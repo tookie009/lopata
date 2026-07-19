@@ -1,15 +1,32 @@
+import heapq
+import logging
+import math
+from collections import deque
+
 import numpy as np
 from pyproj import Transformer
 from shapely.geometry import Polygon, box, mapping
 from shapely.ops import transform as shp_transform
 from shapely.ops import unary_union
 
-from ndvi import fetch_ndvi_array
+from geometry_utils import points_in_polygon
+from ndvi import fetch_best_vegetation_ndvi_array
+
+logger = logging.getLogger(__name__)
 
 MIN_ZONES = 2
 MAX_ZONES = 12
 MIN_RASTER_PX = 16
 MAX_RASTER_PX = 512
+
+# A zone's area may be at most this many times larger than the field's smallest zone (i.e. up to
+# 15% bigger) - real field operations (spraying, sampling) need plots that are roughly the same
+# size. strategy="contiguous" (see _balanced_contiguous_zones) satisfies this by construction
+# (each zone is grown to an explicit pixel-count share, so any two zones differ by at most a
+# handful of pixels - comfortably inside this ratio for anything but a near-empty field); it's
+# not enforced for strategy="smooth", which is kept as the plain, unbalanced k-means baseline for
+# comparison.
+MAX_ZONE_SIZE_RATIO = 1.15
 
 
 def _utm_epsg(lon: float, lat: float) -> int:
@@ -24,21 +41,6 @@ def _to_utm_transformer(lon: float, lat: float) -> Transformer:
 def _area_ha(polygon: Polygon, transformer: Transformer) -> float:
     utm_polygon = shp_transform(transformer.transform, polygon)
     return utm_polygon.area / 10_000.0
-
-
-def _points_in_polygon(x: np.ndarray, y: np.ndarray, poly_x: np.ndarray, poly_y: np.ndarray) -> np.ndarray:
-    """Vectorized ray-casting point-in-polygon test."""
-    inside = np.zeros(x.shape, dtype=bool)
-    n = len(poly_x)
-    j = n - 1
-    for i in range(n):
-        xi, yi = poly_x[i], poly_y[i]
-        xj, yj = poly_x[j], poly_y[j]
-        denom = (yj - yi) if (yj - yi) != 0 else 1e-12
-        intersect = ((yi > y) != (yj > y)) & (x < (xj - xi) * (y - yi) / denom + xi)
-        inside ^= intersect
-        j = i
-    return inside
 
 
 def _kmeans_1d(values: np.ndarray, k: int, n_iter: int = 50, seed: int = 0):
@@ -67,20 +69,81 @@ def _kmeans_1d(values: np.ndarray, k: int, n_iter: int = 50, seed: int = 0):
     return remap[labels], centers[order]
 
 
-def _vectorize_label(label_raster: np.ndarray, label: int, lon_edges: np.ndarray, lat_edges: np.ndarray):
-    """Union all pixels with the given label into a single (multi)polygon, using
-    row-wise run-length merging so we don't build one box per pixel."""
-    height, width = label_raster.shape
+def _box_blur(array: np.ndarray, radius: int) -> np.ndarray:
+    """Mean over a (2*radius+1)^2 window (edge-padded), computed via an integral image so it's
+    O(1) per pixel regardless of radius.
+
+    _kmeans_1d clusters purely on pixel *value*, with no notion of spatial position - real NDVI
+    is noisy pixel-to-pixel (sensor noise, sub-pixel mixed ground cover) even within a uniform
+    crop, and once several cluster centers end up closer together than that noise floor (easy
+    with up to MAX_ZONES clusters over a modest NDVI range), neighboring pixels flip between
+    clusters almost at random. That renders as a chaotic speckle/crosshatch of zone boundaries
+    instead of coherent regions. Blurring before clustering (see compute_field_zones) averages
+    that noise out so nearby pixels agree, without erasing genuine zone-scale NDVI variation.
+    """
+    if radius <= 0:
+        return array
+    padded = np.pad(array, radius, mode="edge")
+    integral = np.pad(np.cumsum(np.cumsum(padded, axis=0), axis=1), ((1, 0), (1, 0)))
+    window = 2 * radius + 1
+    total = (
+        integral[window:, window:]
+        - integral[:-window, window:]
+        - integral[window:, :-window]
+        + integral[:-window, :-window]
+    )
+    return total / (window * window)
+
+
+def _majority_filter(label_raster: np.ndarray, radius: int = 1, iterations: int = 4) -> np.ndarray:
+    """Iteratively replaces each in-field pixel's zone label (labels are >= 0; out-of-field
+    pixels stay -1 and are never touched or counted) with whichever label is most common among
+    its (2*radius+1)^2 neighbors.
+
+    Pre-clustering smoothing (_box_blur) alone doesn't guarantee this: even a smoothed NDVI
+    surface can cross a cluster's value boundary back and forth many times as it varies
+    spatially (canopy texture, drainage lines, ...), which per-value clustering has no way to
+    see - it only ever looks at value, never position. Voting on the *discrete* zone labels
+    directly enforces spatial coherence regardless of why they fragmented, converging a chaotic
+    speckle of tiny same-label patches into contiguous regions within a few iterations.
+    """
+    result = label_raster.copy()
+    labels_present = sorted(int(l) for l in np.unique(result) if l >= 0)
+    if len(labels_present) <= 1:
+        return result
+
+    for _ in range(iterations):
+        # One-hot neighbor counts per label via the same box-blur used for pre-clustering
+        # smoothing, rather than a per-pixel Python loop over the raster.
+        counts = np.stack(
+            [_box_blur((result == label).astype(np.float64), radius) for label in labels_present],
+            axis=-1,
+        )
+        majority_idx = np.argmax(counts, axis=-1)
+        majority_labels = np.array(labels_present)[majority_idx]
+
+        new_result = np.where(result >= 0, majority_labels, result)
+        if np.array_equal(new_result, result):
+            break
+        result = new_result
+
+    return result
+
+
+def _vectorize_mask(mask: np.ndarray, lon_edges: np.ndarray, lat_edges: np.ndarray):
+    """Union all pixels set in the mask into a single (multi)polygon, using row-wise
+    run-length merging so we don't build one box per pixel."""
+    height, width = mask.shape
     boxes = []
     for row in range(height):
-        row_labels = label_raster[row]
+        row_mask = mask[row]
         col = 0
         while col < width:
-            if row_labels[col] != label:
+            if not row_mask[col]:
                 col += 1
                 continue
             start = col
-            while col < width and row_labels[col] == label:
+            while col < width and row_mask[col]:
                 col += 1
             boxes.append(
                 box(lon_edges[start], lat_edges[row + 1], lon_edges[col], lat_edges[row])
@@ -90,13 +153,190 @@ def _vectorize_label(label_raster: np.ndarray, label: int, lon_edges: np.ndarray
     return unary_union(boxes)
 
 
+def _neighbors8(r: int, c: int, height: int, width: int):
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < height and 0 <= nc < width:
+                yield nr, nc
+
+
+def _connected_components(mask: np.ndarray) -> list[np.ndarray]:
+    """Splits a boolean mask into its 8-connected components, each returned as its own boolean
+    mask of the same shape (no scipy dependency in this project, so a plain BFS flood-fill
+    instead of scipy.ndimage.label)."""
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components = []
+    rows, cols = np.where(mask)
+    for start_r, start_c in zip(rows.tolist(), cols.tolist()):
+        if visited[start_r, start_c]:
+            continue
+        component = np.zeros_like(mask, dtype=bool)
+        stack = [(start_r, start_c)]
+        visited[start_r, start_c] = True
+        while stack:
+            r, c = stack.pop()
+            component[r, c] = True
+            for nr, nc in _neighbors8(r, c, height, width):
+                if mask[nr, nc] and not visited[nr, nc]:
+                    visited[nr, nc] = True
+                    stack.append((nr, nc))
+        components.append(component)
+    return components
+
+
+def _absorb_unassigned(assigned_zone: np.ndarray, remaining: np.ndarray) -> None:
+    """Mutates assigned_zone/remaining in place: multi-source BFS grown simultaneously from every
+    already-assigned pixel into the still-`remaining` ones, so they split fairly by proximity
+    between neighboring zones instead of whichever zone's scan order happens to reach a pixel
+    first monopolizing all of it. Pixels that touch no assigned zone at all are left as-is rather
+    than spinning forever."""
+    if not np.any(remaining):
+        return
+    height, width = assigned_zone.shape
+    frontier = deque((int(r), int(c)) for r, c in zip(*np.where(assigned_zone >= 0)))
+    while frontier:
+        r, c = frontier.popleft()
+        zone_index = assigned_zone[r, c]
+        for nr, nc in _neighbors8(r, c, height, width):
+            if remaining[nr, nc]:
+                remaining[nr, nc] = False
+                assigned_zone[nr, nc] = zone_index
+                frontier.append((nr, nc))
+
+
+# Weight of spatial distance-from-seed (normalized 0..1 by the raster's diagonal) relative to
+# NDVI-value distance (typically also well under 1, given real NDVI's range) in the region-
+# growing priority queue - see _balanced_contiguous_zones. Purely a shape control: growth is
+# already capped at an exact pixel-count target regardless of this value, so it doesn't affect
+# zone balance, only how jagged/compact the boundaries between zones come out.
+GROWTH_SHAPE_WEIGHT = 3.0
+
+
+def _balanced_contiguous_zones(
+    smoothed_ndvi: np.ndarray, valid: np.ndarray, n_zones: int
+) -> list[np.ndarray]:
+    """Splits `valid` into n_zones spatially-contiguous regions of near-equal pixel count,
+    ordered ascending by NDVI, via sequential seeded region growing.
+
+    Earlier attempts at this ("smooth"'s cluster-by-value-then-merge-islands, and a first cut of
+    this function that clustered by value first and merged undersized results afterwards) can't
+    actually guarantee balance: merging only ever makes a zone bigger, never smaller, so for a
+    genuinely skewed NDVI distribution the only way to satisfy a strict size-ratio constraint
+    between all zones is to keep merging until almost everything collapses into one giant zone -
+    which was verified experimentally (7 fragmented zones from a notched field collapsed to a
+    single zone under a naive "merge smallest into nearest neighbor" balancer). Building zones by
+    construction to an exact pixel-count share sidesteps that failure mode entirely.
+
+    Algorithm: process zones one at a time, lowest-NDVI first. Seeding naively at the single
+    lowest-NDVI pixel among ALL remaining ones turned out to be a real trap once several zones
+    have already been carved out: that pixel can easily be an isolated speck walled in by
+    already-assigned territory (a noisy local dip, or a sliver left over after earlier zones
+    consumed the bulk of the low-value area), so its own reachable neighborhood is far smaller
+    than its target share - verified experimentally, where this stranded most zones at a handful
+    of pixels each while one zone's uncapped leftover-cleanup swallowed the rest of the field (84%
+    of it) in 65 seconds. Restricting the seed to the LARGEST remaining connected component avoids
+    that: the seed is always somewhere inside the bulk of what's left, so a plain best-first grow
+    (8-connected, cheapest NDVI-difference-from-seed first, via a priority queue) reliably reaches
+    `remaining_pixels // zones_still_to_place` pixels before running out of room - any two zones
+    then differ by at most a few pixels, trivially satisfying MAX_ZONE_SIZE_RATIO.
+
+    Whatever a zone's growth still can't reach (a genuinely boxed-in leftover, rare once seeding
+    avoids stranded specks) is swept up afterwards by _absorb_unassigned, so it's split fairly by
+    proximity between zones instead of the first zone whose scan order happens to reach it
+    monopolizing all of it.
+
+    Growth priority is NDVI-value-distance-from-seed *plus* a spatial-distance-from-seed term
+    weighted by GROWTH_SHAPE_WEIGHT, not NDVI distance alone: ranking purely by value has no
+    notion of a straight/compact boundary, so wherever the underlying NDVI surface varies
+    diagonally across the raster grid, greedily hopping to whichever unclaimed neighbor matches
+    the seed's value best saws the edge between two zones back and forth pixel-by-pixel instead of
+    running cleanly - visually "dziwne" (odd) and not something anyone could actually walk/drive
+    along. Mixing in spatial distance pulls growth toward roughly circular (Voronoi-like) blobs
+    instead, without touching zone balance at all - each zone is still capped at exactly
+    `remaining_pixels // zones_still_to_place` regardless of which neighbor the priority queue
+    happens to prefer, only the *shape* it takes to get there changes. (An earlier attempt fixed
+    the jaggedness with a majority-filter smoothing pass on the finished raster instead - it
+    worked, but skewed zone sizes by a few percent each time, occasionally past
+    MAX_ZONE_SIZE_RATIO, which this avoids entirely by shaping growth as it happens.)
+    """
+    height, width = valid.shape
+    remaining = valid.copy()
+    assigned_zone = np.full(valid.shape, -1, dtype=int)
+    raster_diagonal = math.hypot(height, width)
+
+    def largest_component(mask: np.ndarray) -> np.ndarray:
+        components = _connected_components(mask)
+        return max(components, key=lambda comp: int(comp.sum()))
+
+    for zone_index in range(n_zones):
+        zones_left = n_zones - zone_index
+        remaining_count = int(remaining.sum())
+        if remaining_count == 0:
+            break
+        target_px = remaining_count // zones_left
+
+        seed_pool = largest_component(remaining)
+        pool_rows, pool_cols = np.where(seed_pool)
+        seed_values = smoothed_ndvi[pool_rows, pool_cols]
+        seed_i = int(np.argmin(seed_values))
+        seed_r, seed_c = int(pool_rows[seed_i]), int(pool_cols[seed_i])
+        seed_value = float(smoothed_ndvi[seed_r, seed_c])
+
+        heap: list[tuple[float, int, int]] = [(0.0, seed_r, seed_c)]
+        queued = np.zeros_like(valid, dtype=bool)
+        queued[seed_r, seed_c] = True
+        claimed = 0
+
+        while heap and claimed < target_px:
+            _, r, c = heapq.heappop(heap)
+            if not remaining[r, c]:
+                continue
+            remaining[r, c] = False
+            assigned_zone[r, c] = zone_index
+            claimed += 1
+            for nr, nc in _neighbors8(r, c, height, width):
+                if remaining[nr, nc] and not queued[nr, nc]:
+                    queued[nr, nc] = True
+                    ndvi_term = abs(float(smoothed_ndvi[nr, nc]) - seed_value)
+                    shape_term = math.hypot(nr - seed_r, nc - seed_c) / raster_diagonal
+                    priority = ndvi_term + GROWTH_SHAPE_WEIGHT * shape_term
+                    heapq.heappush(heap, (priority, nr, nc))
+
+    _absorb_unassigned(assigned_zone, remaining)
+
+    return [assigned_zone == zone_index for zone_index in range(n_zones)]
+
+
+ZONE_STRATEGIES = ("smooth", "contiguous")
+
+
 def compute_field_zones(
     polygon_lonlat: list[tuple[float, float]],
     target_plot_size_ha: float,
     max_cloud_cover: float = 30.0,
-    search_days: int = 30,
     resolution_m: float = 10.0,
+    strategy: str = "smooth",
 ) -> dict:
+    """strategy="smooth": plain 1D k-means over NDVI value (see _kmeans_1d) plus a hard
+    majority-filter pass to merge small same-label islands into their surrounding zone. Kept as
+    the naive baseline for comparison - zones are NOT guaranteed equal-area or fragment-free (a
+    zone can still come back as several disjoint patches wherever two unconnected spots share a
+    cluster and survive the majority filter), and the returned feature count always equals the
+    requested zone count.
+
+    strategy="contiguous": ignores k-means/majority-filter entirely and instead builds zones by
+    seeded region growing (see _balanced_contiguous_zones) - each zone is grown outward from a
+    seed pixel to an explicit, near-equal pixel-count share of the field, so every returned
+    polygon is both a single contiguous shape AND within MAX_ZONE_SIZE_RATIO of every other
+    zone's area, by construction rather than by post-hoc merging.
+    """
+    if strategy not in ZONE_STRATEGIES:
+        raise ValueError(f"Nieznana strategia podzialu: {strategy!r} (oczekiwano jednej z {ZONE_STRATEGIES})")
+
     field_polygon = Polygon(polygon_lonlat)
     if not field_polygon.is_valid or field_polygon.area == 0:
         raise ValueError("Podany wielokat pola jest niepoprawny (samoprzecinajacy sie lub zerowej powierzchni)")
@@ -119,15 +359,11 @@ def compute_field_zones(
     width_px = int(np.clip(round((maxx - minx) / resolution_m), MIN_RASTER_PX, MAX_RASTER_PX))
     height_px = int(np.clip(round((maxy - miny) / resolution_m), MIN_RASTER_PX, MAX_RASTER_PX))
 
-    ndvi_array = fetch_ndvi_array(
-        min_lon=min_lon,
-        min_lat=min_lat,
-        max_lon=max_lon,
-        max_lat=max_lat,
+    ndvi_array, ndvi_metadata = fetch_best_vegetation_ndvi_array(
+        polygon_lonlat=polygon_lonlat,
         width=width_px,
         height=height_px,
         max_cloud_cover=max_cloud_cover,
-        search_days=search_days,
     )
     ndvi = ndvi_array[:, :, 0]
     data_mask = ndvi_array[:, :, 1]
@@ -139,7 +375,7 @@ def compute_field_zones(
     grid_lon, grid_lat = np.meshgrid(lon_centers, lat_centers)
 
     poly_xy = np.asarray(field_polygon.exterior.coords)
-    inside = _points_in_polygon(
+    inside = points_in_polygon(
         grid_lon.ravel(), grid_lat.ravel(), poly_xy[:, 0], poly_xy[:, 1]
     ).reshape(grid_lon.shape)
 
@@ -149,36 +385,71 @@ def compute_field_zones(
             "Brak prawidlowych pikseli NDVI wewnatrz podanego pola (zla data/zachmurzenie/geometria)"
         )
 
-    valid_values = ndvi[valid]
+    # Smooth before clustering so zones come out as coherent regions instead of a pixel-level
+    # speckle - see _box_blur's docstring. Radius scales with how large a single zone is
+    # expected to be (in pixels), so it washes out noise without also washing out genuine
+    # zone-scale variation. Used by both strategies (also as the seed-ordering/growth-priority
+    # signal for "contiguous"'s region growing).
+    expected_zone_side_px = math.sqrt((width_px * height_px) / max(n_zones, 1))
+    blur_radius = max(1, round(expected_zone_side_px * 0.15))
+    smoothed_ndvi = _box_blur(ndvi, blur_radius)
+
+    valid_values = smoothed_ndvi[valid]
     actual_n_zones = min(n_zones, len(np.unique(valid_values)))
     actual_n_zones = max(MIN_ZONES, actual_n_zones)
-    labels_flat, centers = _kmeans_1d(valid_values, actual_n_zones)
 
-    label_raster = np.full(ndvi.shape, -1, dtype=int)
-    label_raster[valid] = labels_flat
+    if strategy == "contiguous":
+        zone_masks = _balanced_contiguous_zones(smoothed_ndvi, valid, actual_n_zones)
+        zone_pixel_counts = [int(m.sum()) for m in zone_masks if m.any()]
+        if zone_pixel_counts:
+            size_ratio = max(zone_pixel_counts) / min(zone_pixel_counts)
+            if size_ratio > MAX_ZONE_SIZE_RATIO:
+                # Region growing guarantees this for any ordinary field outline (see
+                # _balanced_contiguous_zones's docstring) - only a pathologically non-convex
+                # shape (far beyond what a real field looks like) should ever land here, so this
+                # is a visibility signal for that rare case, not a hard failure.
+                logger.warning(
+                    "NDVI zone size ratio %.3f exceeds MAX_ZONE_SIZE_RATIO=%.2f "
+                    "(zone pixel counts: %s) - field outline is unusually non-convex",
+                    size_ratio, MAX_ZONE_SIZE_RATIO, sorted(zone_pixel_counts, reverse=True),
+                )
+    else:
+        labels_flat, _centers = _kmeans_1d(valid_values, actual_n_zones)
+        label_raster = np.full(ndvi.shape, -1, dtype=int)
+        label_raster[valid] = labels_flat
+        label_raster = _majority_filter(label_raster, radius=max(1, round(blur_radius * 1.5)))
+        # Run the majority filter again, harder, so small same-label islands get absorbed into
+        # whichever zone actually surrounds them instead of surviving as a separate patch - at
+        # the cost of zones no longer purely reflecting NDVI value near their edges.
+        label_raster = _majority_filter(label_raster, radius=max(1, round(blur_radius * 3)), iterations=8)
+        zone_masks = [label_raster == zone_id for zone_id in range(actual_n_zones)]
 
-    zones = []
-    for zone_id in range(actual_n_zones):
-        geom = _vectorize_label(label_raster, zone_id, lon_edges, lat_edges)
+    def _zone_entry(zone_id: int, mask: np.ndarray) -> dict | None:
+        geom = _vectorize_mask(mask, lon_edges, lat_edges)
         if geom is None:
-            continue
+            return None
         geom = geom.intersection(field_polygon)
         if geom.is_empty:
-            continue
+            return None
         area_ha = _area_ha(geom, transformer)
         if area_ha < 1e-4:
-            continue
-        zone_mask = label_raster == zone_id
-        zones.append(
-            {
-                "zone_id": zone_id,
-                "ndvi_mean": round(float(centers[zone_id]), 4),
-                "ndvi_min": round(float(ndvi[zone_mask].min()), 4),
-                "ndvi_max": round(float(ndvi[zone_mask].max()), 4),
-                "area_ha": round(area_ha, 4),
-                "geometry": mapping(geom),
-            }
-        )
+            return None
+        return {
+            "zone_id": zone_id,
+            # Reported from the raw (unsmoothed) NDVI, not the blurred values clustering
+            # actually ran on - stats should reflect what's really there, not the smoothing.
+            "ndvi_mean": round(float(ndvi[mask].mean()), 4),
+            "ndvi_min": round(float(ndvi[mask].min()), 4),
+            "ndvi_max": round(float(ndvi[mask].max()), 4),
+            "area_ha": round(area_ha, 4),
+            "geometry": mapping(geom),
+        }
+
+    zones = []
+    for idx, mask in enumerate(zone_masks):
+        entry = _zone_entry(idx, mask)
+        if entry is not None:
+            zones.append(entry)
 
     return {
         "type": "FeatureCollection",
@@ -186,6 +457,7 @@ def compute_field_zones(
         "target_plot_size_ha": target_plot_size_ha,
         "n_zones": len(zones),
         "raster_size": {"width": width_px, "height": height_px},
+        "ndvi_metadata": ndvi_metadata,
         "features": [
             {
                 "type": "Feature",

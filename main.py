@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 
 from field_zones import compute_field_zones
 from ndvi import fetch_ndvi_png
-from schemas import FieldZonesRequest
+from schemas import FieldZonesRequest, NdviRequest
 
 app = FastAPI(
     title="NDVI API",
@@ -15,42 +15,59 @@ app = FastAPI(
 )
 
 
-@app.get(
-    "/ndvi",
-    summary="Wygeneruj obraz NDVI dla podanego obszaru",
-    response_class=Response,
-    responses={200: {"content": {"image/png": {}}, "description": "Obraz NDVI w formacie PNG"}},
-)
-def get_ndvi(
-    min_lon: float = Query(..., ge=-180, le=180, description="Minimalna dlugosc geograficzna (WGS84)"),
-    min_lat: float = Query(..., ge=-90, le=90, description="Minimalna szerokosc geograficzna (WGS84)"),
-    max_lon: float = Query(..., ge=-180, le=180, description="Maksymalna dlugosc geograficzna (WGS84)"),
-    max_lat: float = Query(..., ge=-90, le=90, description="Maksymalna szerokosc geograficzna (WGS84)"),
-    width: int = Query(512, gt=0, le=2500, description="Szerokosc obrazu w pikselach"),
-    height: int = Query(512, gt=0, le=2500, description="Wysokosc obrazu w pikselach"),
-    max_cloud_cover: float = Query(30.0, ge=0, le=100, description="Maksymalne dopuszczalne zachmurzenie sceny w %"),
-    search_days: int = Query(30, gt=0, le=365, description="Ile dni wstecz szukac najnowszego bezchmurnego zdjecia"),
-):
-    if min_lon >= max_lon or min_lat >= max_lat:
-        raise HTTPException(status_code=400, detail="min_lon/min_lat musza byc mniejsze niz max_lon/max_lat")
+def _ndvi_metadata_headers(metadata: dict) -> dict[str, str]:
+    """Flattens NDVI metadata (acquisition date, search window, ...) into response headers,
+    for endpoints (like /ndvi) whose body is a raw image and can't carry it as JSON."""
+    headers = {
+        "X-NDVI-Acquisition-Dates": ",".join(metadata["acquisition_dates"]),
+        "X-NDVI-Time-From": metadata["time_window_searched"]["from"],
+        "X-NDVI-Time-To": metadata["time_window_searched"]["to"],
+        "X-NDVI-Max-Cloud-Cover": str(metadata["max_cloud_cover"]),
+        "X-NDVI-Mosaicking-Order": metadata["mosaicking_order"],
+        "X-NDVI-Data-Collection": metadata["data_collection"],
+    }
+    if metadata["acquired"] is not None:
+        headers["X-NDVI-Acquired"] = metadata["acquired"]
+    if metadata.get("cloud_cover") is not None:
+        headers["X-NDVI-Cloud-Cover"] = str(metadata["cloud_cover"])
+    if metadata.get("candidates_considered") is not None:
+        headers["X-NDVI-Candidates-Considered"] = str(metadata["candidates_considered"])
+    if metadata.get("ndvi_mean_at_selection") is not None:
+        headers["X-NDVI-Mean-At-Selection"] = str(metadata["ndvi_mean_at_selection"])
+    return headers
 
+
+@app.post(
+    "/ndvi",
+    summary="Wygeneruj obraz NDVI dla podanego wielokata pola",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {"image/png": {}},
+            "description": (
+                "Obraz NDVI w formacie PNG, przyciety do dokladnych krawedzi podanego "
+                "wielokata pola (pozostale piksele przezroczyste), dla terminu z ostatniego "
+                "sezonu wegetacyjnego o najlepszej roslinnosci w obrebie pola. Metadane (data "
+                "zdjecia satelitarnego, ile terminow rozwazono, ...) sa dolaczone jako naglowki "
+                "odpowiedzi X-NDVI-*."
+            ),
+        }
+    },
+)
+def get_ndvi(payload: NdviRequest):
     try:
-        png_bytes = fetch_ndvi_png(
-            min_lon=min_lon,
-            min_lat=min_lat,
-            max_lon=max_lon,
-            max_lat=max_lat,
-            width=width,
-            height=height,
-            max_cloud_cover=max_cloud_cover,
-            search_days=search_days,
+        png_bytes, metadata = fetch_ndvi_png(
+            polygon_lonlat=payload.polygon,
+            width=payload.width,
+            height=payload.height,
+            max_cloud_cover=payload.max_cloud_cover,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Blad pobierania danych z Copernicus: {exc}") from exc
 
-    return Response(content=png_bytes, media_type="image/png")
+    return Response(content=png_bytes, media_type="image/png", headers=_ndvi_metadata_headers(metadata))
 
 
 @app.post(
@@ -70,8 +87,8 @@ def post_field_zones(payload: FieldZonesRequest):
             polygon_lonlat=payload.polygon,
             target_plot_size_ha=payload.target_plot_size_ha,
             max_cloud_cover=payload.max_cloud_cover,
-            search_days=payload.search_days,
             resolution_m=payload.resolution_m,
+            strategy=payload.strategy,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -84,4 +101,4 @@ def post_field_zones(payload: FieldZonesRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
