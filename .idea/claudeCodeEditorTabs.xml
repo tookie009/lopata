@@ -1,20 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ClaudeCodeEditorTabs">
-    <option name="activeSessionId" value="7efbd5b1-102c-46ae-839e-73a1f7a187a8" />
+    <option name="activeSessionId" value="c3c072cd-e684-4ccd-bab0-5bbd6fbb65b7" />
     <option name="openSessionIds">
       <list>
         <option value="7efbd5b1-102c-46ae-839e-73a1f7a187a8" />
+        <option value="c3c072cd-e684-4ccd-bab0-5bbd6fbb65b7" />
       </list>
     </option>
     <option name="sessionPaths">
       <map>
         <entry key="7efbd5b1-102c-46ae-839e-73a1f7a187a8" value="/sessions/2b34b63b-138e-404a-920e-20755b61e613" />
+        <entry key="c3c072cd-e684-4ccd-bab0-5bbd6fbb65b7" value="/sessions/bb785375-06d5-4a90-9f48-3e0b9337dcbe" />
       </map>
     </option>
     <option name="sessionTitles">
       <map>
-        <entry key="7efbd5b1-102c-46ae-839e-73a1f7a187a8" value="(.venv) PS D:\lopata&gt; git push -u origin main err" />
+        <entry key="7efbd5b1-102c-46ae-839e-73a1f7a187a8" value="(.venv) PS D:\lopata&gt; git push -u origin main erro" />
+        <entry key="c3c072cd-e684-4ccd-bab0-5bbd6fbb65b7" value="kazdy response powinien rowniez zwracac metadane o" />
       </map>
     </option>
   </component>
