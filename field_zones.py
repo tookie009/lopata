@@ -244,6 +244,17 @@ def _simplify_zone_boundaries(
     return results
 
 
+# _fill_field_edge_gaps works directly in lon/lat degrees (called both before any UTM reprojection
+# and, a second time, on already-reprojected-back results - see compute_field_zones), so this floor
+# is in degrees^2 rather than m^2. ~1e-11 deg^2 is a small fraction of a square meter at any
+# latitude field polygons in this app realistically fall at (Poland: roughly 0.05-0.1 m^2) - well
+# below any real gap piece (raster/polygon edge mismatch, or a busy junction's edges simplifying
+# apart - see the docstring below), but comfortably above the floating-point-noise slivers GEOS's
+# difference() can produce right where two boundaries nearly meet at a point (verified
+# experimentally: a "gap" piece of 0.0012 m^2 - a fraction of a square millimeter).
+MIN_GAP_PIECE_AREA_DEG2 = 1e-11
+
+
 def _fill_field_edge_gaps(zone_geoms: list, field_polygon: Polygon) -> list:
     """Merges any sliver of the field polygon that no zone covers into whichever zone touches it.
 
@@ -278,7 +289,19 @@ def _fill_field_edge_gaps(zone_geoms: list, field_polygon: Polygon) -> list:
     pieces = list(gap.geoms) if gap.geom_type in ("MultiPolygon", "GeometryCollection") else [gap]
     result = list(zone_geoms)
     for piece in pieces:
-        if not hasattr(piece, "area") or piece.area <= 0:
+        if not hasattr(piece, "area") or piece.area <= MIN_GAP_PIECE_AREA_DEG2:
+            # Below MIN_GAP_PIECE_AREA_DEG2 this isn't a real sliver of field to reclaim, it's
+            # floating-point noise from the difference() overlay itself - verified experimentally:
+            # a "gap" piece with area 0.0012 m^2 (a fraction of a square millimeter), rendering as
+            # a needle-thin degenerate triangle wherever two zones' simplified edges nearly (but
+            # not quite) meet at a point. `result[nearest_i].distance(piece)` picking the
+            # geometrically nearest zone doesn't guarantee that zone actually touches the piece
+            # along a real edge - for a piece this degenerate it's essentially always a single-
+            # point graze, so unary_union() keeps it as its own separate MultiPolygon part rather
+            # than merging it away, reproducing the exact "boundary looks like several lines"
+            # artifact this function exists to fix. Real gaps worth reclaiming (see this
+            # function's main docstring - raster-to-polygon edge mismatch, or a busy junction's
+            # edges simplifying apart) are many square meters, comfortably above this floor.
             continue
         nearest_i = min((i for i, _ in present), key=lambda i: result[i].distance(piece))
         result[nearest_i] = _polygonal_only(unary_union([result[nearest_i], piece]))
