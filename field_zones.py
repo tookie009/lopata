@@ -854,7 +854,13 @@ def compute_field_zones(
     if target_plot_size_ha <= 0:
         raise ValueError("target_plot_size_ha musi byc wieksze od zera")
 
-    n_zones = round(field_area_ha / target_plot_size_ha)
+    # ceil, not round: rounding down (e.g. 9.89ha / 4ha -> round() = 2) can propose an average
+    # zone size *above* target_plot_size_ha - which MAX_SUBFIELD_AREA_HA then has to fix after
+    # the fact via _split_oversized_zones, crudely doubling that zone count (2 -> 4 zones here)
+    # instead of landing on the right count (3) directly, the way FieldDivisionService's own
+    # equal-area grid split already does on the frontend. Ceiling guarantees field_area_ha /
+    # n_zones never exceeds target_plot_size_ha in the first place.
+    n_zones = math.ceil(field_area_ha / target_plot_size_ha)
     n_zones = max(MIN_ZONES, min(MAX_ZONES, n_zones))
 
     # Size the analysis raster from the requested ground resolution, capped for
