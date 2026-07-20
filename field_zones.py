@@ -103,6 +103,35 @@ def _split_dust_parts(geom, dust_area_m2: float):
     return kept, dropped
 
 
+def _best_touching_neighbor(piece, geoms: list) -> int:
+    """Index into `geoms` of whichever geometry shares the longest boundary run with `piece` -
+    not just whichever is nearest by point-set distance (used previously by both
+    _simplify_zone_boundaries's dust-piece merge and _fill_field_edge_gaps). `.distance()` is 0
+    for ANY touching candidate, whether it shares a long real edge or only grazes `piece` at a
+    single corner point - so "nearest by distance" has no way to prefer the former, and picking
+    the latter leaves `piece` merged in name only: unary_union() of two shapes touching at just a
+    point can't make them one connected Polygon, so `piece` survives as its own barely-attached
+    sliver - visually the exact "boundary looks like several lines" / detached-square artifact
+    this is meant to fix (verified experimentally on real fields at up to a few hundred m^2, not
+    just floating-point noise - large enough to be clearly visible, not a rounding artifact).
+
+    Falls back to nearest-by-distance only if `piece` doesn't share any boundary length with
+    anything at all (e.g. a piece that's genuinely floating apart from every candidate) - rare in
+    practice, but a length of 0 for every candidate would otherwise pick arbitrarily among ties."""
+    def shared_length(g):
+        try:
+            inter = piece.boundary.intersection(g.boundary)
+        except Exception:
+            return 0.0
+        return inter.length if hasattr(inter, "length") else 0.0
+
+    lengths = [shared_length(g) for g in geoms]
+    best_i = max(range(len(geoms)), key=lambda i: lengths[i])
+    if lengths[best_i] > 0:
+        return best_i
+    return min(range(len(geoms)), key=lambda i: geoms[i].distance(piece))
+
+
 def _polygonal_only(geom):
     """Keeps only the Polygon/MultiPolygon area of a geometry. unary_union() of pieces that touch
     at a near-degenerate (zero-or-near-zero-width) contact can come back as a GeometryCollection
@@ -219,14 +248,15 @@ def _simplify_zone_boundaries(
         kept_geoms.append(kept)
         all_dropped.extend(dropped)
 
-    # Second pass: merge every dust-sized piece into whichever zone's *kept* geometry is nearest -
-    # not a separate, later, field-wide gap-fill pass (that has no way to tell "this speck used to
-    # be part of zone 6's territory" from "this is a genuine gap against the field's own edge", and
-    # verified experimentally to sometimes reattach a dropped piece to a zone several places away
-    # instead of the one actually surrounding it). Doing it here, in the same UTM working space and
-    # with the full set of this call's own zones, reattaches each piece to its real neighbor.
+    # Second pass: merge every dust-sized piece into whichever zone's *kept* geometry actually
+    # borders it (see _best_touching_neighbor) - not a separate, later, field-wide gap-fill pass
+    # (that has no way to tell "this speck used to be part of zone 6's territory" from "this is a
+    # genuine gap against the field's own edge", and verified experimentally to sometimes reattach
+    # a dropped piece to a zone several places away instead of the one actually surrounding it).
+    # Doing it here, in the same UTM working space and with the full set of this call's own zones,
+    # reattaches each piece to its real neighbor.
     for piece in all_dropped:
-        nearest_i = min(range(len(kept_geoms)), key=lambda i: kept_geoms[i].distance(piece))
+        nearest_i = _best_touching_neighbor(piece, kept_geoms)
         kept_geoms[nearest_i] = _polygonal_only(unary_union([kept_geoms[nearest_i], piece]))
 
     results = []
@@ -292,18 +322,18 @@ def _fill_field_edge_gaps(zone_geoms: list, field_polygon: Polygon) -> list:
         if not hasattr(piece, "area") or piece.area <= MIN_GAP_PIECE_AREA_DEG2:
             # Below MIN_GAP_PIECE_AREA_DEG2 this isn't a real sliver of field to reclaim, it's
             # floating-point noise from the difference() overlay itself - verified experimentally:
-            # a "gap" piece with area 0.0012 m^2 (a fraction of a square millimeter), rendering as
-            # a needle-thin degenerate triangle wherever two zones' simplified edges nearly (but
-            # not quite) meet at a point. `result[nearest_i].distance(piece)` picking the
-            # geometrically nearest zone doesn't guarantee that zone actually touches the piece
-            # along a real edge - for a piece this degenerate it's essentially always a single-
-            # point graze, so unary_union() keeps it as its own separate MultiPolygon part rather
-            # than merging it away, reproducing the exact "boundary looks like several lines"
-            # artifact this function exists to fix. Real gaps worth reclaiming (see this
-            # function's main docstring - raster-to-polygon edge mismatch, or a busy junction's
-            # edges simplifying apart) are many square meters, comfortably above this floor.
+            # a "gap" piece with area 0.0012 m^2, a fraction of a square millimeter.
             continue
-        nearest_i = min((i for i, _ in present), key=lambda i: result[i].distance(piece))
+        present_indices = [i for i, _ in present]
+        candidate_geoms = [result[i] for i in present_indices]
+        # _best_touching_neighbor, not just whichever zone is nearest - real gap pieces reclaimed
+        # here can be sizeable (verified experimentally up to several hundred m^2, not just
+        # floating-point noise), and "nearest by distance" ties at 0 for any touching zone whether
+        # it shares a real edge or only grazes the piece at a single point, so it can just as
+        # easily pick the latter - leaving the piece merged in name only, as its own barely-
+        # attached sliver (the exact "boundary looks like several lines" artifact being fixed).
+        best_local_i = _best_touching_neighbor(piece, candidate_geoms)
+        nearest_i = present_indices[best_local_i]
         result[nearest_i] = _polygonal_only(unary_union([result[nearest_i], piece]))
     return result
 
@@ -489,6 +519,94 @@ def _absorb_unassigned(assigned_zone: np.ndarray, remaining: np.ndarray) -> None
             zone_sizes[best_zone] = zone_sizes.get(best_zone, 0) + 1
             next_frontier.append((r, c))
         frontier = next_frontier
+
+
+def _neighbors4(r: int, c: int, height: int, width: int):
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < height and 0 <= nc < width:
+            yield nr, nc
+
+
+def _connected_components4(mask: np.ndarray) -> list[np.ndarray]:
+    """Same as _connected_components but edge-sharing (4-connected) neighbors only - see
+    _enforce_4_connectivity for why that distinction matters here."""
+    height, width = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    components = []
+    rows, cols = np.where(mask)
+    for start_r, start_c in zip(rows.tolist(), cols.tolist()):
+        if visited[start_r, start_c]:
+            continue
+        component = np.zeros_like(mask, dtype=bool)
+        stack = [(start_r, start_c)]
+        visited[start_r, start_c] = True
+        while stack:
+            r, c = stack.pop()
+            component[r, c] = True
+            for nr, nc in _neighbors4(r, c, height, width):
+                if mask[nr, nc] and not visited[nr, nc]:
+                    visited[nr, nc] = True
+                    stack.append((nr, nc))
+        components.append(component)
+    return components
+
+
+def _enforce_4_connectivity(zone_masks: list) -> list:
+    """Reassigns any part of a zone that's only reachable from the rest of that same zone
+    *diagonally* (8-connected but not 4-connected) into whichever neighboring zone actually
+    borders it along a real edge.
+
+    _balanced_contiguous_zones and _absorb_unassigned both grow/expand via _neighbors8 (diagonal
+    moves count as "contiguous"), on purpose - it gives visibly more compact, natural-looking
+    boundaries than 4-connectivity would (see GROWTH_SHAPE_WEIGHT's docstring). But a pixel that's
+    only reachable from its own zone's main body through a corner - never through a shared edge -
+    vectorizes (_vectorize_mask, all box edges axis-aligned) into a shape that only touches the
+    zone's main polygon at that single corner point too. Two shapes touching at one point don't
+    merge into a single connected Polygon under unary_union() - by construction they can't, there's
+    no edge between them - so it renders as its own barely-attached island: verified experimentally
+    as the root cause behind several different-looking artifacts reported on real fields (floating
+    detached "kwadracik" squares, boundaries that render as several disconnected line segments) -
+    all downstream symptoms of the same 8-vs-4-connectivity gap, just surfacing differently
+    depending on where in the pipeline the disconnected piece ended up.
+
+    Fixing it here, on the raw pixel mask straight out of region growing/absorption (before any
+    vectorization or simplification), is more robust than patching the polygon output afterward
+    (see _split_dust_parts/_best_touching_neighbor, which still catch some of this - a merge only
+    reassigns whichever zone a piece is already recorded as belonging to; this instead corrects
+    that assignment before it's ever turned into geometry): a pixel-level reassignment to whichever
+    neighboring zone actually 4-borders the disconnected chunk guarantees the result is 4-connected
+    to its new zone, so vectorizing it produces one properly joined polygon, not another sliver to
+    catch downstream.
+    """
+    if not zone_masks:
+        return zone_masks
+    height, width = zone_masks[0].shape
+    n_zones = len(zone_masks)
+    assigned_zone = np.full((height, width), -1, dtype=int)
+    for zi, mask in enumerate(zone_masks):
+        assigned_zone[mask] = zi
+
+    for zi in range(n_zones):
+        components = _connected_components4(assigned_zone == zi)
+        if len(components) <= 1:
+            continue
+        components.sort(key=lambda comp: int(comp.sum()), reverse=True)
+        for small in components[1:]:
+            border_zone_counts: dict[int, int] = {}
+            rows, cols = np.where(small)
+            for r, c in zip(rows.tolist(), cols.tolist()):
+                for nr, nc in _neighbors4(r, c, height, width):
+                    neighbor_zone = int(assigned_zone[nr, nc])
+                    if neighbor_zone != zi and neighbor_zone >= 0:
+                        border_zone_counts[neighbor_zone] = border_zone_counts.get(neighbor_zone, 0) + 1
+            if border_zone_counts:
+                new_zone = max(border_zone_counts, key=border_zone_counts.get)
+                assigned_zone[small] = new_zone
+            # No 4-connected neighbor at all (every side is diagonal-only or out of field) is rare
+            # enough in practice to leave as-is rather than force a connection that isn't there.
+
+    return [assigned_zone == zi for zi in range(n_zones)]
 
 
 # Weight of spatial distance-from-seed (normalized 0..1 by the raster's diagonal) relative to
@@ -711,6 +829,10 @@ def compute_field_zones(
 
     if strategy == "contiguous":
         zone_masks = _balanced_contiguous_zones(smoothed_ndvi, valid, actual_n_zones)
+        # Region growing/absorption both use 8-connectivity (see GROWTH_SHAPE_WEIGHT's docstring),
+        # which can leave a pixel reachable from its own zone only diagonally - see
+        # _enforce_4_connectivity for why that reads as a detached "kwadracik" once vectorized.
+        zone_masks = _enforce_4_connectivity(zone_masks)
         zone_pixel_counts = [int(m.sum()) for m in zone_masks if m.any()]
         if zone_pixel_counts:
             size_ratio = max(zone_pixel_counts) / min(zone_pixel_counts)
