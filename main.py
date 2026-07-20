@@ -89,6 +89,7 @@ def post_field_zones(payload: FieldZonesRequest):
             max_cloud_cover=payload.max_cloud_cover,
             resolution_m=payload.resolution_m,
             strategy=payload.strategy,
+            line_smoothing=payload.line_smoothing,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

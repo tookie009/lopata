@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from field_zones import DEFAULT_LINE_SMOOTHING
+
 
 def _validate_lonlat_polygon(value: list[tuple[float, float]]) -> list[tuple[float, float]]:
     for lon, lat in value:
@@ -51,6 +53,18 @@ class FieldZonesRequest(BaseModel):
             "kazdy zwrocony wielokat jest jednym spojnym kawalkiem I ma powierzchnie w granicach "
             "MAX_ZONE_SIZE_RATIO wzgledem pozostalych stref (patrz field_zones.py), kosztem "
             "nieco dluzszego przetwarzania."
+        ),
+    )
+    line_smoothing: float = Field(
+        DEFAULT_LINE_SMOOTHING,
+        gt=0,
+        le=10,
+        description=(
+            "Jak mocno prostowac postrzepione, rastrowe granice stref (Douglas-Peucker w metrach: "
+            "resolution_m * line_smoothing) - patrz _simplify_zone_boundaries w field_zones.py. "
+            "Wieksze = prostsze/mniej wierzcholkow; powyzej ok. 2.5 dalsze zwiekszanie zwykle nic "
+            "juz nie daje, bo liczbe wierzcholkow ogranicza wtedy liczba wezlow sieci (miejsc, "
+            "gdzie stykaja sie 3+ strefy), nie ta tolerancja."
         ),
     )
 
