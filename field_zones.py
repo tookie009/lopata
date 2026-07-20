@@ -8,6 +8,7 @@ from pyproj import Transformer
 from shapely.geometry import Polygon, box, mapping
 from shapely.ops import transform as shp_transform
 from shapely.ops import linemerge, polygonize, unary_union
+from shapely.vectorized import contains as _shapely_contains
 
 from geometry_utils import points_in_polygon
 from ndvi import fetch_best_vegetation_ndvi_array
@@ -304,7 +305,10 @@ def _simplify_zone_boundaries(
 MIN_GAP_PIECE_AREA_DEG2 = 1e-11
 
 
-def _fill_field_edge_gaps(zone_geoms: list, field_polygon: Polygon) -> list:
+def _fill_field_edge_gaps(
+    zone_geoms: list, field_polygon: Polygon, transformer: Transformer | None = None,
+    max_area_ha: float | None = None,
+) -> list:
     """Merges any sliver of the field polygon that no zone covers into whichever zone touches it.
 
     `valid` (see compute_field_zones) is a cell-*center*-inside-the-field test, so the raster grid
@@ -325,6 +329,16 @@ def _fill_field_edge_gaps(zone_geoms: list, field_polygon: Polygon) -> list:
     have neighboring zones' shared edge simplify into two lines that no longer coincide, opening a
     genuine interior gap the same shape as this one (just not at the field's outer edge) - merging
     it into the nearest zone the same way closes it.
+
+    If transformer/max_area_ha are given, a candidate already at or over that budget is skipped in
+    favor of whichever *other* touching zone still has room, before falling back to plain
+    "whichever touches most" if every touching candidate is already full. Needed because
+    dozens of individually tiny per-zone raster-to-vector losses (~0.05-0.1ha each - the zone-level
+    version of the exact gap this function exists to reclaim) add up field-wide to something far
+    from tiny, and without this check they can all end up reclaimed onto the same one or two
+    zones that happen to be geometrically closest to the most pieces - concentrated rather than
+    spread out, which is what actually pushed a zone from 3.95ha to 4.68ha in practice, well past
+    MAX_SUBFIELD_AREA_HA despite _split_oversized_zones already having enforced that cap upstream.
     """
     present = [(i, g) for i, g in enumerate(zone_geoms) if g is not None]
     if not present:
@@ -336,6 +350,13 @@ def _fill_field_edge_gaps(zone_geoms: list, field_polygon: Polygon) -> list:
         return zone_geoms
 
     pieces = list(gap.geoms) if gap.geom_type in ("MultiPolygon", "GeometryCollection") else [gap]
+    # Largest first: the budget check below is greedy/sequential, so it only sees each zone's
+    # *current* total, not how many more pieces are still coming its way - placing big pieces
+    # while most zones still have plenty of headroom, leaving only small leftover pieces for
+    # later once some zones are fuller, measurably reduces worst-case overshoot versus whatever
+    # order shapely's difference() happened to emit them in (verified experimentally: on the
+    # same real field, cut the largest post-gap-fill overshoot roughly in half).
+    pieces.sort(key=lambda p: getattr(p, "area", 0), reverse=True)
     result = list(zone_geoms)
     for piece in pieces:
         if not hasattr(piece, "area") or piece.area <= MIN_GAP_PIECE_AREA_DEG2:
@@ -345,13 +366,33 @@ def _fill_field_edge_gaps(zone_geoms: list, field_polygon: Polygon) -> list:
             continue
         present_indices = [i for i, _ in present]
         candidate_geoms = [result[i] for i in present_indices]
+
+        if transformer is not None and max_area_ha is not None:
+            piece_area_ha = _area_ha(piece, transformer)
+            under_budget = [
+                local_i for local_i, geom in enumerate(candidate_geoms)
+                if _area_ha(geom, transformer) + piece_area_ha <= max_area_ha
+            ]
+        else:
+            under_budget = list(range(len(candidate_geoms)))
+
         # _best_touching_neighbor, not just whichever zone is nearest - real gap pieces reclaimed
         # here can be sizeable (verified experimentally up to several hundred m^2, not just
         # floating-point noise), and "nearest by distance" ties at 0 for any touching zone whether
         # it shares a real edge or only grazes the piece at a single point, so it can just as
         # easily pick the latter - leaving the piece merged in name only, as its own barely-
         # attached sliver (the exact "boundary looks like several lines" artifact being fixed).
-        best_local_i = _best_touching_neighbor(piece, candidate_geoms)
+        if under_budget:
+            pool = [candidate_geoms[local_i] for local_i in under_budget]
+            best_of_pool = _best_touching_neighbor(piece, pool)
+            best_local_i = under_budget[best_of_pool]
+        else:
+            # Every touching zone is already at/over budget - has to go somewhere, so fall back
+            # to the normal rule rather than leaving a hole; MAX_SUBFIELD_AREA_HA is enforced as
+            # a practical operational limit, not a mathematical guarantee that can always hold
+            # (a gap piece with no under-budget neighbor at all is the rare exception).
+            best_local_i = _best_touching_neighbor(piece, candidate_geoms)
+
         nearest_i = present_indices[best_local_i]
         result[nearest_i] = _polygonal_only(unary_union([result[nearest_i], piece]))
     return result
@@ -861,7 +902,16 @@ def compute_field_zones(
     # equal-area grid split already does on the frontend. Ceiling guarantees field_area_ha /
     # n_zones never exceeds target_plot_size_ha in the first place.
     n_zones = math.ceil(field_area_ha / target_plot_size_ha)
-    n_zones = max(MIN_ZONES, min(MAX_ZONES, n_zones))
+    # MAX_ZONES is a normal, performance-motivated cap - but clamping n_zones down to it can
+    # reintroduce the exact bug the ceil() above just fixed, one level up: for a big enough field
+    # (e.g. 67.35ha with target_plot_size_ha=4.0 -> ideally ceil(67.35/4)=17 zones), MAX_ZONES=12
+    # forces fewer, larger zones (67.35/12=5.6ha, already over MAX_SUBFIELD_AREA_HA), which then
+    # forces _split_oversized_zones to double them (verified: 12 -> 24 actual zones of ~2.8ha
+    # each, nowhere near the requested 4ha). Never clamping n_zones below what the hard area cap
+    # itself requires (ceil(field_area_ha / MAX_SUBFIELD_AREA_HA)) means the resulting zones
+    # actually land near target_plot_size_ha instead of needing that emergency doubling.
+    max_zones_for_request = max(MAX_ZONES, math.ceil(field_area_ha / MAX_SUBFIELD_AREA_HA))
+    n_zones = max(MIN_ZONES, min(max_zones_for_request, n_zones))
 
     # Size the analysis raster from the requested ground resolution, capped for
     # request-size/performance reasons (Sentinel Hub payload + local processing time).
@@ -953,7 +1003,7 @@ def compute_field_zones(
         return geom if not geom.is_empty else None
 
     zone_geoms = [_raw_zone_geometry(m) for m in zone_masks]
-    zone_geoms = _fill_field_edge_gaps(zone_geoms, field_polygon)
+    zone_geoms = _fill_field_edge_gaps(zone_geoms, field_polygon, transformer, MAX_SUBFIELD_AREA_HA)
 
     # Straighten every zone's boundary into clean line segments, all together (see
     # _simplify_zone_boundaries - simplifying each zone polygon independently was tried first and
@@ -994,7 +1044,20 @@ def compute_field_zones(
         # problem _fill_field_edge_gaps already solves for the *outer* field edge (a gap no zone's
         # raster-aligned boundary quite reaches) - reusing it here mops up whatever this
         # post-simplification gap left over, merging it into whichever zone is nearest.
-        zone_geoms = _fill_field_edge_gaps(zone_geoms, field_polygon)
+        zone_geoms = _fill_field_edge_gaps(zone_geoms, field_polygon, transformer, MAX_SUBFIELD_AREA_HA)
+
+        # Douglas-Peucker simplification of the shared line network (_simplify_zone_boundaries)
+        # has no "stay inside the original polygon" constraint - it simplifies the field's own
+        # boundary as part of that same network, and can bulge the simplified edge slightly
+        # outward at a concave point. Every zone rebuilt from that network inherits the same
+        # excess area past the field's *true* boundary (verified experimentally: zone polygons
+        # visibly crossing outside the field outline on the map). _raw_zone_geometry already
+        # clipped to field_polygon before any of this ran; re-clipping here guarantees the final
+        # output still never exceeds it, regardless of what simplification did afterward.
+        zone_geoms = [
+            _polygonal_only(g.intersection(field_polygon)) if g is not None and not g.is_empty else None
+            for g in zone_geoms
+        ]
 
     def _zone_entry(mask: np.ndarray, geom) -> dict | None:
         if geom is None:
@@ -1012,8 +1075,44 @@ def compute_field_zones(
             "geometry": mapping(geom),
         }
 
-    zones = []
+    # Final hard-cap enforcement. Everything above (pixel-level _split_oversized_zones, then
+    # budget-aware, largest-first gap-filling) sharply reduces but doesn't mathematically
+    # guarantee every zone stays under MAX_SUBFIELD_AREA_HA: small per-zone raster-to-vector
+    # losses, reclaimed across *two* separate gap-fill passes, can still stack onto the same
+    # zone (verified experimentally on a real 67ha field: a zone still coming out at ~4.2ha,
+    # ~5% over a 4.0ha cap, despite every earlier safeguard). Re-checking the *actual final*
+    # geometry here and re-splitting anything still over budget - by re-rasterizing just that
+    # zone's own footprint and running it through the same region-growing split used upfront -
+    # closes that gap for good instead of just making it rarer. The re-split pieces are
+    # intersected with field_polygon (same as _raw_zone_geometry) but not run back through
+    # gap-filling, so they may be a hair smaller than their exact pixel share - the safe
+    # direction to err in, given the alternative is exceeding the cap again.
+    max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
+    final_entries: list[tuple[np.ndarray, object]] = []
     for mask, geom in zip(zone_masks, zone_geoms):
+        if geom is None:
+            continue
+        if _area_ha(geom, transformer) <= MAX_SUBFIELD_AREA_HA:
+            final_entries.append((mask, geom))
+            continue
+
+        zone_mask = valid & _shapely_contains(geom, grid_lon, grid_lat)
+        if not zone_mask.any():
+            # Too thin to recapture any pixel center - shouldn't happen for anything big
+            # enough to be over MAX_SUBFIELD_AREA_HA in the first place, but keep the original
+            # rather than silently dropping real field area if it somehow does.
+            final_entries.append((mask, geom))
+            continue
+
+        for sub_mask in _enforce_4_connectivity(_split_until_within_budget(zone_mask, smoothed_ndvi, max_pixels)):
+            if not sub_mask.any():
+                continue
+            sub_geom = _raw_zone_geometry(sub_mask)
+            if sub_geom is not None:
+                final_entries.append((sub_mask, sub_geom))
+
+    zones = []
+    for mask, geom in final_entries:
         entry = _zone_entry(mask, geom)
         if entry is not None:
             zones.append(entry)
