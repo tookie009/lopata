@@ -64,26 +64,43 @@ LINE_SMOOTHING_MAX_FRACTION_OF_ZONE_SIZE = 0.1
 
 # A MultiPolygon part smaller than this many raster pixels' worth of area is "dust" - too small
 # to be a real usable secondary patch of field, kept only because it happened to best-match this
-# zone during assignment. See _drop_dust_parts/_simplify_zone_boundaries. Expressed in pixels
+# zone during assignment. See _split_dust_parts/_simplify_zone_boundaries. Expressed in pixels
 # (not an absolute m^2) so it scales with resolution_m instead of over- or under-filtering at
 # resolutions far from the ~10m this was tuned against.
-DUST_PART_MAX_PIXELS = 0.5
+#
+# Raised from 0.5 to 2.5: verified experimentally (two real fields, several target sizes) that a
+# ~1-pixel island - comfortably above the old 0.5px cutoff, so it survived as its own tiny
+# same-color-but-detached "kwadracik" square rather than being merged away - was exactly the
+# visible artifact being reported. 2.5px still sits well below any of the legitimately large
+# secondary patches seen in practice (thousands of m2, i.e. tens of pixels), so genuine disjoint
+# territory isn't affected, only genuinely dust-sized fragments.
+DUST_PART_MAX_PIXELS = 2.5
 
 
-def _drop_dust_parts(geom, dust_area_m2: float):
-    """Drops any MultiPolygon part smaller than dust_area_m2 (a zone's real secondary patch, if
-    it has one, is easily the size of several raster pixels - anything far smaller is a scrap
-    left over from a busy-junction rebuild, not real disjoint territory), always keeping at least
-    the largest part so a zone with pieces that are ALL tiny doesn't vanish."""
+def _split_dust_parts(geom, dust_area_m2: float):
+    """Splits a MultiPolygon's parts smaller than dust_area_m2 - a zone's real secondary patch, if
+    it has one, is easily the size of several raster pixels; anything far smaller is a scrap left
+    over from a busy-junction rebuild, not real disjoint territory - off into their own list,
+    returning (kept, dropped). Always keeps at least the largest part in `kept` so a zone with
+    pieces that are ALL tiny doesn't vanish.
+
+    Earlier this discarded the small parts outright. That just traded one visible artifact for
+    another - each dropped piece was a real, if tiny, sliver of the field, and dropping it left an
+    uncovered hole rather than removing anything (verified experimentally: a ~1-pixel "kwadracik"
+    floating detached from its own zone's main body, exactly the shape the caller is trying to
+    eliminate, just recolored as a gap instead of a stray island). Returning the dropped pieces
+    lets the caller (_simplify_zone_boundaries) merge each one into whichever *other* zone is
+    actually nearest, so the area ends up seamlessly inside a real neighboring zone instead of
+    either floating as its own island or vanishing into a hole."""
     if geom.geom_type != "MultiPolygon":
-        return geom
+        return geom, []
     parts = sorted(geom.geoms, key=lambda p: p.area, reverse=True)
     if not parts:
-        # A MultiPolygon with no parts at all - every constituent piece snapped/collapsed away to
-        # nothing (see JUNCTION_SNAP_GRID_M) - is itself as good as empty; nothing to keep.
-        return geom
-    kept = [parts[0]] + [p for p in parts[1:] if p.area >= dust_area_m2]
-    return kept[0] if len(kept) == 1 else unary_union(kept)
+        return geom, []
+    dropped = [p for p in parts[1:] if p.area < dust_area_m2]
+    kept_parts = [parts[0]] + [p for p in parts[1:] if p.area >= dust_area_m2]
+    kept = kept_parts[0] if len(kept_parts) == 1 else unary_union(kept_parts)
+    return kept, dropped
 
 
 def _polygonal_only(geom):
@@ -180,7 +197,10 @@ def _simplify_zone_boundaries(
     def _inverse(x, y):
         return transformer.transform(x, y, direction="INVERSE")
 
-    results = []
+    # First pass: each zone's own merged geometry, with its dust-sized parts (see
+    # _split_dust_parts) pulled out rather than dropped outright.
+    kept_geoms = []
+    all_dropped = []
     for i, orig in enumerate(utm_zone_geoms):
         pieces = assignments[i]
         # Plain union of whatever this zone's pieces are - deliberately NOT forced into a single
@@ -195,7 +215,22 @@ def _simplify_zone_boundaries(
         # self-touching knot - and Leaflet renders a MultiPolygon's separate parts just fine, each
         # with its own clean outline, so there's nothing to fix here by forcing one shape.
         geom = _polygonal_only(unary_union(pieces)) if pieces else orig
-        geom = _drop_dust_parts(geom, dust_area_m2)
+        kept, dropped = _split_dust_parts(geom, dust_area_m2)
+        kept_geoms.append(kept)
+        all_dropped.extend(dropped)
+
+    # Second pass: merge every dust-sized piece into whichever zone's *kept* geometry is nearest -
+    # not a separate, later, field-wide gap-fill pass (that has no way to tell "this speck used to
+    # be part of zone 6's territory" from "this is a genuine gap against the field's own edge", and
+    # verified experimentally to sometimes reattach a dropped piece to a zone several places away
+    # instead of the one actually surrounding it). Doing it here, in the same UTM working space and
+    # with the full set of this call's own zones, reattaches each piece to its real neighbor.
+    for piece in all_dropped:
+        nearest_i = min(range(len(kept_geoms)), key=lambda i: kept_geoms[i].distance(piece))
+        kept_geoms[nearest_i] = _polygonal_only(unary_union([kept_geoms[nearest_i], piece]))
+
+    results = []
+    for geom in kept_geoms:
         geom = shp_transform(_inverse, geom)
         if not geom.is_valid:
             # Reprojecting a perfectly valid UTM polygon back to lon/lat can still come out
