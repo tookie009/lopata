@@ -70,7 +70,15 @@ DEFAULT_LINE_SMOOTHING = 2.5
 # area against the zone's actual shape; 10% of the zone's side brought that down to ~12% (and left
 # larger zones, where this fraction's cap sits well above the uncapped tolerance anyway, all but
 # unaffected).
-LINE_SMOOTHING_MAX_FRACTION_OF_ZONE_SIZE = 0.1
+#
+# Raised from 0.1 to 0.2: at 0.1, small zones (e.g. 0.3ha, ~55m to a side) still visibly kept
+# raster staircase steps - verified experimentally (field with 12 zones at target 0.3ha) that
+# line_smoothing itself (2.5 through 15) had *zero* effect on vertex count, because this fraction's
+# cap (5.5m at 0.1) was the actually-binding constraint the whole time, not line_smoothing's own
+# tolerance. 0.2 (11m) turned a visible multi-step staircase into a single clean diagonal line;
+# 0.3 barely changed anything further (same vertex count as 0.5 already), so 0.2 is the point of
+# diminishing returns, not an arbitrary bump.
+LINE_SMOOTHING_MAX_FRACTION_OF_ZONE_SIZE = 0.2
 
 
 # A MultiPolygon part smaller than this many raster pixels' worth of area is "dust" - too small
