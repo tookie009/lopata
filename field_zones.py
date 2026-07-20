@@ -19,6 +19,17 @@ MAX_ZONES = 12
 MIN_RASTER_PX = 16
 MAX_RASTER_PX = 512
 
+# Absolute upper bound on a single returned subfield's area, in hectares - a hard operational
+# limit (equipment/route-planning constraints), not just a sizing default, so it holds regardless
+# of the requested target_plot_size_ha or which strategy produced the zones. Matches the
+# frontend's own APP_CONFIG.maxSubfieldAreaHa (src/app/config/app.config.ts, krecik/krecik repo),
+# which validates the *requested* target - this is the backend-side guarantee that the *actual*
+# returned geometry never exceeds it either, enforced as a hard post-process split (see
+# _split_oversized_zones) since neither strategy otherwise guarantees it: "contiguous" only
+# guarantees zones are within MAX_ZONE_SIZE_RATIO of each other (a large target_plot_size_ha still
+# yields large zones), and "smooth" doesn't bound zone size at all.
+MAX_SUBFIELD_AREA_HA = 4.0
+
 # A zone's area may be at most this many times larger than the field's smallest zone (i.e. up to
 # 15% bigger) - real field operations (spraying, sampling) need plots that are roughly the same
 # size. strategy="contiguous" (see _balanced_contiguous_zones) satisfies this by construction
@@ -732,6 +743,63 @@ def _balanced_contiguous_zones(
     return [assigned_zone == zone_index for zone_index in range(n_zones)]
 
 
+def _split_until_within_budget(
+    mask: np.ndarray, smoothed_ndvi: np.ndarray, max_pixels: int, depth: int = 0
+) -> list:
+    """Recursively splits `mask` (via _balanced_contiguous_zones + _enforce_4_connectivity, same
+    as _split_oversized_zones) until every piece is at most max_pixels - not a single split pass
+    sized by "divide the pixel count evenly", because _balanced_contiguous_zones only guarantees
+    pieces are within MAX_ZONE_SIZE_RATIO of each other, not that every piece individually respects
+    an external budget (verified experimentally: a single pass split into 2 "equal" halves still
+    left one piece ~3% over MAX_SUBFIELD_AREA_HA). Recursing on whichever pieces are still too big
+    closes that gap exactly, at the pixel level, rather than leaving it to a size-ratio margin that
+    would only make an overshoot less likely, not impossible.
+
+    depth is a hard recursion cutoff (not expected to matter for any real field - it would take a
+    single piece failing to shrink at all across 6 halvings, which _balanced_contiguous_zones's
+    "target an exact pixel share" construction doesn't do) so a pathological mask can't recurse
+    forever.
+    """
+    pixel_count = int(mask.sum())
+    if pixel_count == 0:
+        return []
+    if pixel_count <= max_pixels or depth >= 6:
+        return [mask]
+    n_pieces = math.ceil(pixel_count / max_pixels)
+    sub_masks = _enforce_4_connectivity(_balanced_contiguous_zones(smoothed_ndvi, mask, n_pieces))
+    result = []
+    for sub_mask in sub_masks:
+        if sub_mask.any():
+            result.extend(_split_until_within_budget(sub_mask, smoothed_ndvi, max_pixels, depth + 1))
+    return result
+
+
+def _split_oversized_zones(
+    zone_masks: list, smoothed_ndvi: np.ndarray, pixel_area_ha: float
+) -> list:
+    """Splits any zone mask bigger than MAX_SUBFIELD_AREA_HA into further balanced, 4-connected
+    contiguous pieces (see _split_until_within_budget) - reusing the exact same region-growing/
+    absorption/connectivity machinery "contiguous" itself uses, so every mask this returns
+    respects the hard cap regardless of which strategy produced it or what target_plot_size_ha
+    was requested.
+
+    Runs on the raw pixel masks, before vectorization, for the same reason
+    _enforce_4_connectivity does: splitting a raster region and re-growing sub-zones from it
+    guarantees properly-joined, 4-connected results by construction, rather than needing to fix
+    up a polygon (or several disconnected ones) after the fact.
+
+    pixel_area_ha is the area of one raster pixel in hectares - uniform across the grid (built
+    from an evenly-spaced lon/lat mesh before reprojection, see compute_field_zones), so the ha
+    cap converts to a simple pixel-count budget without having to vectorize a mask just to
+    measure it.
+    """
+    max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
+    result = []
+    for mask in zone_masks:
+        result.extend(_split_until_within_budget(mask, smoothed_ndvi, max_pixels))
+    return result
+
+
 ZONE_STRATEGIES = ("smooth", "contiguous")
 
 
@@ -857,6 +925,12 @@ def compute_field_zones(
         label_raster = _majority_filter(label_raster, radius=max(1, round(blur_radius * 3)), iterations=8)
         zone_masks = [label_raster == zone_id for zone_id in range(actual_n_zones)]
 
+    # Hard cap regardless of strategy or the requested target_plot_size_ha - see
+    # MAX_SUBFIELD_AREA_HA. Every raster pixel is the same lon/lat size (evenly-spaced mesh, see
+    # lon_edges/lat_edges above), so field_area_ha / valid-pixel-count is that size in hectares.
+    pixel_area_ha = field_area_ha / max(int(valid.sum()), 1)
+    zone_masks = _split_oversized_zones(zone_masks, smoothed_ndvi, pixel_area_ha)
+
     def _raw_zone_geometry(mask: np.ndarray):
         geom = _vectorize_mask(mask, lon_edges, lat_edges)
         if geom is None:
@@ -908,14 +982,13 @@ def compute_field_zones(
         # post-simplification gap left over, merging it into whichever zone is nearest.
         zone_geoms = _fill_field_edge_gaps(zone_geoms, field_polygon)
 
-    def _zone_entry(zone_id: int, mask: np.ndarray, geom) -> dict | None:
+    def _zone_entry(mask: np.ndarray, geom) -> dict | None:
         if geom is None:
             return None
         area_ha = _area_ha(geom, transformer)
         if area_ha < 1e-4:
             return None
         return {
-            "zone_id": zone_id,
             # Reported from the raw (unsmoothed) NDVI, not the blurred values clustering
             # actually ran on - stats should reflect what's really there, not the smoothing.
             "ndvi_mean": round(float(ndvi[mask].mean()), 4),
@@ -926,10 +999,18 @@ def compute_field_zones(
         }
 
     zones = []
-    for idx, (mask, geom) in enumerate(zip(zone_masks, zone_geoms)):
-        entry = _zone_entry(idx, mask, geom)
+    for mask, geom in zip(zone_masks, zone_geoms):
+        entry = _zone_entry(mask, geom)
         if entry is not None:
             zones.append(entry)
+
+    # Both strategies build zone_masks in ascending-NDVI order already, but
+    # _split_oversized_zones can append an oversized zone's sub-pieces after later, lower-NDVI
+    # zones, breaking that order - re-sort explicitly rather than relying on it falling out of
+    # construction, to keep the documented "sorted ascending by mean NDVI" contract regardless.
+    zones.sort(key=lambda z: z["ndvi_mean"])
+    for zone_id, z in enumerate(zones):
+        z["zone_id"] = zone_id
 
     return {
         "type": "FeatureCollection",
