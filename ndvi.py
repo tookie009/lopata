@@ -63,10 +63,11 @@ class _TTLCache:
         self._store[key] = (time.monotonic() + self._ttl, value)
 
 
-# 1 hour: long enough to cover "preview image, then divide into zones" within one planning
-# session, short enough that a genuinely new Sentinel-2 scene (revisit time ~5 days) is never
-# meaningfully stale relative to it.
-_RAW_NDVI_CACHE = _TTLCache(ttl_seconds=3600)
+# Default 1 hour: long enough to cover "preview image, then divide into zones" within one
+# planning session, short enough that a genuinely new Sentinel-2 scene (revisit time ~5 days) is
+# never meaningfully stale relative to it. Overridable via NDVI_CACHE_TTL_SECONDS (settings.
+# ndvi_cache_ttl_seconds) - set to 0 to disable caching entirely, e.g. while testing.
+_RAW_NDVI_CACHE = _TTLCache(ttl_seconds=settings.ndvi_cache_ttl_seconds)
 
 # Raw (uncolored) NDVI + validity mask, as FLOAT32 - used both for the colored PNG (fetch_ndvi_png,
 # which stretches contrast per-request before coloring - see below) and for numeric analysis
