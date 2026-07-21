@@ -1,8 +1,9 @@
 import json
 import logging
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 
 from field_zones import compute_field_zones
@@ -21,16 +22,75 @@ app = FastAPI(
 # Full request/response JSON for /field-zones, one plain-text block per call - separate from
 # uvicorn's own access log (which only has the status line, not the bodies) so a request that
 # produced a bad geometry can be copy-pasted straight out of this file and handed over as-is,
-# instead of re-typing/re-fetching it from the browser dev tools every time.
+# instead of re-typing/re-fetching it from the browser dev tools every time. Also goes to stdout
+# (not just the file) since on Railway the container disk isn't visible anywhere - the Logs tab
+# only streams stdout/stderr.
 _field_zones_logger = logging.getLogger("field_zones_requests")
 _field_zones_logger.setLevel(logging.INFO)
 _field_zones_logger.propagate = False
 if not _field_zones_logger.handlers:
     _log_path = Path(__file__).parent / "logs" / "field_zones_requests.log"
     _log_path.parent.mkdir(parents=True, exist_ok=True)
-    _handler = logging.FileHandler(_log_path, encoding="utf-8")
-    _handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    _field_zones_logger.addHandler(_handler)
+    _formatter = logging.Formatter("%(asctime)s %(message)s")
+    _file_handler = logging.FileHandler(_log_path, encoding="utf-8")
+    _file_handler.setFormatter(_formatter)
+    _field_zones_logger.addHandler(_file_handler)
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(_formatter)
+    _field_zones_logger.addHandler(_console_handler)
+
+# One line per request across every endpoint (method, path, status, duration, client) - to
+# stdout only, since this is what actually shows up in Railway's Logs tab. Separate from the
+# _field_zones_logger above, which additionally dumps full request/response bodies for that one
+# endpoint.
+_access_logger = logging.getLogger("lopata_access")
+_access_logger.setLevel(logging.INFO)
+_access_logger.propagate = False
+if not _access_logger.handlers:
+    _access_handler = logging.StreamHandler()
+    _access_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _access_logger.addHandler(_access_handler)
+
+
+_BODY_LOG_LIMIT = 2000
+
+
+def _format_body_for_log(body_bytes: bytes) -> str:
+    """Best-effort text preview of a request body for the access log - truncated so one huge
+    polygon doesn't blow up a single log line, "-" for the common empty-body case (GET/docs)."""
+    if not body_bytes:
+        return "-"
+    try:
+        text = body_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"<{len(body_bytes)} bytes binary>"
+    if len(text) > _BODY_LOG_LIMIT:
+        return text[:_BODY_LOG_LIMIT] + f"...<truncated, {len(text)} chars total>"
+    return text
+
+
+@app.middleware("http")
+async def log_all_requests(request: Request, call_next):
+    start = time.monotonic()
+    client = request.client.host if request.client else "?"
+    # Starlette caches the raw bytes on first read, so the route handler downstream still gets a
+    # fresh, fully-readable body afterwards - reading it here for logging doesn't consume it.
+    body_preview = _format_body_for_log(await request.body())
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.monotonic() - start) * 1000
+        _access_logger.exception(
+            "%s %s client=%s body=%s -> EXCEPTION (%.1fms)",
+            request.method, request.url.path, client, body_preview, duration_ms,
+        )
+        raise
+    duration_ms = (time.monotonic() - start) * 1000
+    _access_logger.info(
+        "%s %s client=%s body=%s -> %s (%.1fms)",
+        request.method, request.url.path, client, body_preview, response.status_code, duration_ms,
+    )
+    return response
 
 
 def _ndvi_metadata_headers(metadata: dict) -> dict[str, str]:
