@@ -1059,6 +1059,33 @@ def compute_field_zones(
             for g in zone_geoms
         ]
 
+        # EXPERIMENT: the field_polygon re-clip just above can itself introduce a fresh,
+        # near-zero-area sliver part on a zone that was otherwise clean (a GEOS intersection()
+        # artifact, same class of issue _polygonal_only's docstring describes for unary_union) -
+        # one that never goes through _simplify_zone_boundaries's own dust filter since that ran
+        # earlier, before this re-clip. Stripped here with the same dust_area_m2 threshold,
+        # dropped outright rather than reattached to a neighbor (already been through gap-filling
+        # once, and it's by definition under a few pixels' worth of area) - targets a real reported
+        # case: a zone rendering as a MultiPolygon with one real part plus a 3-point ~0 m^2
+        # triangle, which showed up on the map as a stray duplicate area label (Leaflet's
+        # L.geoJSON().bindTooltip() binds one tooltip per MultiPolygon part - see
+        # map.service.ts's addGridCell in the krecik/krecik repo).
+        def _to_utm(g):
+            return shp_transform(transformer.transform, g)
+
+        def _from_utm(g):
+            return shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), g)
+
+        dust_area_m2 = DUST_PART_MAX_PIXELS * resolution_m ** 2
+        cleaned_geoms = []
+        for g in zone_geoms:
+            if g is None or g.is_empty:
+                cleaned_geoms.append(g)
+                continue
+            kept_utm, _dropped = _split_dust_parts(_to_utm(g), dust_area_m2)
+            cleaned_geoms.append(_from_utm(kept_utm))
+        zone_geoms = cleaned_geoms
+
     def _zone_entry(mask: np.ndarray, geom) -> dict | None:
         if geom is None:
             return None
