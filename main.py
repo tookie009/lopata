@@ -160,9 +160,7 @@ def get_ndvi(payload: NdviRequest):
     ),
 )
 def post_field_zones(payload: FieldZonesRequest):
-    _field_zones_logger.info(
-        "REQUEST /field-zones\n%s", json.dumps(payload.model_dump(), ensure_ascii=False, indent=2)
-    )
+    request_json = payload.model_dump()
     try:
         result = compute_field_zones(
             polygon_lonlat=payload.polygon,
@@ -172,19 +170,30 @@ def post_field_zones(payload: FieldZonesRequest):
             strategy=payload.strategy,
             line_smoothing=payload.line_smoothing,
         )
-        _field_zones_logger.info(
-            "RESPONSE /field-zones\n%s", json.dumps(result, ensure_ascii=False, indent=2)
-        )
+        _log_field_zones_call(request_json, response=result)
         return result
     except LookupError as exc:
-        _field_zones_logger.info("ERROR /field-zones 404: %s", exc)
+        _log_field_zones_call(request_json, error=f"404: {exc}")
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
-        _field_zones_logger.info("ERROR /field-zones 400: %s", exc)
+        _log_field_zones_call(request_json, error=f"400: {exc}")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        _field_zones_logger.info("ERROR /field-zones 502: %s", exc)
+        _log_field_zones_call(request_json, error=f"502: {exc}")
         raise HTTPException(status_code=502, detail=f"Blad przetwarzania: {exc}") from exc
+
+
+def _log_field_zones_call(request_json: dict, response=None, error: str | None = None) -> None:
+    """One compact, single-line JSON log entry per /field-zones call (request + response, or
+    request + error) - separate calls with indent=2 pretty-printing used to spread one call across
+    many lines in the log viewer (Railway/Render split on embedded newlines), making a single
+    request/response pair hard to find/copy as one unit."""
+    entry = {"request": request_json}
+    if response is not None:
+        entry["response"] = response
+    if error is not None:
+        entry["error"] = error
+    _field_zones_logger.info(json.dumps(entry, ensure_ascii=False))
 
 
 if __name__ == "__main__":
