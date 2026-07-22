@@ -839,6 +839,92 @@ def _split_until_within_budget(
     return result
 
 
+def _dilate4(mask: np.ndarray) -> np.ndarray:
+    """mask, plus every pixel 4-adjacent to it."""
+    dil = mask.copy()
+    dil[1:, :] |= mask[:-1, :]
+    dil[:-1, :] |= mask[1:, :]
+    dil[:, 1:] |= mask[:, :-1]
+    dil[:, :-1] |= mask[:, 1:]
+    return dil
+
+
+def _touches(mask_a: np.ndarray, mask_b: np.ndarray) -> bool:
+    return bool(np.any(mask_a & _dilate4(mask_b)))
+
+
+def _transfer_border_pixels(source: np.ndarray, target: np.ndarray, take: int) -> int:
+    """Moves up to `take` pixels from `source` into `target`, mutating both in place - peeled
+    ring-by-ring inward from whichever pixels currently border `target` (so `target` only ever
+    grows from pixels already touching it, and `source` only ever shrinks from its own outer
+    edge, keeping both roughly as contiguous as they started rather than punching a hole in the
+    middle of either). Returns how many pixels actually moved - less than `take` if `source` ran
+    out of pixels reachable from `target` first (they stopped touching at all)."""
+    moved = 0
+    while moved < take:
+        border = source & _dilate4(target)
+        if not np.any(border):
+            break
+        rows, cols = np.where(border)
+        n_this_ring = min(len(rows), take - moved)
+        for k in range(n_this_ring):
+            r, c = int(rows[k]), int(cols[k])
+            source[r, c] = False
+            target[r, c] = True
+        moved += n_this_ring
+    return moved
+
+
+def _rebalance_oversized_zones(zone_masks: list, max_pixels: int) -> None:
+    """Mutates zone_masks in place: for any zone over max_pixels, hands its excess pixels off to
+    whichever touching neighbor currently has the most spare room (falling back to a second,
+    third, ... neighbor if one alone can't absorb it all), instead of leaving it to
+    _split_oversized_zones to manufacture a whole new zone for the overage.
+
+    This exists because splitting an oversized zone into >=2 brand-new zones - unconditionally,
+    even for a one-pixel overage - inflates the total zone count far more than the overage
+    warrants: verified on a real ~102ha field requesting a 4ha target, where the ideal count
+    (ceil(102/4) = 26) came back as 34 zones - roughly a third of them had been silently doubled
+    by a percent-or-two of overage each, because target_plot_size_ha and MAX_SUBFIELD_AREA_HA
+    happened to be the same value, so ordinary balance variance alone put ~half the zones
+    (whichever landed above the average) over the cap. A zone that's 2% over the cap needs a
+    sliver hurried off to a neighbor, not a whole second zone.
+
+    Whatever a zone still can't shed this way (no touching neighbor has enough combined spare
+    room - rare) is left over budget for _split_oversized_zones to actually split, same as
+    before this existed.
+    """
+    n = len(zone_masks)
+    sizes = [int(m.sum()) for m in zone_masks]
+
+    for i in range(n):
+        excess = sizes[i] - max_pixels
+        if excess <= 0:
+            continue
+
+        # Most spare room first - a big overage is more likely resolved by one generous
+        # neighbor than fragmented thinly across several already-nearly-full ones.
+        neighbor_order = sorted(
+            (j for j in range(n) if j != i and zone_masks[j].any()),
+            key=lambda j: max_pixels - sizes[j],
+            reverse=True,
+        )
+
+        for j in neighbor_order:
+            if excess <= 0:
+                break
+            spare = max_pixels - sizes[j]
+            if spare <= 0:
+                continue
+            if not _touches(zone_masks[i], zone_masks[j]):
+                continue
+
+            moved = _transfer_border_pixels(zone_masks[i], zone_masks[j], min(spare, excess))
+            sizes[i] -= moved
+            sizes[j] += moved
+            excess -= moved
+
+
 def _split_oversized_zones(
     zone_masks: list, smoothed_ndvi: np.ndarray, pixel_area_ha: float
 ) -> list:
@@ -856,9 +942,12 @@ def _split_oversized_zones(
     pixel_area_ha is the area of one raster pixel in hectares - uniform across the grid (built
     from an evenly-spaced lon/lat mesh before reprojection, see compute_field_zones), so the ha
     cap converts to a simple pixel-count budget without having to vectorize a mask just to
-    measure it.
+    measure it. _rebalance_oversized_zones runs first so a merely-marginal overage gets handed
+    to a neighbor instead of manufacturing a new zone - only genuine excess (more than every
+    touching neighbor combined has room for) actually reaches the splitting below.
     """
     max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
+    _rebalance_oversized_zones(zone_masks, max_pixels)
     result = []
     for mask in zone_masks:
         result.extend(_split_until_within_budget(mask, smoothed_ndvi, max_pixels))
@@ -1204,6 +1293,29 @@ def compute_field_zones(
     # gap-filling, so they may be a hair smaller than their exact pixel share - the safe
     # direction to err in, given the alternative is exceeding the cap again.
     max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
+
+    # Before falling back to a full re-split (which always manufactures a brand-new zone, even
+    # for the couple-percent overage this raster-to-vector loss typically causes - see
+    # _rebalance_oversized_zones's docstring for why that's disproportionate), try donating the
+    # excess to a touching sibling with spare room instead. Re-rasterizes every zone's CURRENT
+    # (post-gap-fill/simplification) geometry to do the donation at the pixel level, then
+    # re-vectorizes only whichever zones actually changed - one that didn't touch any under-cap
+    # neighbor (or wasn't oversized to begin with) is left completely untouched, geometry and
+    # all.
+    rebalance_masks = [
+        (valid & _shapely_contains(geom, grid_lon, grid_lat)) if geom is not None else np.zeros_like(valid)
+        for geom in zone_geoms
+    ]
+    sizes_before_rebalance = [int(m.sum()) for m in rebalance_masks]
+    _rebalance_oversized_zones(rebalance_masks, max_pixels)
+    for idx, geom in enumerate(zone_geoms):
+        if geom is None or int(rebalance_masks[idx].sum()) == sizes_before_rebalance[idx]:
+            continue
+        new_geom = _raw_zone_geometry(rebalance_masks[idx])
+        if new_geom is not None:
+            zone_geoms[idx] = new_geom
+            zone_masks[idx] = rebalance_masks[idx]
+
     final_entries: list[tuple[np.ndarray, object]] = []
     for mask, geom in zip(zone_masks, zone_geoms):
         if geom is None:
