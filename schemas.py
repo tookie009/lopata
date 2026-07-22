@@ -1,5 +1,3 @@
-from typing import Literal
-
 from pydantic import BaseModel, Field, field_validator
 
 from field_zones import DEFAULT_LINE_SMOOTHING, DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE
@@ -50,18 +48,6 @@ class FieldZonesRequest(BaseModel):
     max_cloud_cover: float = Field(30.0, ge=0, le=100, description="Maksymalne dopuszczalne zachmurzenie sceny w %")
     resolution_m: float = Field(
         10.0, gt=0, le=100, description="Rozdzielczosc analizy NDVI w metrach na piksel (natywna Sentinel-2 to 10m)"
-    )
-    strategy: Literal["smooth", "contiguous"] = Field(
-        "smooth",
-        description=(
-            "'smooth': prosty podzial wg wartosci NDVI (k-means) z wygladzaniem malych wysp - "
-            "szybki, ale strefy moga wyjsc nierownej wielkosci i nadal jako kilka rozlacznych "
-            "plam. "
-            "'contiguous': strefy budowane od ziarna (region growing) do rownej liczby pikseli - "
-            "kazdy zwrocony wielokat jest jednym spojnym kawalkiem I ma powierzchnie w granicach "
-            "MAX_ZONE_SIZE_RATIO wzgledem pozostalych stref (patrz field_zones.py), kosztem "
-            "nieco dluzszego przetwarzania."
-        ),
     )
     line_smoothing: float = Field(
         DEFAULT_LINE_SMOOTHING,

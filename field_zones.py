@@ -22,22 +22,19 @@ MAX_RASTER_PX = 512
 
 # Absolute upper bound on a single returned subfield's area, in hectares - a hard operational
 # limit (equipment/route-planning constraints), not just a sizing default, so it holds regardless
-# of the requested target_plot_size_ha or which strategy produced the zones. Matches the
-# frontend's own APP_CONFIG.maxSubfieldAreaHa (src/app/config/app.config.ts, krecik/krecik repo),
-# which validates the *requested* target - this is the backend-side guarantee that the *actual*
-# returned geometry never exceeds it either, enforced as a hard post-process split (see
-# _split_oversized_zones) since neither strategy otherwise guarantees it: "contiguous" only
-# guarantees zones are within MAX_ZONE_SIZE_RATIO of each other (a large target_plot_size_ha still
-# yields large zones), and "smooth" doesn't bound zone size at all.
+# of the requested target_plot_size_ha. Matches the frontend's own APP_CONFIG.maxSubfieldAreaHa
+# (src/app/config/app.config.ts, krecik/krecik repo), which validates the *requested* target -
+# this is the backend-side guarantee that the *actual* returned geometry never exceeds it either,
+# enforced as a hard post-process split (see _split_oversized_zones) since region growing only
+# guarantees zones are within MAX_ZONE_SIZE_RATIO of each other (a large target_plot_size_ha
+# still yields large zones), not an absolute cap.
 MAX_SUBFIELD_AREA_HA = 4.0
 
 # A zone's area may be at most this many times larger than the field's smallest zone (i.e. up to
 # 15% bigger) - real field operations (spraying, sampling) need plots that are roughly the same
-# size. strategy="contiguous" (see _balanced_contiguous_zones) satisfies this by construction
-# (each zone is grown to an explicit pixel-count share, so any two zones differ by at most a
-# handful of pixels - comfortably inside this ratio for anything but a near-empty field); it's
-# not enforced for strategy="smooth", which is kept as the plain, unbalanced k-means baseline for
-# comparison.
+# size. _balanced_contiguous_zones satisfies this by construction (each zone is grown to an
+# explicit pixel-count share, so any two zones differ by at most a handful of pixels -
+# comfortably inside this ratio for anything but a near-empty field).
 MAX_ZONE_SIZE_RATIO = 1.15
 
 # Sample-point selection (see _select_sample_points): within a zone, discard pixels outside the
@@ -414,43 +411,13 @@ def _fill_field_edge_gaps(
     return result
 
 
-def _kmeans_1d(values: np.ndarray, k: int, n_iter: int = 50, seed: int = 0):
-    """Simple 1D k-means, returns labels (0..k-1, ascending by center) and sorted centers."""
-    rng = np.random.default_rng(seed)
-    quantiles = np.linspace(0, 1, k + 2)[1:-1]
-    centers = np.quantile(values, quantiles)
-    labels = np.zeros(values.shape, dtype=int)
-
-    for _ in range(n_iter):
-        dist = np.abs(values[:, None] - centers[None, :])
-        labels = np.argmin(dist, axis=1)
-        new_centers = centers.copy()
-        for i in range(k):
-            mask = labels == i
-            if np.any(mask):
-                new_centers[i] = values[mask].mean()
-        if np.allclose(new_centers, centers):
-            centers = new_centers
-            break
-        centers = new_centers
-
-    order = np.argsort(centers)
-    remap = np.empty(k, dtype=int)
-    remap[order] = np.arange(k)
-    return remap[labels], centers[order]
-
-
 def _box_blur(array: np.ndarray, radius: int) -> np.ndarray:
     """Mean over a (2*radius+1)^2 window (edge-padded), computed via an integral image so it's
     O(1) per pixel regardless of radius.
 
-    _kmeans_1d clusters purely on pixel *value*, with no notion of spatial position - real NDVI
-    is noisy pixel-to-pixel (sensor noise, sub-pixel mixed ground cover) even within a uniform
-    crop, and once several cluster centers end up closer together than that noise floor (easy
-    with up to MAX_ZONES clusters over a modest NDVI range), neighboring pixels flip between
-    clusters almost at random. That renders as a chaotic speckle/crosshatch of zone boundaries
-    instead of coherent regions. Blurring before clustering (see compute_field_zones) averages
-    that noise out so nearby pixels agree, without erasing genuine zone-scale NDVI variation.
+    Real NDVI is noisy pixel-to-pixel (sensor noise, sub-pixel mixed ground cover) even within a
+    uniform crop. Blurring before clustering/growth (see compute_field_zones) averages that noise
+    out so nearby pixels agree, without erasing genuine zone-scale NDVI variation.
     """
     if radius <= 0:
         return array
@@ -464,41 +431,6 @@ def _box_blur(array: np.ndarray, radius: int) -> np.ndarray:
         + integral[:-window, :-window]
     )
     return total / (window * window)
-
-
-def _majority_filter(label_raster: np.ndarray, radius: int = 1, iterations: int = 4) -> np.ndarray:
-    """Iteratively replaces each in-field pixel's zone label (labels are >= 0; out-of-field
-    pixels stay -1 and are never touched or counted) with whichever label is most common among
-    its (2*radius+1)^2 neighbors.
-
-    Pre-clustering smoothing (_box_blur) alone doesn't guarantee this: even a smoothed NDVI
-    surface can cross a cluster's value boundary back and forth many times as it varies
-    spatially (canopy texture, drainage lines, ...), which per-value clustering has no way to
-    see - it only ever looks at value, never position. Voting on the *discrete* zone labels
-    directly enforces spatial coherence regardless of why they fragmented, converging a chaotic
-    speckle of tiny same-label patches into contiguous regions within a few iterations.
-    """
-    result = label_raster.copy()
-    labels_present = sorted(int(l) for l in np.unique(result) if l >= 0)
-    if len(labels_present) <= 1:
-        return result
-
-    for _ in range(iterations):
-        # One-hot neighbor counts per label via the same box-blur used for pre-clustering
-        # smoothing, rather than a per-pixel Python loop over the raster.
-        counts = np.stack(
-            [_box_blur((result == label).astype(np.float64), radius) for label in labels_present],
-            axis=-1,
-        )
-        majority_idx = np.argmax(counts, axis=-1)
-        majority_labels = np.array(labels_present)[majority_idx]
-
-        new_result = np.where(result >= 0, majority_labels, result)
-        if np.array_equal(new_result, result):
-            break
-        result = new_result
-
-    return result
 
 
 def _vectorize_mask(mask: np.ndarray, lon_edges: np.ndarray, lat_edges: np.ndarray):
@@ -870,7 +802,7 @@ def _bisection_contiguous_zones(
     A very non-convex region can still end up with an accidentally-disconnected piece on one side
     of the cut (e.g. a C-shaped region cut straight through both arms) - not handled specially
     here, since compute_field_zones already runs the whole bisection result through
-    _enforce_4_connectivity afterward (same safety net the other strategy relies on), which
+    _enforce_4_connectivity afterward (same safety net sequential growth relies on), which
     reassigns any disconnected fragment to whichever neighboring zone actually borders it.
     """
     if n_zones <= 1 or not valid.any():
@@ -1038,9 +970,8 @@ def _split_oversized_zones(
 ) -> list:
     """Splits any zone mask bigger than MAX_SUBFIELD_AREA_HA into further balanced, 4-connected
     contiguous pieces (see _split_until_within_budget) - reusing the exact same region-growing/
-    absorption/connectivity machinery "contiguous" itself uses, so every mask this returns
-    respects the hard cap regardless of which strategy produced it or what target_plot_size_ha
-    was requested.
+    absorption/connectivity machinery zone construction itself uses, so every mask this returns
+    respects the hard cap regardless of what target_plot_size_ha was requested.
 
     Runs on the raw pixel masks, before vectorization, for the same reason
     _enforce_4_connectivity does: splitting a raster region and re-growing sub-zones from it
@@ -1095,42 +1026,30 @@ def _farthest_point_sample(points_m: np.ndarray, n: int) -> list[int]:
     return chosen
 
 
-ZONE_STRATEGIES = ("smooth", "contiguous")
-
-
 def compute_field_zones(
     polygon_lonlat: list[tuple[float, float]],
     target_plot_size_ha: float,
     max_cloud_cover: float = 30.0,
     resolution_m: float = 10.0,
-    strategy: str = "smooth",
     line_smoothing: float = DEFAULT_LINE_SMOOTHING,
     max_sample_points_per_zone: int = DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE,
     field_id: int | None = None,
 ) -> dict:
-    """strategy="smooth": plain 1D k-means over NDVI value (see _kmeans_1d) plus a hard
-    majority-filter pass to merge small same-label islands into their surrounding zone. Kept as
-    the naive baseline for comparison - zones are NOT guaranteed equal-area or fragment-free (a
-    zone can still come back as several disjoint patches wherever two unconnected spots share a
-    cluster and survive the majority filter), and the returned feature count always equals the
-    requested zone count.
-
-    strategy="contiguous": ignores k-means/majority-filter entirely and instead builds zones by
-    seeded region growing (see _balanced_contiguous_zones) - each zone is grown outward from a
-    seed pixel to an explicit, near-equal pixel-count share of the field, so every returned
-    polygon is both a single contiguous shape AND within MAX_ZONE_SIZE_RATIO of every other
-    zone's area, by construction rather than by post-hoc merging.
+    """Builds zones by seeded region growing (see _balanced_contiguous_zones) - each zone is
+    grown outward from a seed pixel to an explicit, near-equal pixel-count share of the field, so
+    every returned polygon is both a single contiguous shape AND within MAX_ZONE_SIZE_RATIO of
+    every other zone's area, by construction rather than by post-hoc merging. Falls back to
+    _bisection_contiguous_zones (recursive positional splitting) if that needs more zones than
+    requested to keep every one under the hard cap - see compute_field_zones's own fallback logic
+    below and _bisection_contiguous_zones's docstring.
 
     line_smoothing controls how aggressively _simplify_zone_boundaries straightens every zone's
-    boundary afterward (both strategies): the actual Douglas-Peucker tolerance used is
-    resolution_m * line_smoothing (a ground distance in meters), so it scales with the raster's
-    own pixel size rather than needing to be re-tuned per resolution_m. Higher = straighter/fewer
-    vertices; in practice values beyond ~2.5 stop helping much, since the network's junction
-    points (where 3+ zones meet) are a hard floor on vertex count no tolerance can simplify past.
+    boundary afterward: the actual Douglas-Peucker tolerance used is resolution_m * line_smoothing
+    (a ground distance in meters), so it scales with the raster's own pixel size rather than
+    needing to be re-tuned per resolution_m. Higher = straighter/fewer vertices; in practice
+    values beyond ~2.5 stop helping much, since the network's junction points (where 3+ zones
+    meet) are a hard floor on vertex count no tolerance can simplify past.
     """
-    if strategy not in ZONE_STRATEGIES:
-        raise ValueError(f"Nieznana strategia podzialu: {strategy!r} (oczekiwano jednej z {ZONE_STRATEGIES})")
-
     field_polygon = Polygon(polygon_lonlat)
     if not field_polygon.is_valid or field_polygon.area == 0:
         raise ValueError("Podany wielokat pola jest niepoprawny (samoprzecinajacy sie lub zerowej powierzchni)")
@@ -1217,45 +1136,34 @@ def compute_field_zones(
     max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
 
     # Reported back in the response (construction_algorithm) so callers/logs can see which one
-    # actually produced the returned zones, not just which strategy was requested - "contiguous"
-    # can fall back from "sequential" to "bisection" below.
-    construction_algorithm = "smooth" if strategy != "contiguous" else "sequential"
+    # actually produced the returned zones: "sequential" (the default) or "bisection" (fallback
+    # below).
+    construction_algorithm = "sequential"
 
-    if strategy == "contiguous":
-        zone_masks = _balanced_contiguous_zones(smoothed_ndvi, valid, actual_n_zones, max_pixels=max_pixels)
-        # Region growing/absorption both use 8-connectivity (see GROWTH_SHAPE_WEIGHT's docstring),
-        # which can leave a pixel reachable from its own zone only diagonally - see
-        # _enforce_4_connectivity for why that reads as a detached "kwadracik" once vectorized.
-        zone_masks = _enforce_4_connectivity(zone_masks)
-        zone_pixel_counts = [int(m.sum()) for m in zone_masks if m.any()]
-        if zone_pixel_counts:
-            size_ratio = max(zone_pixel_counts) / min(zone_pixel_counts)
-            if size_ratio > MAX_ZONE_SIZE_RATIO:
-                # Region growing guarantees this for any ordinary field outline (see
-                # _balanced_contiguous_zones's docstring) - only a pathologically non-convex
-                # shape (far beyond what a real field looks like) should ever land here, so this
-                # is a visibility signal for that rare case, not a hard failure.
-                logger.warning(
-                    "NDVI zone size ratio %.3f exceeds MAX_ZONE_SIZE_RATIO=%.2f "
-                    "(zone pixel counts: %s) - field outline is unusually non-convex",
-                    size_ratio, MAX_ZONE_SIZE_RATIO, sorted(zone_pixel_counts, reverse=True),
-                )
-    else:
-        labels_flat, _centers = _kmeans_1d(valid_values, actual_n_zones)
-        label_raster = np.full(ndvi.shape, -1, dtype=int)
-        label_raster[valid] = labels_flat
-        label_raster = _majority_filter(label_raster, radius=max(1, round(blur_radius * 1.5)))
-        # Run the majority filter again, harder, so small same-label islands get absorbed into
-        # whichever zone actually surrounds them instead of surviving as a separate patch - at
-        # the cost of zones no longer purely reflecting NDVI value near their edges.
-        label_raster = _majority_filter(label_raster, radius=max(1, round(blur_radius * 3)), iterations=8)
-        zone_masks = [label_raster == zone_id for zone_id in range(actual_n_zones)]
+    zone_masks = _balanced_contiguous_zones(smoothed_ndvi, valid, actual_n_zones, max_pixels=max_pixels)
+    # Region growing/absorption both use 8-connectivity (see GROWTH_SHAPE_WEIGHT's docstring),
+    # which can leave a pixel reachable from its own zone only diagonally - see
+    # _enforce_4_connectivity for why that reads as a detached "kwadracik" once vectorized.
+    zone_masks = _enforce_4_connectivity(zone_masks)
+    zone_pixel_counts = [int(m.sum()) for m in zone_masks if m.any()]
+    if zone_pixel_counts:
+        size_ratio = max(zone_pixel_counts) / min(zone_pixel_counts)
+        if size_ratio > MAX_ZONE_SIZE_RATIO:
+            # Region growing guarantees this for any ordinary field outline (see
+            # _balanced_contiguous_zones's docstring) - only a pathologically non-convex
+            # shape (far beyond what a real field looks like) should ever land here, so this
+            # is a visibility signal for that rare case, not a hard failure.
+            logger.warning(
+                "NDVI zone size ratio %.3f exceeds MAX_ZONE_SIZE_RATIO=%.2f "
+                "(zone pixel counts: %s) - field outline is unusually non-convex",
+                size_ratio, MAX_ZONE_SIZE_RATIO, sorted(zone_pixel_counts, reverse=True),
+            )
 
-    # Hard cap regardless of strategy or the requested target_plot_size_ha - see
-    # MAX_SUBFIELD_AREA_HA (pixel_area_ha/max_pixels already computed above, before construction).
+    # Hard cap regardless of the requested target_plot_size_ha - see MAX_SUBFIELD_AREA_HA
+    # (pixel_area_ha/max_pixels already computed above, before construction).
     zone_masks = _split_oversized_zones(zone_masks, smoothed_ndvi, pixel_area_ha)
 
-    if strategy == "contiguous" and len(zone_masks) > actual_n_zones:
+    if len(zone_masks) > actual_n_zones:
         # Sequential growth (_balanced_contiguous_zones) needed more zones than requested to keep
         # every one under the hard cap - despite max_pixels capping growth and
         # _rebalance_oversized_zones trying to donate excess to a neighbor first (both above),
@@ -1267,8 +1175,8 @@ def compute_field_zones(
         # ever two regions compete for territory at a time there - and keep whichever attempt
         # used fewer zones.
         logger.warning(
-            "contiguous strategy needed %d zones instead of the requested %d - retrying with "
-            "bisection construction instead of sequential growth",
+            "sequential growth needed %d zones instead of the requested %d - retrying with "
+            "bisection construction",
             len(zone_masks), actual_n_zones,
         )
         bisection_masks = _bisection_contiguous_zones(valid, actual_n_zones, max_pixels=max_pixels)

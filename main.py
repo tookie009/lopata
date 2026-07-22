@@ -162,10 +162,10 @@ def get_ndvi(payload: NdviRequest):
     summary="Podziel pole na strefy/dzialki na podstawie poziomow NDVI",
     description=(
         "Przyjmuje wielokat pola i docelowa wielkosc dzialki (ha). Pobiera NDVI dla "
-        "obszaru pola, grupuje piksele o podobnym poziomie NDVI w klastry (1D k-means) "
-        "tak, by liczba stref odpowiadala field_area_ha / target_plot_size_ha, a nastepnie "
-        "zamienia kazdy klaster na geometrie (przycieta do granic pola). Zwraca GeoJSON "
-        "FeatureCollection ze strefami posortowanymi rosnaco wg sredniego NDVI."
+        "obszaru pola i buduje strefy przez seeded region growing tak, by liczba stref "
+        "odpowiadala field_area_ha / target_plot_size_ha, kazda jako jeden spojny kawalek "
+        "o zblizonej powierzchni do pozostalych. Zwraca GeoJSON FeatureCollection ze "
+        "strefami posortowanymi rosnaco wg sredniego NDVI."
     ),
 )
 def post_field_zones(payload: FieldZonesRequest):
@@ -176,7 +176,6 @@ def post_field_zones(payload: FieldZonesRequest):
             target_plot_size_ha=payload.target_plot_size_ha,
             max_cloud_cover=payload.max_cloud_cover,
             resolution_m=payload.resolution_m,
-            strategy=payload.strategy,
             line_smoothing=payload.line_smoothing,
             max_sample_points_per_zone=payload.max_sample_points_per_zone,
             field_id=payload.field_id,
