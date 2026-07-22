@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .env
+.env.railway
 logs/
 uvicorn.err.log
 uvicorn.log
