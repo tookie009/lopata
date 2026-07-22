@@ -40,6 +40,22 @@ MAX_SUBFIELD_AREA_HA = 4.0
 # comparison.
 MAX_ZONE_SIZE_RATIO = 1.15
 
+# Sample-point selection (see _select_sample_points): within a zone, discard pixels outside the
+# [LOW, HIGH] percentile of that zone's own NDVI values before spatially spreading candidates -
+# drops local anomalies (puddles, bare patches, machinery tracks) that would otherwise make an
+# unrepresentative soil-sample location, while keeping the middle bulk of genuinely typical
+# pixels to choose from.
+SAMPLE_POINT_PERCENTILE_LOW = 12.5
+SAMPLE_POINT_PERCENTILE_HIGH = 87.5
+# Below this many pixels, a percentile split isn't meaningful (e.g. 3 pixels -> "middle 75%" is
+# either 1 or all 3 depending on rounding) - skip the filter rather than let it arbitrarily
+# exclude a real candidate in an already-tiny zone.
+MIN_PIXELS_FOR_PERCENTILE_FILTER = 8
+# Generous default candidate count per zone, not a fixed request - the frontend takes however
+# many points it actually needs from the front of the list (see field_zones.py's
+# _farthest_point_sample: any prefix of its output is itself well-spread).
+DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE = 8
+
 
 def _utm_epsg(lon: float, lat: float) -> int:
     zone = int((lon + 180) // 6) + 1
@@ -849,6 +865,39 @@ def _split_oversized_zones(
     return result
 
 
+def _farthest_point_sample(points_m: np.ndarray, n: int) -> list[int]:
+    """Greedy farthest-point sampling over 2D points already in a metric (meters) CRS: seeds with
+    whichever point is farthest from the centroid, then repeatedly adds whichever remaining point
+    is farthest from every point already chosen. Fully vectorized (maintains a running per-point
+    "distance to nearest chosen point" array, updated in one np.minimum call per iteration)
+    rather than looping candidate-by-candidate, so it stays fast even for thousands of candidate
+    pixels. Returns indices into points_m, in selection order - any prefix of the result is
+    itself a reasonably well-spread sample, since each point was chosen as farthest from *all*
+    prior points, not just the most recent one.
+    """
+    n_points = len(points_m)
+    n = min(n, n_points)
+    if n <= 0:
+        return []
+
+    centroid = points_m.mean(axis=0)
+    first = int(np.argmax(np.hypot(*(points_m - centroid).T)))
+    chosen = [first]
+    min_dist = np.hypot(*(points_m - points_m[first]).T)
+    min_dist[first] = -1.0
+
+    while len(chosen) < n:
+        next_idx = int(np.argmax(min_dist))
+        if min_dist[next_idx] <= 0:
+            break  # every remaining candidate coincides with an already-chosen point
+        chosen.append(next_idx)
+        dist_to_new = np.hypot(*(points_m - points_m[next_idx]).T)
+        min_dist = np.minimum(min_dist, dist_to_new)
+        min_dist[next_idx] = -1.0
+
+    return chosen
+
+
 ZONE_STRATEGIES = ("smooth", "contiguous")
 
 
@@ -859,6 +908,8 @@ def compute_field_zones(
     resolution_m: float = 10.0,
     strategy: str = "smooth",
     line_smoothing: float = DEFAULT_LINE_SMOOTHING,
+    max_sample_points_per_zone: int = DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE,
+    field_id: int | None = None,
 ) -> dict:
     """strategy="smooth": plain 1D k-means over NDVI value (see _kmeans_1d) plus a hard
     majority-filter pass to merge small same-label islands into their surrounding zone. Kept as
@@ -925,6 +976,7 @@ def compute_field_zones(
         width=width_px,
         height=height_px,
         max_cloud_cover=max_cloud_cover,
+        field_id=field_id,
     )
     ndvi = ndvi_array[:, :, 0]
     data_mask = ndvi_array[:, :, 1]
@@ -1086,6 +1138,42 @@ def compute_field_zones(
             cleaned_geoms.append(_from_utm(kept_utm))
         zone_geoms = cleaned_geoms
 
+    def _select_sample_points(mask: np.ndarray, geom, max_points: int) -> list[list[float]]:
+        """Candidate sampling points within one zone, biased away from that zone's own NDVI
+        extremes and spatially spread out - see SAMPLE_POINT_PERCENTILE_LOW/HIGH's module
+        docstring for why, and _farthest_point_sample for the spreading step. Filters on the
+        RAW ndvi (not smoothed_ndvi) since smoothing is exactly what would wash out the local
+        anomalies (puddles, bare patches, tracks) this is meant to detect and avoid."""
+        if max_points <= 0 or not mask.any():
+            return []
+        values = ndvi[mask]
+        lons = grid_lon[mask]
+        lats = grid_lat[mask]
+
+        if len(values) >= MIN_PIXELS_FOR_PERCENTILE_FILTER:
+            lo, hi = np.percentile(values, [SAMPLE_POINT_PERCENTILE_LOW, SAMPLE_POINT_PERCENTILE_HIGH])
+            keep = (values >= lo) & (values <= hi)
+            if keep.any():
+                lons, lats = lons[keep], lats[keep]
+            # else: the filter degenerately removed every pixel (e.g. a perfectly uniform zone,
+            # where lo == hi) - fall through with the unfiltered candidates rather than
+            # returning zero points for an otherwise-fine zone.
+
+        # Vectorization/simplification/gap-filling earlier in compute_field_zones can leave the
+        # final zone polygon slightly different from its own raster mask - re-check candidates
+        # against the geometry actually being returned, not just the mask that produced it.
+        if geom is not None and not geom.is_empty and len(lons):
+            inside = _shapely_contains(geom, lons, lats)
+            if inside.any():
+                lons, lats = lons[inside], lats[inside]
+
+        if len(lons) == 0:
+            return []
+
+        xs, ys = transformer.transform(lons, lats)
+        chosen = _farthest_point_sample(np.column_stack([xs, ys]), max_points)
+        return [[float(lons[i]), float(lats[i])] for i in chosen]
+
     def _zone_entry(mask: np.ndarray, geom) -> dict | None:
         if geom is None:
             return None
@@ -1100,6 +1188,7 @@ def compute_field_zones(
             "ndvi_max": round(float(ndvi[mask].max()), 4),
             "area_ha": round(area_ha, 4),
             "geometry": mapping(geom),
+            "sample_points": _select_sample_points(mask, geom, max_sample_points_per_zone),
         }
 
     # Final hard-cap enforcement. Everything above (pixel-level _split_oversized_zones, then
@@ -1168,6 +1257,7 @@ def compute_field_zones(
                     "ndvi_min": z["ndvi_min"],
                     "ndvi_max": z["ndvi_max"],
                     "area_ha": z["area_ha"],
+                    "sample_points": z["sample_points"],
                 },
                 "geometry": z["geometry"],
             }

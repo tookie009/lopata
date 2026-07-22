@@ -2,7 +2,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from field_zones import DEFAULT_LINE_SMOOTHING
+from field_zones import DEFAULT_LINE_SMOOTHING, DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE
 
 
 def _validate_lonlat_polygon(value: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -22,6 +22,14 @@ class NdviRequest(BaseModel):
     width: int = Field(512, gt=0, le=2500, description="Szerokosc obrazu w pikselach")
     height: int = Field(512, gt=0, le=2500, description="Wysokosc obrazu w pikselach")
     max_cloud_cover: float = Field(30.0, ge=0, le=100, description="Maksymalne dopuszczalne zachmurzenie sceny w %")
+    field_id: int | None = Field(
+        None,
+        description=(
+            "Opcjonalny identyfikator pola (z kreta) - gdy podany, uzywany jako prostszy "
+            "klucz cache NDVI zamiast wspolrzednych bbox (patrz ndvi.py/db_cache.py). "
+            "Nieobowiazkowy - inne wywolujace moga go pominac."
+        ),
+    )
 
     @field_validator("polygon")
     @classmethod
@@ -65,6 +73,25 @@ class FieldZonesRequest(BaseModel):
             "Wieksze = prostsze/mniej wierzcholkow; powyzej ok. 2.5 dalsze zwiekszanie zwykle nic "
             "juz nie daje, bo liczbe wierzcholkow ogranicza wtedy liczba wezlow sieci (miejsc, "
             "gdzie stykaja sie 3+ strefy), nie ta tolerancja."
+        ),
+    )
+    max_sample_points_per_zone: int = Field(
+        DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE,
+        ge=0,
+        le=15,
+        description=(
+            "Maks. liczba kandydatow na punkty probne na strefe, dobranych z pikseli poza "
+            "skrajnymi percentylami NDVI danej strefy (odrzuca anomalie: kaluze, ugory, sciezki) "
+            "i rozlozonych przestrzennie (farthest-point sampling) - front-end wybiera z nich "
+            "tyle, ile faktycznie potrzeba (patrz field_zones.py's _select_sample_points)."
+        ),
+    )
+    field_id: int | None = Field(
+        None,
+        description=(
+            "Opcjonalny identyfikator pola (z kreta) - gdy podany, uzywany jako prostszy "
+            "klucz cache NDVI zamiast wspolrzednych bbox (patrz ndvi.py/db_cache.py). "
+            "Nieobowiazkowy - inne wywolujace moga go pominac."
         ),
     )
 

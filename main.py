@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 
+import db_cache
 from field_zones import compute_field_zones
 from ndvi import fetch_ndvi_png
 from schemas import FieldZonesRequest, NdviRequest
@@ -18,6 +19,13 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+
+@app.on_event("startup")
+def _init_db_cache() -> None:
+    """No-op when LOPATA_DB_ENABLED isn't set - see db_cache.init_schema's own docstring. Runs
+    once per process start, idempotently (CREATE SCHEMA/TABLE IF NOT EXISTS)."""
+    db_cache.init_schema()
 
 # Full request/response JSON for /field-zones, one plain-text block per call - separate from
 # uvicorn's own access log (which only has the status line, not the bodies) so a request that
@@ -139,6 +147,7 @@ def get_ndvi(payload: NdviRequest):
             width=payload.width,
             height=payload.height,
             max_cloud_cover=payload.max_cloud_cover,
+            field_id=payload.field_id,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -169,6 +178,8 @@ def post_field_zones(payload: FieldZonesRequest):
             resolution_m=payload.resolution_m,
             strategy=payload.strategy,
             line_smoothing=payload.line_smoothing,
+            max_sample_points_per_zone=payload.max_sample_points_per_zone,
+            field_id=payload.field_id,
         )
         _log_field_zones_call(request_json, response=result)
         return result

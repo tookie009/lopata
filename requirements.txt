@@ -3,3 +3,4 @@ uvicorn[standard]
 sentinelhub
 pydantic-settings
 python-dotenv
+psycopg2-binary

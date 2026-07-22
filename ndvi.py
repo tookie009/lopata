@@ -15,6 +15,7 @@ from sentinelhub import (
     SHConfig,
 )
 
+import db_cache
 from config import settings
 from geometry_utils import points_in_polygon
 
@@ -40,10 +41,12 @@ _SCORE_RASTER_PX = 32
 
 
 class _TTLCache:
-    """Minimal in-memory cache with per-entry expiry - good enough for a single-process FastAPI
-    deployment; avoids re-hitting Copernicus for an identical request (same bbox/resolution/
-    date/cloud-cover/mosaicking) within the TTL window, e.g. when the frontend fetches an NDVI
-    preview image and then immediately asks to divide the same field into zones."""
+    """Minimal in-memory L1 cache with per-entry expiry - avoids re-hitting Copernicus for an
+    identical request (same field_id-or-bbox/resolution/date/cloud-cover/mosaicking) within the
+    TTL window, e.g. when the frontend fetches an NDVI preview image and then immediately asks to
+    divide the same field into zones. Backed by db_cache's Postgres table as L2, so a value
+    missing here (e.g. right after a process restart) can still be promoted back into L1 without
+    re-hitting Copernicus - see _l1_get/_l1_set below."""
 
     def __init__(self, ttl_seconds: float):
         self._ttl = ttl_seconds
@@ -128,24 +131,65 @@ def _search_best_scene(bbox: BBox, time_interval, max_cloud_cover: float, mosaic
     }
 
 
-def _fetch_ndvi_raw(bbox: BBox, width: int, height: int, max_cloud_cover: float, time_interval, mosaicking_order):
+def _cache_key(field_id, bbox: BBox, width: int, height: int, max_cloud_cover: float, time_interval, mosaicking_order):
+    """field_id (when the caller - kret - has one) replaces the bbox tuple as the identifying
+    part of the key: simpler and far more debuggable than 4 rounded floats ("show me the cache
+    row for field 93"), and a field's geometry is effectively immutable today (merging/splitting
+    always mints a new field id rather than reshaping one in place). The bbox itself is still
+    carried in the key/row regardless, so it can be used as a staleness check (see
+    db_cache.get/_l1_get) if that assumption ever stops holding."""
+    identity = field_id if field_id is not None else (
+        round(bbox.min_x, 6), round(bbox.min_y, 6), round(bbox.max_x, 6), round(bbox.max_y, 6)
+    )
+    return (
+        identity, width, height, round(max_cloud_cover, 1),
+        time_interval[0].isoformat(), time_interval[1].isoformat(),
+        mosaicking_order.value if hasattr(mosaicking_order, "value") else str(mosaicking_order),
+    )
+
+
+def _bbox_tuple(bbox: BBox) -> tuple[float, float, float, float]:
+    return (round(bbox.min_x, 6), round(bbox.min_y, 6), round(bbox.max_x, 6), round(bbox.max_y, 6))
+
+
+def _l1_get(cache_key, bbox: BBox):
+    """L1 (in-process) lookup. Stored value is (bbox_tuple, ndvi_array, metadata_or_None) - the
+    bbox is re-checked here too (not just in db_cache.get) so a field_id-keyed L1 hit can't serve
+    a stale raster either, for the same reason described in _cache_key."""
+    hit = _RAW_NDVI_CACHE.get(cache_key)
+    if hit is None:
+        return None
+    stored_bbox, array, metadata = hit
+    if stored_bbox != _bbox_tuple(bbox):
+        return None
+    return array, metadata
+
+
+def _l1_set(cache_key, bbox: BBox, array, metadata) -> None:
+    _RAW_NDVI_CACHE.set(cache_key, (_bbox_tuple(bbox), array, metadata))
+
+
+def _fetch_ndvi_raw(bbox: BBox, width: int, height: int, max_cloud_cover: float, time_interval, mosaicking_order,
+                     field_id: int | None = None):
     """Just the Process API NDVI raster, no catalog metadata lookup - used for cheaply scoring
     several candidate dates in fetch_best_vegetation_ndvi_array. See _request_ndvi_tiff for the
     metadata-attaching variant used for the single winning/final fetch.
 
-    Cached by every parameter that affects the actual Sentinel Hub request, so an identical call
-    (e.g. the NDVI preview image and a subsequent field-zones split for the same field) is served
-    from memory instead of hitting Copernicus again - see _RAW_NDVI_CACHE.
+    Cached by every parameter that affects the actual Sentinel Hub request (L1: in-process
+    memory, L2: db_cache's Postgres table, which survives a restart) - so an identical call (e.g.
+    the NDVI preview image and a subsequent field-zones split for the same field) is served
+    without hitting Copernicus again.
     """
-    cache_key = (
-        round(bbox.min_x, 6), round(bbox.min_y, 6), round(bbox.max_x, 6), round(bbox.max_y, 6),
-        width, height, round(max_cloud_cover, 1),
-        time_interval[0].isoformat(), time_interval[1].isoformat(),
-        mosaicking_order.value if hasattr(mosaicking_order, "value") else str(mosaicking_order),
-    )
-    cached = _RAW_NDVI_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    cache_key = _cache_key(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order)
+
+    hit = _l1_get(cache_key, bbox)
+    if hit is not None:
+        return hit[0]
+
+    hit = db_cache.get(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order)
+    if hit is not None:
+        _l1_set(cache_key, bbox, hit[0], hit[1])
+        return hit[0]
 
     request = SentinelHubRequest(
         evalscript=NDVI_RAW_EVALSCRIPT,
@@ -167,29 +211,70 @@ def _fetch_ndvi_raw(bbox: BBox, width: int, height: int, max_cloud_cover: float,
         return None
 
     result = data[0]
-    _RAW_NDVI_CACHE.set(cache_key, result)
+    _l1_set(cache_key, bbox, result, None)
+    db_cache.set(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order,
+                 result, None, settings.ndvi_cache_ttl_seconds)
     return result
 
 
-def _request_ndvi_tiff(bbox: BBox, width: int, height: int, max_cloud_cover: float, time_interval, mosaicking_order):
-    ndvi_array = _fetch_ndvi_raw(bbox, width, height, max_cloud_cover, time_interval, mosaicking_order)
+def _request_ndvi_tiff(bbox: BBox, width: int, height: int, max_cloud_cover: float, time_interval, mosaicking_order,
+                        field_id: int | None = None, season_window: tuple[datetime, datetime] | None = None,
+                        candidates_considered: int | None = None, ndvi_mean_at_selection: float | None = None):
+    """Like _fetch_ndvi_raw, but also attaches acquisition-date/cloud-cover metadata (via
+    _search_best_scene). That metadata lookup is its own STAC catalog call - NOT covered by
+    _fetch_ndvi_raw's own cache - so on top of reusing a cached raster, this also checks whether
+    a cache entry for this exact key already carries metadata from a previous call, and skips
+    _search_best_scene entirely when it does.
+
+    season_window/candidates_considered/ndvi_mean_at_selection let fetch_best_vegetation_ndvi_array
+    (the only caller) fold its own season-search bookkeeping into the metadata that gets cached
+    here, rather than caching a partial metadata dict and patching it in-place afterward - the
+    latter used to write only the narrow single-day time_interval this function was actually
+    called with (the winning date) to the cache, never the real season-long window that was
+    searched to find it, since the enrichment happened one level up, after this function's own
+    cache write had already fired.
+    """
+    cache_key = _cache_key(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order)
+
+    cached_array = None
+    hit = _l1_get(cache_key, bbox)
+    if hit is None:
+        hit = db_cache.get(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order)
+        if hit is not None:
+            _l1_set(cache_key, bbox, hit[0], hit[1])
+    if hit is not None:
+        cached_array, cached_metadata = hit
+        if cached_metadata is not None:
+            return cached_array, cached_metadata  # full hit - no Sentinel Hub/STAC calls at all
+
+    ndvi_array = cached_array if cached_array is not None else _fetch_ndvi_raw(
+        bbox, width, height, max_cloud_cover, time_interval, mosaicking_order, field_id=field_id
+    )
     if ndvi_array is None:
         return None
 
     scene_info = _search_best_scene(bbox, time_interval, max_cloud_cover, mosaicking_order)
 
+    time_window_searched = (
+        {"from": season_window[0].isoformat(), "to": season_window[1].isoformat()}
+        if season_window is not None
+        else {"from": time_interval[0].isoformat(), "to": time_interval[1].isoformat()}
+    )
     metadata = {
         "acquired": scene_info["date"] if scene_info else None,
         "acquisition_dates": [scene_info["date"]] if scene_info else [],
         "cloud_cover": scene_info["cloud_cover"] if scene_info else None,
-        "time_window_searched": {
-            "from": time_interval[0].isoformat(),
-            "to": time_interval[1].isoformat(),
-        },
+        "time_window_searched": time_window_searched,
         "max_cloud_cover": max_cloud_cover,
         "mosaicking_order": mosaicking_order.value if hasattr(mosaicking_order, "value") else str(mosaicking_order),
         "data_collection": S2L2A_CDSE.api_id,
+        "candidates_considered": candidates_considered,
+        "ndvi_mean_at_selection": ndvi_mean_at_selection,
     }
+
+    _l1_set(cache_key, bbox, ndvi_array, metadata)
+    db_cache.set(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order,
+                 ndvi_array, metadata, settings.ndvi_cache_ttl_seconds)
     return ndvi_array, metadata
 
 
@@ -260,6 +345,7 @@ def fetch_best_vegetation_ndvi_array(
     height: int,
     max_cloud_cover: float = 30.0,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
+    field_id: int | None = None,
 ):
     """Fetch the NDVI raster for whichever date, among several least-cloudy candidates in the
     last full growing season, has the highest mean NDVI *within the field polygon* - i.e. the
@@ -285,7 +371,8 @@ def fetch_best_vegetation_ndvi_array(
     best_mean = None
     for candidate in candidates:
         day_interval = _day_interval(candidate["properties"]["datetime"])
-        raw = _fetch_ndvi_raw(bbox, _SCORE_RASTER_PX, _SCORE_RASTER_PX, max_cloud_cover, day_interval, MosaickingOrder.LEAST_CC)
+        raw = _fetch_ndvi_raw(bbox, _SCORE_RASTER_PX, _SCORE_RASTER_PX, max_cloud_cover, day_interval,
+                               MosaickingOrder.LEAST_CC, field_id=field_id)
         if raw is None:
             continue
         ndvi = raw[:, :, 0]
@@ -304,18 +391,14 @@ def fetch_best_vegetation_ndvi_array(
         )
 
     final_result = _request_ndvi_tiff(
-        bbox, width, height, max_cloud_cover, _day_interval(best_date), MosaickingOrder.LEAST_CC
+        bbox, width, height, max_cloud_cover, _day_interval(best_date), MosaickingOrder.LEAST_CC,
+        field_id=field_id, season_window=window, candidates_considered=len(candidates),
+        ndvi_mean_at_selection=round(best_mean, 4),
     )
     if final_result is None:
         raise LookupError("Nie udalo sie ponownie pobrac wybranego zdjecia NDVI")
 
     ndvi_array, metadata = final_result
-    # _request_ndvi_tiff reports the narrow single-day interval it was actually called with
-    # (the winning date) - overwrite with the real season-long window that was searched to
-    # find that date, so "which period was considered" isn't just a duplicate of "acquired".
-    metadata["time_window_searched"] = {"from": window[0].isoformat(), "to": window[1].isoformat()}
-    metadata["candidates_considered"] = len(candidates)
-    metadata["ndvi_mean_at_selection"] = round(best_mean, 4)
     return ndvi_array, metadata
 
 
@@ -359,6 +442,7 @@ def fetch_ndvi_png(
     max_cloud_cover: float = 30.0,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
     stretch_percentiles: tuple[float, float] = (2.0, 98.0),
+    field_id: int | None = None,
 ) -> tuple[bytes, dict]:
     """Fetch an NDVI PNG for the given WGS84 field polygon (its exact edges, not just its
     bounding rectangle - pixels outside the polygon are rendered fully transparent), for
@@ -381,6 +465,7 @@ def fetch_ndvi_png(
         height=height,
         max_cloud_cover=max_cloud_cover,
         candidate_limit=candidate_limit,
+        field_id=field_id,
     )
     ndvi = ndvi_array[:, :, 0]
     data_valid = ndvi_array[:, :, 1] > 0
