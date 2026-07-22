@@ -559,14 +559,26 @@ def _connected_components(mask: np.ndarray) -> list[np.ndarray]:
     return components
 
 
-def _absorb_unassigned(assigned_zone: np.ndarray, remaining: np.ndarray) -> None:
+def _absorb_unassigned(assigned_zone: np.ndarray, remaining: np.ndarray, max_pixels: int | None = None) -> None:
     """Mutates assigned_zone/remaining in place: layered (round-by-round, not a single FIFO
     queue) breadth-first expansion from every already-assigned pixel into the still-`remaining`
     ones. Within each round, a `remaining` pixel reachable from more than one zone this round goes
     to whichever of those zones currently has the fewest pixels - a plain FIFO frontier has no
     such preference and can let one zone's slightly-earlier reach monopolize a whole contested
     pocket even when a smaller neighboring zone touches it too. Pixels that touch no assigned zone
-    at all are left as-is rather than spinning forever."""
+    at all are left as-is rather than spinning forever.
+
+    max_pixels, when given, is a secondary preference on top of "smallest wins": among a
+    contested pixel's candidate zones, one still under max_pixels is preferred over one at/over
+    it, regardless of their relative sizes - "smallest of the candidates touching THIS pixel" is
+    a purely local comparison that can still hand pixel after pixel to an already-oversized zone
+    simply because it's the smallest *of that pixel's specific neighbors*, even while some other,
+    already-full zone would take them for lack of an under-budget alternative nearby (verified on
+    a real ~102ha field: two zones ended up 42-52 pixels over the cap this way, despite
+    _balanced_contiguous_zones's own growth already stopping at the cap - see max_pixels's
+    docstring there). Only falls through to picking among over-budget candidates when every zone
+    touching a given pixel is already at or past max_pixels - it still needs to go somewhere.
+    """
     if not np.any(remaining):
         return
     height, width = assigned_zone.shape
@@ -589,7 +601,12 @@ def _absorb_unassigned(assigned_zone: np.ndarray, remaining: np.ndarray) -> None
         for (r, c), zones in candidates.items():
             if not remaining[r, c]:
                 continue
-            best_zone = min(zones, key=lambda z: zone_sizes.get(z, 0))
+            pool = zones
+            if max_pixels is not None:
+                under_budget = [z for z in zones if zone_sizes.get(z, 0) < max_pixels]
+                if under_budget:
+                    pool = under_budget
+            best_zone = min(pool, key=lambda z: zone_sizes.get(z, 0))
             remaining[r, c] = False
             assigned_zone[r, c] = best_zone
             zone_sizes[best_zone] = zone_sizes.get(best_zone, 0) + 1
@@ -694,10 +711,24 @@ GROWTH_SHAPE_WEIGHT = 3.0
 
 
 def _balanced_contiguous_zones(
-    smoothed_ndvi: np.ndarray, valid: np.ndarray, n_zones: int
+    smoothed_ndvi: np.ndarray, valid: np.ndarray, n_zones: int, max_pixels: int | None = None
 ) -> list[np.ndarray]:
     """Splits `valid` into n_zones spatially-contiguous regions of near-equal pixel count,
     ordered ascending by NDVI, via sequential seeded region growing.
+
+    max_pixels, when given, caps each zone's own growth target below - not just an
+    after-the-fact rebalance (see _rebalance_oversized_zones) - so a zone that would otherwise
+    overshoot the hard area cap (because an earlier zone in this same construction starved
+    before reaching ITS fair share, inflating what "remaining_count // zones_left" looks like
+    for whoever grows next) simply stops at the cap instead. Left unclaimed, that zone's
+    unclaimed remainder isn't lost - _absorb_unassigned below sweeps it to whichever bordering
+    zone is currently smallest, which tends toward the field's overall balance instead of
+    piling more onto a zone that's already at its limit. This matters because
+    _rebalance_oversized_zones's post-hoc donation is first-come-first-served: verified on a
+    real ~102ha field where 4 zones overshot the cap and shared overlapping neighbors - the
+    first 3 processed emptied out all their neighbors' spare room, leaving the 4th with nowhere
+    to donate to even though it needed less than what had already been handed out. Capping
+    growth here avoids that scramble entirely for the common case.
 
     Earlier attempts at this ("smooth"'s cluster-by-value-then-merge-islands, and a first cut of
     this function that clustered by value first and merged undersized results afterwards) can't
@@ -775,6 +806,8 @@ def _balanced_contiguous_zones(
         if remaining_count == 0:
             break
         target_px = remaining_count // zones_left
+        if max_pixels is not None:
+            target_px = min(target_px, max_pixels)
 
         seed_pool = largest_component(remaining)
         pool_rows, pool_cols = np.where(seed_pool)
@@ -803,7 +836,7 @@ def _balanced_contiguous_zones(
                     priority = ndvi_term + GROWTH_SHAPE_WEIGHT * shape_term
                     heapq.heappush(heap, (priority, nr, nc))
 
-    _absorb_unassigned(assigned_zone, remaining)
+    _absorb_unassigned(assigned_zone, remaining, max_pixels=max_pixels)
 
     return [assigned_zone == zone_index for zone_index in range(n_zones)]
 
@@ -831,7 +864,9 @@ def _split_until_within_budget(
     if pixel_count <= max_pixels or depth >= 6:
         return [mask]
     n_pieces = math.ceil(pixel_count / max_pixels)
-    sub_masks = _enforce_4_connectivity(_balanced_contiguous_zones(smoothed_ndvi, mask, n_pieces))
+    sub_masks = _enforce_4_connectivity(
+        _balanced_contiguous_zones(smoothed_ndvi, mask, n_pieces, max_pixels=max_pixels)
+    )
     result = []
     for sub_mask in sub_masks:
         if sub_mask.any():
@@ -1100,8 +1135,16 @@ def compute_field_zones(
     actual_n_zones = min(n_zones, len(np.unique(valid_values)))
     actual_n_zones = max(MIN_ZONES, actual_n_zones)
 
+    # Computed here (rather than only after construction, as before) so "contiguous" can cap
+    # each zone's own growth target against it from the start - see max_pixels's docstring on
+    # _balanced_contiguous_zones for why that's better than only fixing overshoot afterward.
+    # Every raster pixel is the same lon/lat size (evenly-spaced mesh, see lon_edges/lat_edges
+    # above), so field_area_ha / valid-pixel-count is that size in hectares.
+    pixel_area_ha = field_area_ha / max(int(valid.sum()), 1)
+    max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
+
     if strategy == "contiguous":
-        zone_masks = _balanced_contiguous_zones(smoothed_ndvi, valid, actual_n_zones)
+        zone_masks = _balanced_contiguous_zones(smoothed_ndvi, valid, actual_n_zones, max_pixels=max_pixels)
         # Region growing/absorption both use 8-connectivity (see GROWTH_SHAPE_WEIGHT's docstring),
         # which can leave a pixel reachable from its own zone only diagonally - see
         # _enforce_4_connectivity for why that reads as a detached "kwadracik" once vectorized.
@@ -1131,9 +1174,7 @@ def compute_field_zones(
         zone_masks = [label_raster == zone_id for zone_id in range(actual_n_zones)]
 
     # Hard cap regardless of strategy or the requested target_plot_size_ha - see
-    # MAX_SUBFIELD_AREA_HA. Every raster pixel is the same lon/lat size (evenly-spaced mesh, see
-    # lon_edges/lat_edges above), so field_area_ha / valid-pixel-count is that size in hectares.
-    pixel_area_ha = field_area_ha / max(int(valid.sum()), 1)
+    # MAX_SUBFIELD_AREA_HA (pixel_area_ha/max_pixels already computed above, before construction).
     zone_masks = _split_oversized_zones(zone_masks, smoothed_ndvi, pixel_area_ha)
 
     def _raw_zone_geometry(mask: np.ndarray):
@@ -1292,7 +1333,7 @@ def compute_field_zones(
     # intersected with field_polygon (same as _raw_zone_geometry) but not run back through
     # gap-filling, so they may be a hair smaller than their exact pixel share - the safe
     # direction to err in, given the alternative is exceeding the cap again.
-    max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
+    # (max_pixels/pixel_area_ha already computed near the top of this function.)
 
     # Before falling back to a full re-split (which always manufactures a brand-new zone, even
     # for the couple-percent overage this raster-to-vector loss typically causes - see
