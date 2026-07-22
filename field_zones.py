@@ -888,21 +888,25 @@ def _bisection_contiguous_zones(
     target_left = max(1, min(total - 1, round(total * n_left / n_zones)))
 
     # Cut perpendicular to whichever axis the region currently spans more of, so a long/narrow
-    # region always gets sliced across its length rather than along it.
+    # region always gets sliced across its length rather than along it. Ordered by (primary,
+    # secondary) axis via lexsort - not a plain threshold on the primary axis alone - so pixels
+    # sharing the same primary-axis coordinate (e.g. many columns on the same row) are broken by
+    # the secondary axis instead of all landing on whichever side the threshold happens to fall.
+    # That guarantees taking the first target_left pixels in this order is EXACT every time,
+    # instead of a threshold-based cut that can overshoot by however many pixels tie at the
+    # boundary value (verified this was the actual source of a real field still needing one
+    # NDVI-based fallback split afterward: a threshold-based cut left one leaf zone at 406 pixels
+    # against a 373 cap, purely from tie overshoot, not genuine imbalance).
     row_span = rows.max() - rows.min()
     col_span = cols.max() - cols.min()
-    axis_values = rows if row_span >= col_span else cols
-
-    threshold = np.partition(axis_values, target_left - 1)[target_left - 1]
-    left_selector = axis_values <= threshold
-    # Pixels sharing the exact threshold coordinate can push the left side a little past
-    # target_left - harmless (the recursive calls below still correctly divide whatever they're
-    # actually handed), just means this particular cut lands a bit off the ideal ratio.
+    order = np.lexsort((cols, rows)) if row_span >= col_span else np.lexsort((rows, cols))
+    left_indices = order[:target_left]
+    right_indices = order[target_left:]
 
     left_mask = np.zeros_like(valid)
     right_mask = np.zeros_like(valid)
-    left_mask[rows[left_selector], cols[left_selector]] = True
-    right_mask[rows[~left_selector], cols[~left_selector]] = True
+    left_mask[rows[left_indices], cols[left_indices]] = True
+    right_mask[rows[right_indices], cols[right_indices]] = True
 
     result = []
     result.extend(_bisection_contiguous_zones(left_mask, n_left, max_pixels=max_pixels))
@@ -1212,6 +1216,11 @@ def compute_field_zones(
     pixel_area_ha = field_area_ha / max(int(valid.sum()), 1)
     max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
 
+    # Reported back in the response (construction_algorithm) so callers/logs can see which one
+    # actually produced the returned zones, not just which strategy was requested - "contiguous"
+    # can fall back from "sequential" to "bisection" below.
+    construction_algorithm = "smooth" if strategy != "contiguous" else "sequential"
+
     if strategy == "contiguous":
         zone_masks = _balanced_contiguous_zones(smoothed_ndvi, valid, actual_n_zones, max_pixels=max_pixels)
         # Region growing/absorption both use 8-connectivity (see GROWTH_SHAPE_WEIGHT's docstring),
@@ -1276,6 +1285,7 @@ def compute_field_zones(
                 len(bisection_masks), len(zone_masks),
             )
             zone_masks = bisection_masks
+            construction_algorithm = "bisection"
 
     def _raw_zone_geometry(mask: np.ndarray):
         geom = _vectorize_mask(mask, lon_edges, lat_edges)
@@ -1500,6 +1510,7 @@ def compute_field_zones(
         "target_plot_size_ha": target_plot_size_ha,
         "n_zones": len(zones),
         "raster_size": {"width": width_px, "height": height_px},
+        "construction_algorithm": construction_algorithm,
         "ndvi_metadata": ndvi_metadata,
         "features": [
             {
