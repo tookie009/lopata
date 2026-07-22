@@ -711,7 +711,7 @@ GROWTH_SHAPE_WEIGHT = 3.0
 
 
 def _balanced_contiguous_zones(
-    smoothed_ndvi: np.ndarray, valid: np.ndarray, n_zones: int, max_pixels: int | None = None
+    smoothed_ndvi: np.ndarray, valid: np.ndarray, n_zones: int, max_pixels: int | None = None,
 ) -> list[np.ndarray]:
     """Splits `valid` into n_zones spatially-contiguous regions of near-equal pixel count,
     ordered ascending by NDVI, via sequential seeded region growing.
@@ -839,6 +839,75 @@ def _balanced_contiguous_zones(
     _absorb_unassigned(assigned_zone, remaining, max_pixels=max_pixels)
 
     return [assigned_zone == zone_index for zone_index in range(n_zones)]
+
+
+def _bisection_contiguous_zones(
+    valid: np.ndarray, n_zones: int, max_pixels: int | None = None
+) -> list[np.ndarray]:
+    """Alternative to _balanced_contiguous_zones's sequential n-way growth, for when that
+    algorithm needs more zones than requested to keep every one under the hard cap (see
+    compute_field_zones - it retries with this as a fallback in exactly that case).
+
+    Recursively splits `valid` into two roughly equal-pixel-count halves by straight-line
+    POSITION - cutting perpendicular to whichever axis the current region currently spans more of
+    (row-wise or column-wise) - not by NDVI-seeded growth, then recurses on each half
+    independently, proportioning how many further zones each side needs to produce
+    (`n_zones // 2` vs the remainder).
+
+    A first version of this tried reusing _balanced_contiguous_zones itself (seeded growth) for
+    each 2-way split - it was *worse* than the sequential n-way algorithm it was meant to replace
+    (verified on the same real ~102ha field: one branch came back with pieces ranging 118-1083
+    pixels, a ~9x spread, versus sequential growth's already-imperfect 277-425 / ~1.5x). That's
+    because a seeded "grow a roughly circular blob from one point" has the exact same weakness on
+    a long/narrow region regardless of whether it's building 2 zones or 26 at once - the blob
+    either has to grow unnaturally elongated to reach half the region's pixels inside a narrow
+    strip, or gets capped short by the strip's own edges (see _balanced_contiguous_zones's own
+    docstring on the "lightning-bolt field" case - this field's raster is a 67x218 strip, exactly
+    that shape). A straight positional cut has no such issue: splitting by row or column index
+    always yields two roughly-equal-count pieces regardless of how long/narrow/bent the region is,
+    since it doesn't depend on growing outward from any single point.
+
+    A very non-convex region can still end up with an accidentally-disconnected piece on one side
+    of the cut (e.g. a C-shaped region cut straight through both arms) - not handled specially
+    here, since compute_field_zones already runs the whole bisection result through
+    _enforce_4_connectivity afterward (same safety net the other strategy relies on), which
+    reassigns any disconnected fragment to whichever neighboring zone actually borders it.
+    """
+    if n_zones <= 1 or not valid.any():
+        return [valid.copy()]
+
+    rows, cols = np.where(valid)
+    total = len(rows)
+    if total <= 1:
+        # Not enough pixels to meaningfully split further - just recurse "as is" onto a
+        # single-zone leaf on each side.
+        return [valid.copy()] + [np.zeros_like(valid) for _ in range(n_zones - 1)]
+
+    n_left = n_zones // 2
+    n_right = n_zones - n_left
+    target_left = max(1, min(total - 1, round(total * n_left / n_zones)))
+
+    # Cut perpendicular to whichever axis the region currently spans more of, so a long/narrow
+    # region always gets sliced across its length rather than along it.
+    row_span = rows.max() - rows.min()
+    col_span = cols.max() - cols.min()
+    axis_values = rows if row_span >= col_span else cols
+
+    threshold = np.partition(axis_values, target_left - 1)[target_left - 1]
+    left_selector = axis_values <= threshold
+    # Pixels sharing the exact threshold coordinate can push the left side a little past
+    # target_left - harmless (the recursive calls below still correctly divide whatever they're
+    # actually handed), just means this particular cut lands a bit off the ideal ratio.
+
+    left_mask = np.zeros_like(valid)
+    right_mask = np.zeros_like(valid)
+    left_mask[rows[left_selector], cols[left_selector]] = True
+    right_mask[rows[~left_selector], cols[~left_selector]] = True
+
+    result = []
+    result.extend(_bisection_contiguous_zones(left_mask, n_left, max_pixels=max_pixels))
+    result.extend(_bisection_contiguous_zones(right_mask, n_right, max_pixels=max_pixels))
+    return result
 
 
 def _split_until_within_budget(
@@ -1176,6 +1245,37 @@ def compute_field_zones(
     # Hard cap regardless of strategy or the requested target_plot_size_ha - see
     # MAX_SUBFIELD_AREA_HA (pixel_area_ha/max_pixels already computed above, before construction).
     zone_masks = _split_oversized_zones(zone_masks, smoothed_ndvi, pixel_area_ha)
+
+    if strategy == "contiguous" and len(zone_masks) > actual_n_zones:
+        # Sequential growth (_balanced_contiguous_zones) needed more zones than requested to keep
+        # every one under the hard cap - despite max_pixels capping growth and
+        # _rebalance_oversized_zones trying to donate excess to a neighbor first (both above),
+        # an early zone can still wall off a pocket of territory that structurally belongs to a
+        # zone processed later, with no under-budget neighbor ever touching that pocket to donate
+        # it to (see _rebalance_oversized_zones's docstring - verified on a real ~102ha field).
+        # Retry from scratch with recursive bisection (_bisection_contiguous_zones) - a
+        # genuinely different construction strategy, not just the same one retried, since only
+        # ever two regions compete for territory at a time there - and keep whichever attempt
+        # used fewer zones.
+        logger.warning(
+            "contiguous strategy needed %d zones instead of the requested %d - retrying with "
+            "bisection construction instead of sequential growth",
+            len(zone_masks), actual_n_zones,
+        )
+        bisection_masks = _bisection_contiguous_zones(valid, actual_n_zones, max_pixels=max_pixels)
+        bisection_masks = _enforce_4_connectivity(bisection_masks)
+        bisection_masks = _split_oversized_zones(bisection_masks, smoothed_ndvi, pixel_area_ha)
+        # <=, not < : bisection's straight-line cuts tend to come out noticeably more evenly
+        # balanced even when it ties on the final zone count (verified on a real ~102ha field:
+        # both approaches needed one extra zone there, but bisection's pre-split pixel-count
+        # spread was 327-406, ~1.24x, versus sequential's 277-425, ~1.53x) - prefer it on a tie
+        # rather than only strictly beating sequential growth on raw count.
+        if len(bisection_masks) <= len(zone_masks):
+            logger.info(
+                "bisection construction produced %d zones (vs %d from sequential growth) - using it",
+                len(bisection_masks), len(zone_masks),
+            )
+            zone_masks = bisection_masks
 
     def _raw_zone_geometry(mask: np.ndarray):
         geom = _vectorize_mask(mask, lon_edges, lat_edges)
