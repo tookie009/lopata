@@ -1632,6 +1632,49 @@ def compute_field_zones(
         snap_tolerance_m = max(resolution_m * 10, 20.0)
         final_entries = [(mask, _snap_to_zone_boundary(geom, snap_tolerance_m)) for mask, geom in final_entries]
 
+        # _snap_to_zone_boundary projects each zone's near-boundary vertices independently, with
+        # no coordination against its neighbors' own snap - it can shift real area between two
+        # adjacent zones (one snaps a shared vertex onto zone_polygon's ring, the other doesn't
+        # move the same point the same way) and, the same GEOS near-degenerate-contact class of
+        # issue _polygonal_only's docstring describes, can turn a single clean Polygon into a
+        # MultiPolygon with tiny sliver parts. Nothing above re-checks the result *after* this
+        # snap runs - the hard-cap/dust-cleanup logic above it only ever validated the PRE-snap
+        # geometry. Verified on a real subfield-scoped request (field 125, target_plot_size_ha=
+        # 4.0): a zone that was a clean, in-budget Polygon before snapping came back post-snap as
+        # a 5.23ha (31% over cap) MultiPolygon with ~30 near-zero-area sliver parts, and a second,
+        # already-compliant-sized zone also came back with its own sliver parts - both defects
+        # reached the response untouched since nothing re-validated post-snap output. Re-run the
+        # same dust-strip-then-recap check here, now against what's actually being returned.
+        revalidated_entries: list[tuple[np.ndarray, object]] = []
+        dust_area_m2 = DUST_PART_MAX_PIXELS * resolution_m ** 2
+        for mask, geom in final_entries:
+            if geom is None or geom.is_empty:
+                continue
+            geom_utm, _dropped = _split_dust_parts(shp_transform(transformer.transform, geom), dust_area_m2)
+            geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), geom_utm)
+
+            if _area_ha(geom, transformer) <= target_max_ha:
+                revalidated_entries.append((mask, geom))
+                continue
+
+            zone_mask = valid & _shapely_contains(geom, grid_lon, grid_lat)
+            if not zone_mask.any():
+                revalidated_entries.append((mask, geom))
+                continue
+
+            for sub_mask in _enforce_4_connectivity(_split_until_within_budget(zone_mask, smoothed_ndvi, max_pixels)):
+                if not sub_mask.any():
+                    continue
+                sub_geom = _raw_zone_geometry(sub_mask)
+                if sub_geom is None:
+                    continue
+                # Fresh from _raw_zone_geometry, so never yet run through a dust check - same
+                # reasoning as everywhere else _raw_zone_geometry's output feeds back in.
+                sub_geom_utm, _dropped = _split_dust_parts(shp_transform(transformer.transform, sub_geom), dust_area_m2)
+                sub_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), sub_geom_utm)
+                revalidated_entries.append((sub_mask, sub_geom))
+        final_entries = revalidated_entries
+
     zones = []
     for mask, geom in final_entries:
         entry = _zone_entry(mask, geom)
