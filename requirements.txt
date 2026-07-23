@@ -4,3 +4,18 @@ sentinelhub
 pydantic-settings
 python-dotenv
 psycopg2-binary
+# shapely/numpy/pyproj are transitive deps of sentinelhub, pulled in with no version constraint
+# of our own - field_zones.py's zone-construction pipeline leans heavily on shapely operations
+# (unary_union, polygonize, boundary intersections) against genuinely ill-conditioned geometry
+# (ring vertices sometimes only micrometers apart at busy junctions - see field_zones.py's own
+# GEOS-robustness comments), which different GEOS versions (bundled inside different shapely
+# wheels) can legitimately resolve differently on the exact same input. Verified pinning matters:
+# a real field/target combination produced a compliant result locally against these versions, but
+# an over-4ha-cap zone with dozens of degenerate MultiPolygon slivers when deployed - same code
+# commit, same NDVI raster - strongly implicating an unpinned dependency resolving differently
+# between the two environments' pip installs rather than a code bug. Pinned to this project's
+# actually-tested-against versions so `pip install -r requirements.txt` is reproducible across
+# environments/rebuilds instead of silently drifting to "whatever's newest right now".
+shapely==2.1.2
+numpy==2.5.1
+pyproj==3.7.2
