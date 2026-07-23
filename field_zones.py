@@ -39,6 +39,19 @@ MAX_SUBFIELD_AREA_HA = 4.0
 # comfortably inside this ratio for anything but a near-empty field).
 MAX_ZONE_SIZE_RATIO = 1.15
 
+# How far, in percent, any single zone's actual area may deviate from the *requested*
+# target_plot_size_ha in either direction - e.g. 25 means a 1.0ha target must yield zones between
+# 0.75 and 1.25ha. Provisional starting value (2026-07-23) - MAX_ZONE_SIZE_RATIO above already
+# keeps zones close to *each other*, but that's silent on how close the whole field's zones sit to
+# what the user actually asked for: field_area_ha / n_zones (the achievable average, since n_zones
+# is an integer count) can itself already be a fair bit below target_plot_size_ha, and the region-
+# growing's per-zone variance stacks on top of that - verified on a real 5.2153ha field divided at
+# target_plot_size_ha=1.0 (n_zones=6, average 0.869ha): actual zones ranged 0.3641-1.7395ha, i.e.
+# -64%/+74% off target, not just off each other. Enforced via max_pixels/min_pixels in
+# compute_field_zones (tighter of this and MAX_SUBFIELD_AREA_HA on the high side; a new
+# _merge_undersized_zones pass on the low side, since nothing enforced a floor before this).
+MAX_ZONE_SIZE_DEVIATION_PCT = 25.0
+
 # Sample-point selection (see _select_sample_points): within a zone, discard pixels outside the
 # [LOW, HIGH] percentile of that zone's own NDVI values before spatially spreading candidates -
 # drops local anomalies (puddles, bare patches, machinery tracks) that would otherwise make an
@@ -1010,10 +1023,44 @@ def _rebalance_oversized_zones(zone_masks: list, max_pixels: int) -> None:
             excess -= moved
 
 
+def _merge_undersized_zones(zone_masks: list, min_pixels: int) -> list:
+    """Merges any zone under min_pixels into whichever touching neighbor it shares the most
+    4-connected border with, reducing the zone count by one per merge - the opposite-direction
+    counterpart to _rebalance_oversized_zones/_split_oversized_zones (which only ever enforce an
+    upper bound; nothing previously enforced a floor at all, see MAX_ZONE_SIZE_DEVIATION_PCT).
+
+    Repeatedly merges the single smallest zone (not just any undersized one) so a merge that
+    happens to push the *result* back over min_pixels doesn't leave other still-undersized zones
+    unmerged - stops as soon as the smallest remaining zone already meets min_pixels, or MIN_ZONES
+    zones are left (never merges below that floor, same as every other zone-count clamp in this
+    file). A merge only ever grows a zone, never creates a new undersized one, so this always
+    terminates. An undersized zone with no touching neighbor at all (shouldn't normally happen -
+    region growing only ever produces zones that border at least one other) is left as-is rather
+    than looping forever.
+
+    Runs on raw pixel masks, before vectorization, same reasoning as _enforce_4_connectivity:
+    merging via mask union (rather than a later polygon-level merge) guarantees the result is
+    properly 4-connected by construction - _touches already only reports true (non-diagonal)
+    4-adjacency, so any pair this merges was already properly connected before the union."""
+    masks = [m.copy() for m in zone_masks if m.any()]
+    while len(masks) > MIN_ZONES:
+        sizes = [int(m.sum()) for m in masks]
+        smallest_i = min(range(len(masks)), key=lambda i: sizes[i])
+        if sizes[smallest_i] >= min_pixels:
+            break
+        touching = [j for j in range(len(masks)) if j != smallest_i and _touches(masks[smallest_i], masks[j])]
+        if not touching:
+            break
+        best_j = max(touching, key=lambda j: int(np.sum(masks[smallest_i] & _dilate4(masks[j]))))
+        masks[best_j] = masks[best_j] | masks[smallest_i]
+        del masks[smallest_i]
+    return masks
+
+
 def _split_oversized_zones(
-    zone_masks: list, smoothed_ndvi: np.ndarray, pixel_area_ha: float
+    zone_masks: list, smoothed_ndvi: np.ndarray, max_pixels: int
 ) -> list:
-    """Splits any zone mask bigger than MAX_SUBFIELD_AREA_HA into further balanced, 4-connected
+    """Splits any zone mask bigger than max_pixels into further balanced, 4-connected
     contiguous pieces (see _split_until_within_budget) - reusing the exact same region-growing/
     absorption/connectivity machinery zone construction itself uses, so every mask this returns
     respects the hard cap regardless of what target_plot_size_ha was requested.
@@ -1023,14 +1070,13 @@ def _split_oversized_zones(
     guarantees properly-joined, 4-connected results by construction, rather than needing to fix
     up a polygon (or several disconnected ones) after the fact.
 
-    pixel_area_ha is the area of one raster pixel in hectares - uniform across the grid (built
-    from an evenly-spaced lon/lat mesh before reprojection, see compute_field_zones), so the ha
-    cap converts to a simple pixel-count budget without having to vectorize a mask just to
-    measure it. _rebalance_oversized_zones runs first so a merely-marginal overage gets handed
-    to a neighbor instead of manufacturing a new zone - only genuine excess (more than every
-    touching neighbor combined has room for) actually reaches the splitting below.
+    max_pixels is a pixel-count budget (see compute_field_zones - the tighter of
+    MAX_ZONE_SIZE_DEVIATION_PCT-off-target and MAX_SUBFIELD_AREA_HA, converted from hectares via
+    pixel_area_ha there) so this needs no area math of its own. _rebalance_oversized_zones runs
+    first so a merely-marginal overage gets handed to a neighbor instead of manufacturing a new
+    zone - only genuine excess (more than every touching neighbor combined has room for) actually
+    reaches the splitting below.
     """
-    max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
     _rebalance_oversized_zones(zone_masks, max_pixels)
     result = []
     for mask in zone_masks:
@@ -1251,7 +1297,12 @@ def compute_field_zones(
     # Every raster pixel is the same lon/lat size (evenly-spaced mesh, see lon_edges/lat_edges
     # above), so field_area_ha / valid-pixel-count is that size in hectares.
     pixel_area_ha = field_area_ha / max(int(valid.sum()), 1)
-    max_pixels = max(1, int(MAX_SUBFIELD_AREA_HA / pixel_area_ha))
+    # target_max_ha/target_min_ha: the tighter of MAX_SUBFIELD_AREA_HA and
+    # target_plot_size_ha +/- MAX_ZONE_SIZE_DEVIATION_PCT% - see that constant's docstring.
+    target_max_ha = min(MAX_SUBFIELD_AREA_HA, target_plot_size_ha * (1 + MAX_ZONE_SIZE_DEVIATION_PCT / 100))
+    target_min_ha = target_plot_size_ha * (1 - MAX_ZONE_SIZE_DEVIATION_PCT / 100)
+    max_pixels = max(1, int(target_max_ha / pixel_area_ha))
+    min_pixels = max(1, int(target_min_ha / pixel_area_ha))
 
     # Reported back in the response (construction_algorithm) so callers/logs can see which one
     # actually produced the returned zones: "sequential" (the default) or "bisection" (fallback
@@ -1263,6 +1314,10 @@ def compute_field_zones(
     # which can leave a pixel reachable from its own zone only diagonally - see
     # _enforce_4_connectivity for why that reads as a detached "kwadracik" once vectorized.
     zone_masks = _enforce_4_connectivity(zone_masks)
+    # Floor side of MAX_ZONE_SIZE_DEVIATION_PCT - nothing above enforces a minimum, only a
+    # maximum, so an undersized zone (region-growing/absorption variance, or just an oddly-shaped
+    # leftover) merges into its best-touching neighbor here instead of reaching the response as-is.
+    zone_masks = _merge_undersized_zones(zone_masks, min_pixels)
     zone_pixel_counts = [int(m.sum()) for m in zone_masks if m.any()]
     if zone_pixel_counts:
         size_ratio = max(zone_pixel_counts) / min(zone_pixel_counts)
@@ -1277,9 +1332,9 @@ def compute_field_zones(
                 size_ratio, MAX_ZONE_SIZE_RATIO, sorted(zone_pixel_counts, reverse=True),
             )
 
-    # Hard cap regardless of the requested target_plot_size_ha - see MAX_SUBFIELD_AREA_HA
-    # (pixel_area_ha/max_pixels already computed above, before construction).
-    zone_masks = _split_oversized_zones(zone_masks, smoothed_ndvi, pixel_area_ha)
+    # Hard cap regardless of the requested target_plot_size_ha - see target_max_ha/max_pixels
+    # (already computed above, before construction).
+    zone_masks = _split_oversized_zones(zone_masks, smoothed_ndvi, max_pixels)
 
     if len(zone_masks) > actual_n_zones:
         # Sequential growth (_balanced_contiguous_zones) needed more zones than requested to keep
@@ -1299,7 +1354,8 @@ def compute_field_zones(
         )
         bisection_masks = _bisection_contiguous_zones(valid, actual_n_zones, max_pixels=max_pixels)
         bisection_masks = _enforce_4_connectivity(bisection_masks)
-        bisection_masks = _split_oversized_zones(bisection_masks, smoothed_ndvi, pixel_area_ha)
+        bisection_masks = _merge_undersized_zones(bisection_masks, min_pixels)
+        bisection_masks = _split_oversized_zones(bisection_masks, smoothed_ndvi, max_pixels)
         # <=, not < : bisection's straight-line cuts tend to come out noticeably more evenly
         # balanced even when it ties on the final zone count (verified on a real ~102ha field:
         # both approaches needed one extra zone there, but bisection's pre-split pixel-count
@@ -1321,7 +1377,7 @@ def compute_field_zones(
         return geom if not geom.is_empty else None
 
     zone_geoms = [_raw_zone_geometry(m) for m in zone_masks]
-    zone_geoms = _fill_field_edge_gaps(zone_geoms, zone_polygon, transformer, MAX_SUBFIELD_AREA_HA)
+    zone_geoms = _fill_field_edge_gaps(zone_geoms, zone_polygon, transformer, target_max_ha)
 
     # Straighten every zone's boundary into clean line segments, all together (see
     # _simplify_zone_boundaries - simplifying each zone polygon independently was tried first and
@@ -1362,7 +1418,7 @@ def compute_field_zones(
         # problem _fill_field_edge_gaps already solves for the *outer* field edge (a gap no zone's
         # raster-aligned boundary quite reaches) - reusing it here mops up whatever this
         # post-simplification gap left over, merging it into whichever zone is nearest.
-        zone_geoms = _fill_field_edge_gaps(zone_geoms, zone_polygon, transformer, MAX_SUBFIELD_AREA_HA)
+        zone_geoms = _fill_field_edge_gaps(zone_geoms, zone_polygon, transformer, target_max_ha)
 
         # Douglas-Peucker simplification of the shared line network (_simplify_zone_boundaries)
         # has no "stay inside the original polygon" constraint - it simplifies the field's own
@@ -1511,7 +1567,7 @@ def compute_field_zones(
     for mask, geom in zip(zone_masks, zone_geoms):
         if geom is None:
             continue
-        if _area_ha(geom, transformer) <= MAX_SUBFIELD_AREA_HA:
+        if _area_ha(geom, transformer) <= target_max_ha:
             final_entries.append((mask, geom))
             continue
 
