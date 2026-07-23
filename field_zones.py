@@ -1485,11 +1485,25 @@ def compute_field_zones(
     ]
     sizes_before_rebalance = [int(m.sum()) for m in rebalance_masks]
     _rebalance_oversized_zones(rebalance_masks, max_pixels)
+    # Re-vectorizing straight from a donated-to/donated-from mask (_raw_zone_geometry) can come
+    # back a MultiPolygon with a fresh tiny disconnected sliver - the donation moves pixels at
+    # the raster level with no connectivity guarantee, same failure mode _split_dust_parts
+    # already guards against earlier in this function, but this path runs *after* that earlier
+    # dust pass, so a sliver introduced here would otherwise reach the response untouched
+    # (verified: this exact mechanism produced a real ~0.008ha sliver on a live field - "Lubów
+    # 457", target_plot_size_ha=1.0 - rendered as a doubled boundary line on the map).
+    rebalance_dust_area_m2 = DUST_PART_MAX_PIXELS * resolution_m ** 2
     for idx, geom in enumerate(zone_geoms):
         if geom is None or int(rebalance_masks[idx].sum()) == sizes_before_rebalance[idx]:
             continue
         new_geom = _raw_zone_geometry(rebalance_masks[idx])
         if new_geom is not None:
+            new_geom_utm, _dropped = _split_dust_parts(
+                shp_transform(transformer.transform, new_geom), rebalance_dust_area_m2
+            )
+            new_geom = shp_transform(
+                lambda x, y: transformer.transform(x, y, direction="INVERSE"), new_geom_utm
+            )
             zone_geoms[idx] = new_geom
             zone_masks[idx] = rebalance_masks[idx]
 
