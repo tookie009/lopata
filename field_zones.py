@@ -1023,11 +1023,25 @@ def _rebalance_oversized_zones(zone_masks: list, max_pixels: int) -> None:
             excess -= moved
 
 
-def _merge_undersized_zones(zone_masks: list, min_pixels: int) -> list:
-    """Merges any zone under min_pixels into whichever touching neighbor it shares the most
-    4-connected border with, reducing the zone count by one per merge - the opposite-direction
-    counterpart to _rebalance_oversized_zones/_split_oversized_zones (which only ever enforce an
-    upper bound; nothing previously enforced a floor at all, see MAX_ZONE_SIZE_DEVIATION_PCT).
+def _merge_undersized_zones(zone_masks: list, min_pixels: int, max_pixels: int) -> list:
+    """Merges any zone under min_pixels into a touching neighbor, reducing the zone count by one
+    per merge - the opposite-direction counterpart to _rebalance_oversized_zones/
+    _split_oversized_zones (which only ever enforce an upper bound; nothing previously enforced a
+    floor at all, see MAX_ZONE_SIZE_DEVIATION_PCT).
+
+    Among touching neighbors, prefers one that has room to absorb the merge without itself going
+    over max_pixels (picking whichever such candidate shares the longest border), falling back to
+    "longest border regardless of size" only when *no* touching neighbor has room. This matters a
+    lot: an earlier version always picked the longest-border neighbor with no size check at all,
+    which on a field left with few zones (n_zones close to MIN_ZONES, so little slack to route
+    around) could merge into a neighbor already near max_pixels, overshooting max_pixels by 30%+
+    in one step - and since _split_oversized_zones/_split_until_within_budget then has to
+    re-split a zone shaped like "one normal zone plus a whole extra zone's worth of raggedly-
+    unioned pixels stitched on" rather than construction's own naturally-compact shapes, it can
+    fail to cleanly recover, producing dozens of degenerate sliver MultiPolygon parts (verified on
+    a real 15.6ha field at target_plot_size_ha=4.0, n_zones=4: a zone ballooned to 5.23ha with
+    ~30 near-zero-area sliver fragments). Preferring a neighbor with spare room avoids manufacturing
+    that overage in the first place wherever there's any alternative.
 
     Repeatedly merges the single smallest zone (not just any undersized one) so a merge that
     happens to push the *result* back over min_pixels doesn't leave other still-undersized zones
@@ -1051,7 +1065,10 @@ def _merge_undersized_zones(zone_masks: list, min_pixels: int) -> list:
         touching = [j for j in range(len(masks)) if j != smallest_i and _touches(masks[smallest_i], masks[j])]
         if not touching:
             break
-        best_j = max(touching, key=lambda j: int(np.sum(masks[smallest_i] & _dilate4(masks[j]))))
+        border_length = {j: int(np.sum(masks[smallest_i] & _dilate4(masks[j]))) for j in touching}
+        with_room = [j for j in touching if sizes[j] + sizes[smallest_i] <= max_pixels]
+        candidates = with_room if with_room else touching
+        best_j = max(candidates, key=lambda j: border_length[j])
         masks[best_j] = masks[best_j] | masks[smallest_i]
         del masks[smallest_i]
     return masks
@@ -1330,7 +1347,7 @@ def compute_field_zones(
     # Floor side of MAX_ZONE_SIZE_DEVIATION_PCT - nothing above enforces a minimum, only a
     # maximum, so an undersized zone (region-growing/absorption variance, or just an oddly-shaped
     # leftover) merges into its best-touching neighbor here instead of reaching the response as-is.
-    zone_masks = _merge_undersized_zones(zone_masks, min_pixels)
+    zone_masks = _merge_undersized_zones(zone_masks, min_pixels, max_pixels)
     zone_pixel_counts = [int(m.sum()) for m in zone_masks if m.any()]
     if zone_pixel_counts:
         size_ratio = max(zone_pixel_counts) / min(zone_pixel_counts)
@@ -1367,7 +1384,7 @@ def compute_field_zones(
         )
         bisection_masks = _bisection_contiguous_zones(valid, actual_n_zones, max_pixels=max_pixels)
         bisection_masks = _enforce_4_connectivity(bisection_masks)
-        bisection_masks = _merge_undersized_zones(bisection_masks, min_pixels)
+        bisection_masks = _merge_undersized_zones(bisection_masks, min_pixels, max_pixels)
         bisection_masks = _split_oversized_zones(bisection_masks, smoothed_ndvi, max_pixels)
         # <=, not < : bisection's straight-line cuts tend to come out noticeably more evenly
         # balanced even when it ties on the final zone count (verified on a real ~102ha field:
