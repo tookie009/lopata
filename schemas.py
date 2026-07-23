@@ -42,6 +42,17 @@ class FieldZonesRequest(BaseModel):
         description="Wierzcholki wielokata pola jako pary [lon, lat] (WGS84), min. 3 punkty",
         examples=[[[20.90, 52.15], [21.00, 52.15], [21.00, 52.20], [20.90, 52.20]]],
     )
+    zone_polygon: list[tuple[float, float]] | None = Field(
+        None,
+        min_length=3,
+        description=(
+            "Opcjonalny wielokat podpola do faktycznego podzialu (podzbior polygon) - gdy podany, "
+            "polygon sluzy tylko do pobrania/rozmiaru rastra NDVI (co pozwala wielu wywolaniom dla "
+            "roznych podpol tego samego pola dzielic sie jednym pobranym rastrem, patrz field_id), "
+            "a n_zones/geometrie stref sa liczone wzgledem zone_polygon. Brak = dzielimy caly "
+            "polygon (dotychczasowe zachowanie)."
+        ),
+    )
     target_plot_size_ha: float = Field(
         ..., gt=0, description="Docelowa powierzchnia jednej dzialki/strefy w hektarach"
     )
@@ -85,3 +96,10 @@ class FieldZonesRequest(BaseModel):
     @classmethod
     def _validate_polygon(cls, value: list[tuple[float, float]]) -> list[tuple[float, float]]:
         return _validate_lonlat_polygon(value)
+
+    @field_validator("zone_polygon")
+    @classmethod
+    def _validate_zone_polygon(
+        cls, value: list[tuple[float, float]] | None
+    ) -> list[tuple[float, float]] | None:
+        return _validate_lonlat_polygon(value) if value is not None else None

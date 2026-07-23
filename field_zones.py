@@ -1034,6 +1034,7 @@ def compute_field_zones(
     line_smoothing: float = DEFAULT_LINE_SMOOTHING,
     max_sample_points_per_zone: int = DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE,
     field_id: int | None = None,
+    zone_polygon_lonlat: list[tuple[float, float]] | None = None,
 ) -> dict:
     """Builds zones by seeded region growing (see _balanced_contiguous_zones) - each zone is
     grown outward from a seed pixel to an explicit, near-equal pixel-count share of the field, so
@@ -1049,15 +1050,37 @@ def compute_field_zones(
     needing to be re-tuned per resolution_m. Higher = straighter/fewer vertices; in practice
     values beyond ~2.5 stop helping much, since the network's junction points (where 3+ zones
     meet) are a hard floor on vertex count no tolerance can simplify past.
+
+    zone_polygon_lonlat: when given, polygon_lonlat is used only to size/fetch the NDVI raster
+    (so callers dividing several sub-regions of the same field - e.g. the krecik wizard's
+    manually-drawn subfields - can pass the FIELD's own full polygon here every time and let
+    fetch_best_vegetation_ndvi_array's field_id cache serve every call from one fetch) while
+    zone_polygon_lonlat is the actual area to divide into zones (a subset of polygon_lonlat).
+    n_zones, valid-pixel masking, and every returned geometry are scoped to zone_polygon_lonlat;
+    None means "divide the whole polygon_lonlat" (today's only behavior, unchanged).
     """
     field_polygon = Polygon(polygon_lonlat)
     if not field_polygon.is_valid or field_polygon.area == 0:
         raise ValueError("Podany wielokat pola jest niepoprawny (samoprzecinajacy sie lub zerowej powierzchni)")
 
+    if zone_polygon_lonlat is not None:
+        zone_polygon = Polygon(zone_polygon_lonlat)
+        if not zone_polygon.is_valid or zone_polygon.area == 0:
+            raise ValueError(
+                "Podany wielokat strefy (subpola) jest niepoprawny (samoprzecinajacy sie lub zerowej powierzchni)"
+            )
+    else:
+        zone_polygon = field_polygon
+
+    # Raster-fetch extent (bbox/UTM origin) always comes from the full polygon_lonlat, even when
+    # zone_polygon is smaller - this is what lets repeated calls for different sub-regions of the
+    # same field share one cached raster (see fetch_best_vegetation_ndvi_array/field_id).
     min_lon, min_lat, max_lon, max_lat = field_polygon.bounds
     centroid = field_polygon.centroid
     transformer = _to_utm_transformer(centroid.x, centroid.y)
-    field_area_ha = _area_ha(field_polygon, transformer)
+    # Despite the name, this is the area actually being divided (zone_polygon) - identical to the
+    # full field's area when zone_polygon_lonlat is None, as before.
+    field_area_ha = _area_ha(zone_polygon, transformer)
 
     if target_plot_size_ha <= 0:
         raise ValueError("target_plot_size_ha musi byc wieksze od zera")
@@ -1103,7 +1126,7 @@ def compute_field_zones(
     lat_centers = (lat_edges[:-1] + lat_edges[1:]) / 2
     grid_lon, grid_lat = np.meshgrid(lon_centers, lat_centers)
 
-    poly_xy = np.asarray(field_polygon.exterior.coords)
+    poly_xy = np.asarray(zone_polygon.exterior.coords)
     inside = points_in_polygon(
         grid_lon.ravel(), grid_lat.ravel(), poly_xy[:, 0], poly_xy[:, 1]
     ).reshape(grid_lon.shape)
@@ -1119,7 +1142,11 @@ def compute_field_zones(
     # expected to be (in pixels), so it washes out noise without also washing out genuine
     # zone-scale variation. Used by both strategies (also as the seed-ordering/growth-priority
     # signal for "contiguous"'s region growing).
-    expected_zone_side_px = math.sqrt((width_px * height_px) / max(n_zones, 1))
+    # Scoped to the zone polygon's own valid-pixel count, not the whole raster's width*height -
+    # when zone_polygon is a small subfield within a much larger raster (see zone_polygon_lonlat's
+    # docstring), sizing this off the full raster would inflate the blur radius far past what
+    # that subfield's own data can support.
+    expected_zone_side_px = math.sqrt(int(valid.sum()) / max(n_zones, 1))
     blur_radius = max(1, round(expected_zone_side_px * 0.15))
     smoothed_ndvi = _box_blur(ndvi, blur_radius)
 
@@ -1199,11 +1226,11 @@ def compute_field_zones(
         geom = _vectorize_mask(mask, lon_edges, lat_edges)
         if geom is None:
             return None
-        geom = geom.intersection(field_polygon)
+        geom = geom.intersection(zone_polygon)
         return geom if not geom.is_empty else None
 
     zone_geoms = [_raw_zone_geometry(m) for m in zone_masks]
-    zone_geoms = _fill_field_edge_gaps(zone_geoms, field_polygon, transformer, MAX_SUBFIELD_AREA_HA)
+    zone_geoms = _fill_field_edge_gaps(zone_geoms, zone_polygon, transformer, MAX_SUBFIELD_AREA_HA)
 
     # Straighten every zone's boundary into clean line segments, all together (see
     # _simplify_zone_boundaries - simplifying each zone polygon independently was tried first and
@@ -1228,7 +1255,7 @@ def compute_field_zones(
             expected_zone_side_m * LINE_SMOOTHING_MAX_FRACTION_OF_ZONE_SIZE,
         )
         simplified = _simplify_zone_boundaries(
-            [zone_geoms[i] for i in present], field_polygon, transformer, simplify_tolerance_m,
+            [zone_geoms[i] for i in present], zone_polygon, transformer, simplify_tolerance_m,
             dust_area_m2=DUST_PART_MAX_PIXELS * resolution_m ** 2,
         )
         for i, geom in zip(present, simplified):
@@ -1244,7 +1271,7 @@ def compute_field_zones(
         # problem _fill_field_edge_gaps already solves for the *outer* field edge (a gap no zone's
         # raster-aligned boundary quite reaches) - reusing it here mops up whatever this
         # post-simplification gap left over, merging it into whichever zone is nearest.
-        zone_geoms = _fill_field_edge_gaps(zone_geoms, field_polygon, transformer, MAX_SUBFIELD_AREA_HA)
+        zone_geoms = _fill_field_edge_gaps(zone_geoms, zone_polygon, transformer, MAX_SUBFIELD_AREA_HA)
 
         # Douglas-Peucker simplification of the shared line network (_simplify_zone_boundaries)
         # has no "stay inside the original polygon" constraint - it simplifies the field's own
@@ -1252,14 +1279,14 @@ def compute_field_zones(
         # outward at a concave point. Every zone rebuilt from that network inherits the same
         # excess area past the field's *true* boundary (verified experimentally: zone polygons
         # visibly crossing outside the field outline on the map). _raw_zone_geometry already
-        # clipped to field_polygon before any of this ran; re-clipping here guarantees the final
+        # clipped to zone_polygon before any of this ran; re-clipping here guarantees the final
         # output still never exceeds it, regardless of what simplification did afterward.
         zone_geoms = [
-            _polygonal_only(g.intersection(field_polygon)) if g is not None and not g.is_empty else None
+            _polygonal_only(g.intersection(zone_polygon)) if g is not None and not g.is_empty else None
             for g in zone_geoms
         ]
 
-        # EXPERIMENT: the field_polygon re-clip just above can itself introduce a fresh,
+        # EXPERIMENT: the zone_polygon re-clip just above can itself introduce a fresh,
         # near-zero-area sliver part on a zone that was otherwise clean (a GEOS intersection()
         # artifact, same class of issue _polygonal_only's docstring describes for unary_union) -
         # one that never goes through _simplify_zone_boundaries's own dust filter since that ran
@@ -1348,7 +1375,7 @@ def compute_field_zones(
     # geometry here and re-splitting anything still over budget - by re-rasterizing just that
     # zone's own footprint and running it through the same region-growing split used upfront -
     # closes that gap for good instead of just making it rarer. The re-split pieces are
-    # intersected with field_polygon (same as _raw_zone_geometry) but not run back through
+    # intersected with zone_polygon (same as _raw_zone_geometry) but not run back through
     # gap-filling, so they may be a hair smaller than their exact pixel share - the safe
     # direction to err in, given the alternative is exceeding the cap again.
     # (max_pixels/pixel_area_ha already computed near the top of this function.)

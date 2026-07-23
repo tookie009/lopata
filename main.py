@@ -164,8 +164,10 @@ def get_ndvi(payload: NdviRequest):
         "Przyjmuje wielokat pola i docelowa wielkosc dzialki (ha). Pobiera NDVI dla "
         "obszaru pola i buduje strefy przez seeded region growing tak, by liczba stref "
         "odpowiadala field_area_ha / target_plot_size_ha, kazda jako jeden spojny kawalek "
-        "o zblizonej powierzchni do pozostalych. Zwraca GeoJSON FeatureCollection ze "
-        "strefami posortowanymi rosnaco wg sredniego NDVI."
+        "o zblizonej powierzchni do pozostalych. Opcjonalny zone_polygon dzieli tylko ten "
+        "podzbior polygon (np. jedno recznie narysowane podpole), pobierajac/cache'ujac raster "
+        "NDVI wciaz dla calego polygon - patrz compute_field_zones's docstring. Zwraca GeoJSON "
+        "FeatureCollection ze strefami posortowanymi rosnaco wg sredniego NDVI."
     ),
 )
 def post_field_zones(payload: FieldZonesRequest):
@@ -179,6 +181,7 @@ def post_field_zones(payload: FieldZonesRequest):
             line_smoothing=payload.line_smoothing,
             max_sample_points_per_zone=payload.max_sample_points_per_zone,
             field_id=payload.field_id,
+            zone_polygon_lonlat=payload.zone_polygon,
         )
         _log_field_zones_call(request_json, response=result)
         return result
