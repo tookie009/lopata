@@ -4,8 +4,10 @@ import math
 from collections import deque
 
 import numpy as np
+import shapely
 from pyproj import Transformer
-from shapely.geometry import Polygon, box, mapping
+from shapely.errors import GEOSException
+from shapely.geometry import Point, Polygon, box, mapping
 from shapely.ops import transform as shp_transform
 from shapely.ops import linemerge, polygonize, unary_union
 from shapely.vectorized import contains as _shapely_contains
@@ -180,6 +182,51 @@ def _polygonal_only(geom):
     return geom
 
 
+# Grid size (meters, in the UTM working space _build_simplified_zone_pieces operates in) used
+# only as a fallback when GEOS itself throws instead of returning a result - see that function's
+# docstring. Comfortably below any precision that matters for a field boundary, so snapping onto
+# it doesn't perceptibly change the result on the rare case where the fallback is even needed.
+_TOPOLOGY_FALLBACK_GRID_M = 0.001
+
+
+def _build_simplified_zone_pieces(lines: list, tolerance_m: float) -> list:
+    """linemerge(unary_union(lines)).simplify(tolerance_m, preserve_topology=True), then
+    polygonize()'d back into pieces - with a fallback for the rare case where GEOS itself throws
+    (typically "TopologyException: side location conflict") instead of returning a result.
+
+    Verified against a real field where this happened: the exception's own reported coordinate
+    landed, to within floating-point noise, exactly on that field's boundary at an ordinary-
+    looking concave corner - not any visibly degenerate input geometry (the field polygon itself
+    was confirmed valid). `lines` mixes many raster-derived, jagged zone-boundary lines with the
+    field's own smooth polygon boundary - exactly the kind of input where two edges can end up
+    only floating-point-noise apart instead of exactly coincident, which is the classic trigger
+    for this GEOS robustness bug. It isn't reliably the same one of union/simplify/polygonize
+    that throws every time, so the whole build is retried here rather than guessing which call to
+    guard individually.
+
+    shapely.set_precision() snapping every input line onto a fixed grid first is the standard fix
+    for this bug class: it forces exact coordinate equality wherever two vertices were already
+    only floating-point-noise apart, closing off the ambiguous case before GEOS ever sees it. The
+    common case (no error) never touches this at all - the snap only runs after a first attempt
+    already failed.
+    """
+    def _run(input_lines):
+        network = linemerge(unary_union(input_lines))
+        simplified = network.simplify(tolerance_m, preserve_topology=True)
+        return list(polygonize(simplified))
+
+    try:
+        return _run(lines)
+    except GEOSException as e:
+        logger.warning(
+            "Zone-boundary network build/simplify/polygonize hit a GEOS topology error (%s) - "
+            "retrying after snapping input lines to a %.3fm precision grid",
+            e, _TOPOLOGY_FALLBACK_GRID_M,
+        )
+        snapped = [shapely.set_precision(line, grid_size=_TOPOLOGY_FALLBACK_GRID_M) for line in lines]
+        return _run(snapped)
+
+
 def _simplify_zone_boundaries(
     zone_geoms: list,
     field_polygon: Polygon,
@@ -245,9 +292,7 @@ def _simplify_zone_boundaries(
         elif not boundary.is_empty:
             lines.append(boundary)
 
-    network = linemerge(unary_union(lines))
-    simplified_network = network.simplify(tolerance_m, preserve_topology=True)
-    rebuilt = list(polygonize(simplified_network))
+    rebuilt = _build_simplified_zone_pieces(lines, tolerance_m)
 
     assignments: list[list] = [[] for _ in utm_zone_geoms]
     for piece in rebuilt:
@@ -1082,6 +1127,52 @@ def compute_field_zones(
     # full field's area when zone_polygon_lonlat is None, as before.
     field_area_ha = _area_ha(zone_polygon, transformer)
 
+    _utm_zone_boundary = shp_transform(transformer.transform, zone_polygon.boundary)
+
+    def _snap_to_zone_boundary(geom, tolerance_m: float):
+        """Snaps geom's vertices within tolerance_m of zone_polygon's own boundary exactly onto
+        it (worked out in UTM meters, isotropic unlike lon/lat degrees). Needed when
+        zone_polygon_lonlat divides one of several sub-regions of the same field: two adjacent
+        subfields are each divided by their OWN, independent compute_field_zones() call, and
+        while both use the exact same UTM transformer (from the whole field's centroid) and the
+        exact same input boundary along their shared seam, each call's own region growing/
+        gap-filling/hard-cap rebalancing can still nudge that nominally-identical edge several
+        pixels apart along most of its length (not just near its corners) - which otherwise
+        renders as two close but distinct lines along the seam instead of one shared edge.
+        Snapping every final zone geometry onto zone_polygon's own boundary (not just once
+        mid-pipeline - rebalancing/hard-cap re-splitting after _simplify_zone_boundaries can
+        reintroduce drift via fresh, unsnapped _raw_zone_geometry() calls) makes both independent
+        calls agree on the exact same seam regardless of which internal path produced a zone.
+
+        shapely.ops.snap() is NOT what's used here - it only pulls vertices onto EXISTING
+        VERTICES of the reference geometry, which is useless for a long straight edge with
+        vertices only at its corners (verified: a mid-edge vertex several meters off the true
+        line was left untouched by snap() even well within its tolerance). Each vertex is instead
+        projected onto the boundary LINE (nearest point on any of its segments) and moved there
+        only if that projection is within tolerance_m.
+        """
+        def _snap_coords(xs, ys):
+            xs = np.asarray(xs, dtype=float)
+            ys = np.asarray(ys, dtype=float)
+            new_xs = xs.copy()
+            new_ys = ys.copy()
+            for i in range(len(xs)):
+                pt = Point(xs[i], ys[i])
+                projected = _utm_zone_boundary.interpolate(_utm_zone_boundary.project(pt))
+                if pt.distance(projected) <= tolerance_m:
+                    new_xs[i] = projected.x
+                    new_ys[i] = projected.y
+            return new_xs, new_ys
+
+        utm_geom = shp_transform(transformer.transform, geom)
+        utm_snapped = shp_transform(_snap_coords, utm_geom)
+        result = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), utm_snapped)
+        if not result.is_valid:
+            # Same GEOS renoding trick used elsewhere in this file (see _simplify_zone_boundaries) -
+            # snapping vertices together can itself introduce a hairline self-intersection.
+            result = result.buffer(0)
+        return result
+
     if target_plot_size_ha <= 0:
         raise ValueError("target_plot_size_ha musi byc wieksze od zera")
 
@@ -1424,6 +1515,22 @@ def compute_field_zones(
             sub_geom = _raw_zone_geometry(sub_mask)
             if sub_geom is not None:
                 final_entries.append((sub_mask, sub_geom))
+
+    # Final, authoritative snap onto zone_polygon's own boundary - applied here (after rebalancing
+    # and hard-cap re-splitting, both of which can produce fresh unsnapped geometry via
+    # _raw_zone_geometry) rather than only inside _simplify_zone_boundaries, so every zone that
+    # makes it into the response is covered regardless of which code path last touched it.
+    #
+    # Only when zone_polygon_lonlat was actually given: with no subfield override, zone_polygon
+    # IS field_polygon and there's only ever one call for it - nothing to reconcile a shared seam
+    # against, so this would just be extra risk on the far more common, already-relied-upon
+    # whole-field path for no benefit (verified: it measurably shrank total returned zone area on
+    # a plain whole-field call - projecting near-boundary vertices onto field_polygon's own ring
+    # can, for a non-convex outline, snap to a *different*, nearer part of that ring instead of
+    # the intended nearby segment).
+    if zone_polygon_lonlat is not None:
+        snap_tolerance_m = max(resolution_m * 10, 20.0)
+        final_entries = [(mask, _snap_to_zone_boundary(geom, snap_tolerance_m)) for mask, geom in final_entries]
 
     zones = []
     for mask, geom in final_entries:
