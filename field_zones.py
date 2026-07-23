@@ -1229,15 +1229,28 @@ def compute_field_zones(
     # equal-area grid split already does on the frontend. Ceiling guarantees field_area_ha /
     # n_zones never exceeds target_plot_size_ha in the first place.
     n_zones = math.ceil(field_area_ha / target_plot_size_ha)
+    # target_max_ha: the tighter of MAX_SUBFIELD_AREA_HA and target_plot_size_ha's own
+    # +MAX_ZONE_SIZE_DEVIATION_PCT% ceiling (see that constant's docstring). Computed here rather
+    # than only later alongside pixel_area_ha/max_pixels so the MAX_ZONES clamp just below is
+    # never looser than what construction will actually be held to - see that clamp's own
+    # reasoning, which applies identically to this tighter cap.
+    target_max_ha = min(MAX_SUBFIELD_AREA_HA, target_plot_size_ha * (1 + MAX_ZONE_SIZE_DEVIATION_PCT / 100))
     # MAX_ZONES is a normal, performance-motivated cap - but clamping n_zones down to it can
     # reintroduce the exact bug the ceil() above just fixed, one level up: for a big enough field
     # (e.g. 67.35ha with target_plot_size_ha=4.0 -> ideally ceil(67.35/4)=17 zones), MAX_ZONES=12
-    # forces fewer, larger zones (67.35/12=5.6ha, already over MAX_SUBFIELD_AREA_HA), which then
+    # forces fewer, larger zones (67.35/12=5.6ha, already over target_max_ha), which then
     # forces _split_oversized_zones to double them (verified: 12 -> 24 actual zones of ~2.8ha
-    # each, nowhere near the requested 4ha). Never clamping n_zones below what the hard area cap
-    # itself requires (ceil(field_area_ha / MAX_SUBFIELD_AREA_HA)) means the resulting zones
-    # actually land near target_plot_size_ha instead of needing that emergency doubling.
-    max_zones_for_request = max(MAX_ZONES, math.ceil(field_area_ha / MAX_SUBFIELD_AREA_HA))
+    # each, nowhere near the requested 4ha). Never clamping n_zones below what target_max_ha
+    # itself requires (ceil(field_area_ha / target_max_ha)) means the resulting zones actually
+    # land near target_plot_size_ha instead of needing that emergency doubling. Using
+    # target_max_ha here (not the old flat MAX_SUBFIELD_AREA_HA) matters most for a small
+    # target_plot_size_ha on a large field: a 15.6ha field at target=1.0ha needs >=13 zones to
+    # keep every one under a 1.25ha cap, but ceil(15.6/4.0)=4 wouldn't have raised the MAX_ZONES=12
+    # floor at all - construction would start from 12 already knowing it can't fit, instead of
+    # this clamp giving it the right count (16) from the outset (verified on a real 15.6453ha
+    # field, target=1.0ha: n_zones now starts at 16 instead of clamping to 12 and relying on the
+    # reactive over-cap/bisection-retry safety valve to claw its way back up afterward).
+    max_zones_for_request = max(MAX_ZONES, math.ceil(field_area_ha / target_max_ha))
     n_zones = max(MIN_ZONES, min(max_zones_for_request, n_zones))
 
     # Size the analysis raster from the requested ground resolution, capped for
