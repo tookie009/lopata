@@ -218,6 +218,32 @@ def _safe_union(geoms: list):
         return unary_union(snapped)
 
 
+def _safe_buffer0(geom):
+    """geom.buffer(0) - the standard GEOS trick for renoding a minor self-intersection back into
+    a valid polygon - retried after snapping onto a small precision grid if GEOS itself throws
+    (confirmed in production: "TopologyException: unable to assign free hole to a shell", the
+    same class of near-coincident-geometry robustness bug as _safe_union's "side location
+    conflict", just surfacing from buffer(0) instead of unary_union - both call sites that used
+    plain buffer(0) with no fallback at all before this). If even the snapped retry still throws,
+    returns the original (still possibly invalid) geometry rather than crashing the whole
+    request - a slightly-off polygon that renders is better than a 502."""
+    try:
+        return geom.buffer(0)
+    except GEOSException as e:
+        logger.warning(
+            "buffer(0) hit a GEOS topology error (%s) - retrying after snapping to a %.3fm "
+            "precision grid", e, _TOPOLOGY_FALLBACK_GRID_M,
+        )
+        try:
+            return shapely.set_precision(geom, grid_size=_TOPOLOGY_FALLBACK_GRID_M).buffer(0)
+        except GEOSException:
+            logger.exception(
+                "buffer(0) still failed after precision snapping - returning the geometry "
+                "unrepaired rather than failing the whole request"
+            )
+            return geom
+
+
 # Grid size (meters, in the UTM working space _build_simplified_zone_pieces operates in) used
 # only as a fallback when GEOS itself throws instead of returning a result - see that function's
 # docstring. Comfortably below any precision that matters for a field boundary, so snapping onto
@@ -383,7 +409,7 @@ def _simplify_zone_boundaries(
             # to flip a hairline crossing. buffer(0) is the standard GEOS trick for renoding a
             # minor self-intersection back into a valid polygon without perceptibly changing its
             # shape/area.
-            geom = geom.buffer(0)
+            geom = _safe_buffer0(geom)
         results.append(geom)
     return results
 
@@ -1256,7 +1282,7 @@ def compute_field_zones(
         if not result.is_valid:
             # Same GEOS renoding trick used elsewhere in this file (see _simplify_zone_boundaries) -
             # snapping vertices together can itself introduce a hairline self-intersection.
-            result = result.buffer(0)
+            result = _safe_buffer0(result)
         return result
 
     if target_plot_size_ha <= 0:
