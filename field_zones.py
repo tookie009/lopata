@@ -244,6 +244,59 @@ def _safe_buffer0(geom):
             return geom
 
 
+def _safe_intersection(a, b):
+    """a.intersection(b), retried after snapping both inputs onto a small precision grid if GEOS
+    itself throws - the same GEOS robustness bug class as _safe_union/_safe_buffer0 (confirmed in
+    production: "TopologyException: unable to assign free hole to a shell" recurring at the exact
+    same coordinate after _safe_buffer0 alone was added - this message isn't buffer-specific, GEOS
+    throws it from overlay ops like intersection()/difference() too), just from a different raw
+    GEOS call than either of those. Falls back to the original, unclipped `a` if even the snapped
+    retry still fails - keeping a little too much area is the safe direction to err in here (every
+    caller in this file uses this to clip TO a boundary, so the fallback can only ever be too
+    generous, never drop real field area)."""
+    try:
+        return a.intersection(b)
+    except GEOSException as e:
+        logger.warning(
+            "intersection hit a GEOS topology error (%s) - retrying after snapping inputs to a "
+            "%.3fm precision grid", e, _TOPOLOGY_FALLBACK_GRID_M,
+        )
+        try:
+            a_snapped = shapely.set_precision(a, grid_size=_TOPOLOGY_FALLBACK_GRID_M)
+            b_snapped = shapely.set_precision(b, grid_size=_TOPOLOGY_FALLBACK_GRID_M)
+            return a_snapped.intersection(b_snapped)
+        except GEOSException:
+            logger.exception(
+                "intersection still failed after precision snapping - returning the unclipped "
+                "geometry rather than failing the whole request"
+            )
+            return a
+
+
+def _safe_difference(a, b):
+    """Same fallback as _safe_intersection, for a.difference(b) - falls back to an empty
+    geometry (i.e. "no gap to fill") rather than crashing if even the snapped retry fails, the
+    safe direction to err in for _fill_field_edge_gaps's use (a missed gap-fill leaves a sliver
+    of field area unassigned to any zone, not incorrect data)."""
+    try:
+        return a.difference(b)
+    except GEOSException as e:
+        logger.warning(
+            "difference hit a GEOS topology error (%s) - retrying after snapping inputs to a "
+            "%.3fm precision grid", e, _TOPOLOGY_FALLBACK_GRID_M,
+        )
+        try:
+            a_snapped = shapely.set_precision(a, grid_size=_TOPOLOGY_FALLBACK_GRID_M)
+            b_snapped = shapely.set_precision(b, grid_size=_TOPOLOGY_FALLBACK_GRID_M)
+            return a_snapped.difference(b_snapped)
+        except GEOSException:
+            logger.exception(
+                "difference still failed after precision snapping - treating as no gap rather "
+                "than failing the whole request"
+            )
+            return Polygon()
+
+
 # Grid size (meters, in the UTM working space _build_simplified_zone_pieces operates in) used
 # only as a fallback when GEOS itself throws instead of returning a result - see that function's
 # docstring. Comfortably below any precision that matters for a field boundary, so snapping onto
@@ -358,7 +411,7 @@ def _simplify_zone_boundaries(
 
     assignments: list[list] = [[] for _ in utm_zone_geoms]
     for piece in rebuilt:
-        overlaps = [piece.intersection(orig).area for orig in utm_zone_geoms]
+        overlaps = [_safe_intersection(piece, orig).area for orig in utm_zone_geoms]
         best_i = max(range(len(overlaps)), key=lambda i: overlaps[i])
         if overlaps[best_i] > 0:
             assignments[best_i].append(piece)
@@ -465,7 +518,7 @@ def _fill_field_edge_gaps(
         return zone_geoms
 
     covered = _safe_union([g for _, g in present])
-    gap = field_polygon.difference(covered)
+    gap = _safe_difference(field_polygon, covered)
     if gap.is_empty:
         return zone_geoms
 
@@ -1452,7 +1505,7 @@ def compute_field_zones(
         geom = _vectorize_mask(mask, lon_edges, lat_edges)
         if geom is None:
             return None
-        geom = geom.intersection(zone_polygon)
+        geom = _safe_intersection(geom, zone_polygon)
         return geom if not geom.is_empty else None
 
     zone_geoms = [_raw_zone_geometry(m) for m in zone_masks]
@@ -1508,7 +1561,7 @@ def compute_field_zones(
         # clipped to zone_polygon before any of this ran; re-clipping here guarantees the final
         # output still never exceeds it, regardless of what simplification did afterward.
         zone_geoms = [
-            _polygonal_only(g.intersection(zone_polygon)) if g is not None and not g.is_empty else None
+            _polygonal_only(_safe_intersection(g, zone_polygon)) if g is not None and not g.is_empty else None
             for g in zone_geoms
         ]
 
