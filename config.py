@@ -22,13 +22,15 @@ class Settings(BaseSettings):
     # configured; a missing/unreachable DB never blocks a request, it just falls back to
     # memory-only behavior. Deliberately its own schema/credentials in kret's existing Postgres
     # instance, not kret's own farming_db tables/user.
+    #
+    # A single connection string (postgresql://user:password@host:port/dbname), not separate
+    # host/port/dbname/user/password fields - matches kret's own SPRING_DATASOURCE_URL convention
+    # and Railway's native per-plugin DATABASE_URL, and psycopg2 accepts this directly as a DSN
+    # with no parsing needed on this end. lopata_db_schema stays separate since a schema isn't
+    # part of a standard Postgres URI.
     lopata_db_enabled: bool = False
-    lopata_db_host: str = ""
-    lopata_db_port: int = 5432
-    lopata_db_name: str = ""
+    lopata_db_url: str = ""
     lopata_db_schema: str = "lopata"
-    lopata_db_user: str = ""
-    lopata_db_password: str = ""
 
 
 settings = Settings()

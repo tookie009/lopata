@@ -72,11 +72,7 @@ def _get_pool() -> ThreadedConnectionPool | None:
             _pool = ThreadedConnectionPool(
                 minconn=1,
                 maxconn=8,
-                host=settings.lopata_db_host,
-                port=settings.lopata_db_port,
-                dbname=settings.lopata_db_name,
-                user=settings.lopata_db_user,
-                password=settings.lopata_db_password,
+                dsn=settings.lopata_db_url,
             )
             _last_pool_failure_at = None
         except Exception:

@@ -24,33 +24,27 @@ starcie serwisu lopata — nic więcej nie trzeba klikać.
 
 ## 2. Ustaw zmienne serwisu lopata
 
+Konfiguracja to jeden connection string zamiast osobnych pól host/port/nazwa/
+użytkownik/hasło - ten sam styl co Railway's własny `DATABASE_URL` per plugin
+Postgres i kreta `SPRING_DATASOURCE_URL`. psycopg2 (sterownik lopaty) przyjmuje
+taki string bezpośrednio, bez żadnego parsowania po stronie kodu.
+
 W Railway: serwis **lopata** → zakładka **Variables** → **Raw Editor** → wklej
 zawartość lokalnego pliku `.env.railway` (obok tego dokumentu, zignorowany
-przez git), uzupełniając trzy pola oznaczone `<...>`:
+przez git):
 
 ```env
 LOPATA_DB_ENABLED=true
-LOPATA_DB_HOST=<PGHOST pluginu Postgres kreta - zakladka Variables tego pluginu>
-LOPATA_DB_PORT=<PGPORT pluginu Postgres kreta, zwykle 5432 lub port proxy>
-LOPATA_DB_NAME=<PGDATABASE pluginu Postgres kreta, zwykle "railway">
+LOPATA_DB_URL=postgresql://lopata_cache:<haslo z .env.railway>@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}
 LOPATA_DB_SCHEMA=lopata
-LOPATA_DB_USER=lopata_cache
-LOPATA_DB_PASSWORD=<haslo z .env.railway>
-```
-
-Wartości `PGHOST`/`PGPORT`/`PGDATABASE` znajdziesz w zakładce **Variables**
-samego pluginu Postgres (nie serwisu lopata) - albo, jeśli lopata i kret są w
-tym samym projekcie Railway, możesz zamiast wpisywać wartości wprost użyć
-referencji do drugiego serwisu, np.:
-
-```env
-LOPATA_DB_HOST=${{Postgres.PGHOST}}
-LOPATA_DB_PORT=${{Postgres.PGPORT}}
-LOPATA_DB_NAME=${{Postgres.PGDATABASE}}
 ```
 
 (`Postgres` zastąp faktyczną nazwą pluginu widoczną w Twoim projekcie, jeśli
-jest inna).
+jest inna - to działa tylko gdy lopata i kret są w tym samym projekcie Railway,
+tak że `${{Postgres.PGHOST}}`-owe referencje w ogóle się rozwiążą). Jeśli nie
+są w tym samym projekcie, wklej zamiast referencji gotowe wartości `PGHOST`/
+`PGPORT`/`PGDATABASE` z zakładki **Variables** samego pluginu Postgres wprost
+do stringa.
 
 Railway zrestartuje serwis lopata automatycznie po zapisaniu zmiennych.
 
