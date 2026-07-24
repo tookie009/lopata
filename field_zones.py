@@ -147,7 +147,7 @@ def _split_dust_parts(geom, dust_area_m2: float):
         return geom, []
     dropped = [p for p in parts[1:] if p.area < dust_area_m2]
     kept_parts = [parts[0]] + [p for p in parts[1:] if p.area >= dust_area_m2]
-    kept = kept_parts[0] if len(kept_parts) == 1 else unary_union(kept_parts)
+    kept = kept_parts[0] if len(kept_parts) == 1 else _safe_union(kept_parts)
     return kept, dropped
 
 
@@ -191,8 +191,31 @@ def _polygonal_only(geom):
     if geom.geom_type == "GeometryCollection":
         polys = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
         if polys:
-            return unary_union(polys)
+            return _safe_union(polys)
     return geom
+
+
+def _safe_union(geoms: list):
+    """unary_union(geoms), retried after snapping every input onto a small precision grid if GEOS
+    itself throws instead of returning a result (typically "TopologyException: side location
+    conflict") - see _build_simplified_zone_pieces's docstring for the root cause (two zone
+    boundaries built from the same raster grid can end up only floating-point-noise apart instead
+    of exactly coincident, which is the classic trigger for this GEOS robustness bug) and why
+    snapping onto a fixed grid closes it off. That function already had its own version of this
+    retry for its own union+simplify+polygonize pipeline; this centralizes the same fallback for
+    every OTHER unary_union call in this file that merges two touching/near-coincident zone
+    polygons - previously unprotected, and confirmed to actually crash in production (a real
+    502 with this exact "side location conflict" message) from one of them merging two adjacent
+    zones' geometry with no fallback at all."""
+    try:
+        return unary_union(geoms)
+    except GEOSException as e:
+        logger.warning(
+            "unary_union hit a GEOS topology error (%s) - retrying after snapping inputs to a "
+            "%.3fm precision grid", e, _TOPOLOGY_FALLBACK_GRID_M,
+        )
+        snapped = [shapely.set_precision(g, grid_size=_TOPOLOGY_FALLBACK_GRID_M) for g in geoms]
+        return unary_union(snapped)
 
 
 # Grid size (meters, in the UTM working space _build_simplified_zone_pieces operates in) used
@@ -334,7 +357,7 @@ def _simplify_zone_boundaries(
         # a valid Polygon (pieces happen to touch) or a valid MultiPolygon (they don't) - never a
         # self-touching knot - and Leaflet renders a MultiPolygon's separate parts just fine, each
         # with its own clean outline, so there's nothing to fix here by forcing one shape.
-        geom = _polygonal_only(unary_union(pieces)) if pieces else orig
+        geom = _polygonal_only(_safe_union(pieces)) if pieces else orig
         kept, dropped = _split_dust_parts(geom, dust_area_m2)
         kept_geoms.append(kept)
         all_dropped.extend(dropped)
@@ -348,7 +371,7 @@ def _simplify_zone_boundaries(
     # reattaches each piece to its real neighbor.
     for piece in all_dropped:
         nearest_i = _best_touching_neighbor(piece, kept_geoms)
-        kept_geoms[nearest_i] = _polygonal_only(unary_union([kept_geoms[nearest_i], piece]))
+        kept_geoms[nearest_i] = _polygonal_only(_safe_union([kept_geoms[nearest_i], piece]))
 
     results = []
     for geom in kept_geoms:
@@ -415,7 +438,7 @@ def _fill_field_edge_gaps(
     if not present:
         return zone_geoms
 
-    covered = unary_union([g for _, g in present])
+    covered = _safe_union([g for _, g in present])
     gap = field_polygon.difference(covered)
     if gap.is_empty:
         return zone_geoms
@@ -465,7 +488,7 @@ def _fill_field_edge_gaps(
             best_local_i = _best_touching_neighbor(piece, candidate_geoms)
 
         nearest_i = present_indices[best_local_i]
-        result[nearest_i] = _polygonal_only(unary_union([result[nearest_i], piece]))
+        result[nearest_i] = _polygonal_only(_safe_union([result[nearest_i], piece]))
     return result
 
 
@@ -511,7 +534,7 @@ def _vectorize_mask(mask: np.ndarray, lon_edges: np.ndarray, lat_edges: np.ndarr
             )
     if not boxes:
         return None
-    return unary_union(boxes)
+    return _safe_union(boxes)
 
 
 def _neighbors8(r: int, c: int, height: int, width: int):
@@ -1843,7 +1866,7 @@ def compute_field_zones(
 
         smallest_mask, smallest_geom = final_entries[smallest_i]
         target_mask, _target_geom = final_entries[target_i]
-        merged_geom_utm = _polygonal_only(unary_union([utm_geoms[target_i], utm_geoms[smallest_i]]))
+        merged_geom_utm = _polygonal_only(_safe_union([utm_geoms[target_i], utm_geoms[smallest_i]]))
         merged_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), merged_geom_utm)
         merged_mask = target_mask | (valid & _shapely_contains(smallest_geom, grid_lon, grid_lat))
         final_entries[target_i] = (merged_mask, merged_geom)
