@@ -1876,19 +1876,31 @@ def compute_field_zones(
     # (here, only) part unconditionally regardless of its own absolute size. Verified on a real
     # field (id 320, target_plot_size_ha=2.0): one zone came back as a 3-vertex, 0.0002ha triangle
     # - real area, not a floating-point artifact, but nowhere near a usable subfield. Merge any
-    # zone this degenerate into whichever other final zone it shares the longest boundary with -
-    # the same idea as _merge_undersized_zones at the pixel-mask stage earlier, just applied here
-    # at the polygon stage, where this specific failure mode actually surfaces - never merging
-    # below MIN_ZONES.
+    # zone this degenerate into another final zone it touches - the same idea as
+    # _merge_undersized_zones at the pixel-mask stage earlier, just applied here at the polygon
+    # stage, where this specific failure mode actually surfaces - never merging below MIN_ZONES.
+    #
+    # Prefer a touching zone with room to absorb it under target_max_ha (picking whichever such
+    # candidate shares the longest border), falling back to "longest border regardless of size"
+    # only when no candidate has room - the exact same fix _merge_undersized_zones needed earlier
+    # for the identical reason: picking purely by border length with no size check at all can
+    # merge into a zone already near the cap and blow through it. Verified on a real, much larger
+    # field (id 127, ~102ha at target_plot_size_ha=1.0/2.0 - hundreds of zones, so many more
+    # degenerate merges happen): several zones came back at 2x+ their 1.25ha/2.5ha cap before this
+    # fix, because the field's larger scale meant more of these merges had no room-aware
+    # candidate to prefer.
     while len(final_entries) > MIN_ZONES:
         areas_ha = [_area_ha(geom, transformer) for _mask, geom in final_entries]
         smallest_i = min(range(len(final_entries)), key=lambda i: areas_ha[i])
         if areas_ha[smallest_i] >= target_min_ha:
             break
         utm_geoms = [shp_transform(transformer.transform, geom) for _mask, geom in final_entries]
+        smallest_area_ha = areas_ha[smallest_i]
         others_idx = [i for i in range(len(utm_geoms)) if i != smallest_i]
-        best_local_i = _best_touching_neighbor(utm_geoms[smallest_i], [utm_geoms[i] for i in others_idx])
-        target_i = others_idx[best_local_i]
+        with_room_idx = [i for i in others_idx if areas_ha[i] + smallest_area_ha <= target_max_ha]
+        candidate_idx = with_room_idx if with_room_idx else others_idx
+        best_local_i = _best_touching_neighbor(utm_geoms[smallest_i], [utm_geoms[i] for i in candidate_idx])
+        target_i = candidate_idx[best_local_i]
 
         smallest_mask, smallest_geom = final_entries[smallest_i]
         target_mask, _target_geom = final_entries[target_i]
