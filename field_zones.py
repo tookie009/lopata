@@ -1818,6 +1818,37 @@ def compute_field_zones(
             for before, after in zip(pre_resimplify_entries, final_entries)
         ]
 
+    # A whole zone (not just a MultiPolygon's secondary part - _split_dust_parts already handles
+    # that case, everywhere it's called) can end up almost entirely reassigned away from itself
+    # during _simplify_zone_boundaries's busy-junction piece-matching ("whichever zone a rebuilt
+    # piece overlaps most" - see that function's own docstring), leaving only a tiny leftover
+    # scrap as that zone's *entire* geometry. Nothing above catches this: every dust-part check in
+    # this file only ever inspects a MultiPolygon's secondary parts, always keeping its largest
+    # (here, only) part unconditionally regardless of its own absolute size. Verified on a real
+    # field (id 320, target_plot_size_ha=2.0): one zone came back as a 3-vertex, 0.0002ha triangle
+    # - real area, not a floating-point artifact, but nowhere near a usable subfield. Merge any
+    # zone this degenerate into whichever other final zone it shares the longest boundary with -
+    # the same idea as _merge_undersized_zones at the pixel-mask stage earlier, just applied here
+    # at the polygon stage, where this specific failure mode actually surfaces - never merging
+    # below MIN_ZONES.
+    while len(final_entries) > MIN_ZONES:
+        areas_ha = [_area_ha(geom, transformer) for _mask, geom in final_entries]
+        smallest_i = min(range(len(final_entries)), key=lambda i: areas_ha[i])
+        if areas_ha[smallest_i] >= target_min_ha:
+            break
+        utm_geoms = [shp_transform(transformer.transform, geom) for _mask, geom in final_entries]
+        others_idx = [i for i in range(len(utm_geoms)) if i != smallest_i]
+        best_local_i = _best_touching_neighbor(utm_geoms[smallest_i], [utm_geoms[i] for i in others_idx])
+        target_i = others_idx[best_local_i]
+
+        smallest_mask, smallest_geom = final_entries[smallest_i]
+        target_mask, _target_geom = final_entries[target_i]
+        merged_geom_utm = _polygonal_only(unary_union([utm_geoms[target_i], utm_geoms[smallest_i]]))
+        merged_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), merged_geom_utm)
+        merged_mask = target_mask | (valid & _shapely_contains(smallest_geom, grid_lon, grid_lat))
+        final_entries[target_i] = (merged_mask, merged_geom)
+        del final_entries[smallest_i]
+
     zones = []
     for mask, geom in final_entries:
         entry = _zone_entry(mask, geom)
