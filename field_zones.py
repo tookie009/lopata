@@ -206,7 +206,15 @@ def _safe_union(geoms: list):
     every OTHER unary_union call in this file that merges two touching/near-coincident zone
     polygons - previously unprotected, and confirmed to actually crash in production (a real
     502 with this exact "side location conflict" message) from one of them merging two adjacent
-    zones' geometry with no fallback at all."""
+    zones' geometry with no fallback at all.
+
+    The retry itself is wrapped too (unlike an earlier version of this function) - verified in
+    production that shapely.set_precision() snapping the inputs can itself throw a *second*,
+    different GEOSException ("unable to assign free hole to a shell") on the same ill-conditioned
+    geometry that triggered the first one. An unwrapped retry step meant the very fallback added
+    to prevent a 502 became the 502 - falls back to just the first input geometry, unmerged,
+    if even the snapped retry still fails, the same "give up gracefully" direction _safe_buffer0/
+    _safe_intersection/_safe_difference already take."""
     try:
         return unary_union(geoms)
     except GEOSException as e:
@@ -214,8 +222,15 @@ def _safe_union(geoms: list):
             "unary_union hit a GEOS topology error (%s) - retrying after snapping inputs to a "
             "%.3fm precision grid", e, _TOPOLOGY_FALLBACK_GRID_M,
         )
-        snapped = [shapely.set_precision(g, grid_size=_TOPOLOGY_FALLBACK_GRID_M) for g in geoms]
-        return unary_union(snapped)
+        try:
+            snapped = [shapely.set_precision(g, grid_size=_TOPOLOGY_FALLBACK_GRID_M) for g in geoms]
+            return unary_union(snapped)
+        except GEOSException:
+            logger.exception(
+                "unary_union still failed after precision snapping - returning just the first "
+                "input geometry unmerged rather than failing the whole request"
+            )
+            return geoms[0]
 
 
 def _safe_buffer0(geom):
