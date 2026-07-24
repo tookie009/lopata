@@ -1935,6 +1935,83 @@ def compute_field_zones(
             for before, after in zip(pre_resimplify_entries, final_entries)
         ]
 
+    # The "keep fewer vertices" choice just above is made per zone independently - two zones that
+    # used to share an edge can end up on different sides of it (one kept its pre-second-simplify
+    # geometry, the other the resimplified version), desyncing what was one shared line into either
+    # a genuine interior gap (the same busy-junction failure _fill_field_edge_gaps's second call
+    # earlier in this function targets, just reopened by a step that runs after that call) or,
+    # unlike that earlier case, an actual overlap between the two zones. Verified on a real, highly
+    # non-convex field (id 318, "Lubów 155", a narrow strip curling around a river bend - the
+    # MAX_ZONE_SIZE_RATIO warning already flags it as unusually non-convex) at both 2.0ha and 3.0ha
+    # targets: real interior gaps up to ~0.65ha and real pairwise polygon overlaps up to a few
+    # hundred m^2 between neighboring zones in the final response, after every other fix in this
+    # file had already run.
+    final_geoms_only = [geom for _mask, geom in final_entries]
+    final_geoms_only = _fill_field_edge_gaps(final_geoms_only, zone_polygon, transformer, target_max_ha)
+
+    # _fill_field_edge_gaps only ever closes gaps (field area belonging to no zone) - it has no
+    # equivalent for the opposite defect, two zones both claiming the same sliver of area, which
+    # this same desync can just as easily produce instead. Give the disputed sliver to whichever
+    # zone comes first in list order (arbitrary but deterministic - these overlaps are always tiny,
+    # dozens to a few hundred m^2 against multi-hectare zones, so which side keeps it doesn't
+    # matter) by clipping it out of every later zone that shares it.
+    for i in range(len(final_geoms_only)):
+        gi = final_geoms_only[i]
+        if gi is None or gi.is_empty:
+            continue
+        for j in range(i + 1, len(final_geoms_only)):
+            gj = final_geoms_only[j]
+            if gj is None or gj.is_empty:
+                continue
+            overlap = _safe_intersection(gi, gj)
+            if overlap.is_empty or overlap.area <= MIN_GAP_PIECE_AREA_DEG2:
+                continue
+            final_geoms_only[j] = _polygonal_only(_safe_difference(gj, gi))
+
+    final_sweep_dust_area_m2 = DUST_PART_MAX_PIXELS * resolution_m ** 2
+    cleaned_final_geoms = []
+    for g in final_geoms_only:
+        if g is None or g.is_empty:
+            cleaned_final_geoms.append(g)
+            continue
+        kept_utm, _dropped = _split_dust_parts(
+            shp_transform(transformer.transform, g), final_sweep_dust_area_m2
+        )
+        cleaned_final_geoms.append(
+            shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), kept_utm)
+        )
+
+    # Clipping an overlap out of the "losing" zone just above can leave a sliver too small to
+    # survive the dust-strip that just ran on it (same as any other dust part, dropped rather than
+    # reattached) - the same gap this whole sweep started by closing, reopened at a smaller scale
+    # by the very fix for the other defect. One more gap-fill pass mops that up, same as the two
+    # earlier repetitions of this pair in this function.
+    cleaned_final_geoms = _fill_field_edge_gaps(cleaned_final_geoms, zone_polygon, transformer, target_max_ha)
+
+    # This last gap-fill reclaims whatever the overlap-clipping's own GEOS difference() scattered
+    # along the disputed boundaries - dozens of individually dust-sized scraps, each merged into
+    # its nearest zone by _best_touching_neighbor but often only point-touching that zone's main
+    # body (verified on the same field 318 case: zone 0 came back a 22-part MultiPolygon after
+    # this reclaim, almost all parts under a few m^2), reintroducing the exact "kwadraciki" look
+    # the dust-strip above already exists to remove. One final dust-strip, same threshold, cleans
+    # it back up - what it drops here is, by construction, only ever what this reclaim pass itself
+    # just added (~0.1 m^2 total on field 318), not anything the rest of the pipeline built.
+    final_geoms_only = []
+    for g in cleaned_final_geoms:
+        if g is None or g.is_empty:
+            final_geoms_only.append(g)
+            continue
+        kept_utm, _dropped = _split_dust_parts(
+            shp_transform(transformer.transform, g), final_sweep_dust_area_m2
+        )
+        final_geoms_only.append(
+            shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), kept_utm)
+        )
+
+    final_entries = [
+        (mask, geom) for (mask, _orig_geom), geom in zip(final_entries, final_geoms_only)
+    ]
+
     # A whole zone (not just a MultiPolygon's secondary part - _split_dust_parts already handles
     # that case, everywhere it's called) can end up almost entirely reassigned away from itself
     # during _simplify_zone_boundaries's busy-junction piece-matching ("whichever zone a rebuilt
@@ -1949,26 +2026,40 @@ def compute_field_zones(
     # stage, where this specific failure mode actually surfaces - never merging below MIN_ZONES.
     #
     # Prefer a touching zone with room to absorb it under target_max_ha (picking whichever such
-    # candidate shares the longest border), falling back to "longest border regardless of size"
-    # only when no candidate has room - the exact same fix _merge_undersized_zones needed earlier
-    # for the identical reason: picking purely by border length with no size check at all can
-    # merge into a zone already near the cap and blow through it. Verified on a real, much larger
-    # field (id 127, ~102ha at target_plot_size_ha=1.0/2.0 - hundreds of zones, so many more
-    # degenerate merges happen): several zones came back at 2x+ their 1.25ha/2.5ha cap before this
-    # fix, because the field's larger scale meant more of these merges had no room-aware
-    # candidate to prefer.
+    # candidate shares the longest border). Unlike the similar fallback in _merge_undersized_zones,
+    # this is the LAST merge in the whole pipeline - nothing downstream ever re-splits or
+    # rebalances its output - so forcing a merge when no candidate has room is not a "least bad
+    # option" here, it's an unconditional, unrecoverable cap violation. The user has stated the
+    # MAX_SUBFIELD_AREA_HA cap is the single highest-priority constraint in this file, ranked above
+    # even zone count or avoiding undersized zones - so when no touching zone has room, leave this
+    # zone as its own (undersized) zone rather than merging it into one that's already full.
+    # Verified this is a real, reachable case, not theoretical: field 318 ("Lubów 155", a narrow
+    # strip curling around a river bend) at target_plot_size_ha=4.0 produced a 5.9-6.0ha zone (up
+    # to 50% over the 4.0ha cap) via exactly this forced fallback, with only 4 final zones instead
+    # of the field's own ceil(17.26/4.0)=5 - and nothing after this loop ever caught it.
+    #
+    # A zone whose only touching neighbors are all already full is marked unmergeable and excluded
+    # from being picked as "smallest" again (by its mask's identity, stable across iterations since
+    # a skipped zone is never merged/deleted) - so the loop can still keep merging any other,
+    # genuinely-mergeable undersized zone instead of getting stuck retrying the same one forever.
+    unmergeable_mask_ids: set[int] = set()
     while len(final_entries) > MIN_ZONES:
+        eligible_idx = [i for i, (mask, _geom) in enumerate(final_entries) if id(mask) not in unmergeable_mask_ids]
+        if not eligible_idx:
+            break
         areas_ha = [_area_ha(geom, transformer) for _mask, geom in final_entries]
-        smallest_i = min(range(len(final_entries)), key=lambda i: areas_ha[i])
+        smallest_i = min(eligible_idx, key=lambda i: areas_ha[i])
         if areas_ha[smallest_i] >= target_min_ha:
             break
         utm_geoms = [shp_transform(transformer.transform, geom) for _mask, geom in final_entries]
         smallest_area_ha = areas_ha[smallest_i]
         others_idx = [i for i in range(len(utm_geoms)) if i != smallest_i]
         with_room_idx = [i for i in others_idx if areas_ha[i] + smallest_area_ha <= target_max_ha]
-        candidate_idx = with_room_idx if with_room_idx else others_idx
-        best_local_i = _best_touching_neighbor(utm_geoms[smallest_i], [utm_geoms[i] for i in candidate_idx])
-        target_i = candidate_idx[best_local_i]
+        if not with_room_idx:
+            unmergeable_mask_ids.add(id(final_entries[smallest_i][0]))
+            continue
+        best_local_i = _best_touching_neighbor(utm_geoms[smallest_i], [utm_geoms[i] for i in with_room_idx])
+        target_i = with_room_idx[best_local_i]
 
         smallest_mask, smallest_geom = final_entries[smallest_i]
         target_mask, _target_geom = final_entries[target_i]
