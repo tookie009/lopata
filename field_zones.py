@@ -1721,6 +1721,79 @@ def compute_field_zones(
                 revalidated_entries.append((sub_mask, sub_geom))
         final_entries = revalidated_entries
 
+    # Final re-simplification pass over whatever actually made it into the response. Every step
+    # from here up (hard-cap rebalancing/splitting, _merge_undersized_zones, and - when
+    # zone_polygon_lonlat is given - snapping and its own post-snap rebalance/split) regenerates
+    # geometry straight from a pixel mask via _raw_zone_geometry, which is never simplified - only
+    # the very first construction pass ever went through _simplify_zone_boundaries. Any zone that a
+    # later step actually touched therefore reached the response as a raw, blocky pixel-staircase
+    # polygon instead of a smoothed one, and - the exact problem _simplify_zone_boundaries's own
+    # docstring describes for simplifying zones independently - two zones simplified at different
+    # times (one here, one only in the original first-pass network) can no longer agree on their
+    # shared edge, which is what a "double line" seam actually is. Verified on a real subfield-
+    # scoped request (field 125, target_plot_size_ha=2.0): one zone _merge_undersized_zones/
+    # rebalancing touched came back a MultiPolygon with exact-grid-aligned raw coordinates
+    # (e.g. two vertices at the identical 16.4635075745 - a raster grid line, not a simplified
+    # curve), next to untouched zones with normally-simplified boundaries. Re-running the same
+    # whole-network simplification used for the first pass, now against the truly final set of
+    # zones regardless of which path last touched each one, re-smooths every zone consistently and
+    # re-threads shared edges through one shared network again - the same guarantee the first pass
+    # already relies on, just re-established at the point where it can no longer be invalidated by
+    # anything that runs afterward.
+    final_geoms = [geom for _mask, geom in final_entries]
+    final_dust_area_m2 = DUST_PART_MAX_PIXELS * resolution_m ** 2
+    resimplified = _simplify_zone_boundaries(
+        final_geoms, zone_polygon, transformer, simplify_tolerance_m, final_dust_area_m2
+    )
+    final_entries = [
+        (mask, geom) for (mask, _orig_geom), geom in zip(final_entries, resimplified)
+    ]
+
+    # Simplification has no "stay inside the original shape" constraint (same reasoning as the
+    # zone_polygon re-clip earlier in this function) - it can bulge a zone's boundary slightly
+    # outward at a concave point, pushing it a little over target_max_ha (verified: this exact
+    # resimplification pass did that on a real field/target combination, 2.5331ha against a 2.5ha
+    # cap). Donate any such overage to a touching neighbor with spare room first, same
+    # rebalance-before-split order used everywhere else in this function, rather than immediately
+    # falling back to a full re-split - which would just reintroduce the raw, unsimplified
+    # geometry this whole pass exists to clean up, for what's typically only a few pixels' worth
+    # of simplification drift.
+    resimplify_masks = [valid & _shapely_contains(geom, grid_lon, grid_lat) for _, geom in final_entries]
+    resimplify_sizes_before = [int(m.sum()) for m in resimplify_masks]
+    _rebalance_oversized_zones(resimplify_masks, max_pixels)
+    rebalanced_final: list[tuple[np.ndarray, object]] = []
+    for idx, (mask, geom) in enumerate(final_entries):
+        if int(resimplify_masks[idx].sum()) == resimplify_sizes_before[idx]:
+            rebalanced_final.append((mask, geom))
+            continue
+        new_geom = _raw_zone_geometry(resimplify_masks[idx])
+        if new_geom is None:
+            rebalanced_final.append((mask, geom))
+            continue
+        new_geom_utm, _dropped = _split_dust_parts(shp_transform(transformer.transform, new_geom), final_dust_area_m2)
+        new_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), new_geom_utm)
+        rebalanced_final.append((resimplify_masks[idx], new_geom))
+
+    capped_final: list[tuple[np.ndarray, object]] = []
+    for mask, geom in rebalanced_final:
+        if _area_ha(geom, transformer) <= target_max_ha:
+            capped_final.append((mask, geom))
+            continue
+        zone_mask = valid & _shapely_contains(geom, grid_lon, grid_lat)
+        if not zone_mask.any():
+            capped_final.append((mask, geom))
+            continue
+        for sub_mask in _enforce_4_connectivity(_split_until_within_budget(zone_mask, smoothed_ndvi, max_pixels)):
+            if not sub_mask.any():
+                continue
+            sub_geom = _raw_zone_geometry(sub_mask)
+            if sub_geom is None:
+                continue
+            sub_geom_utm, _dropped = _split_dust_parts(shp_transform(transformer.transform, sub_geom), final_dust_area_m2)
+            sub_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), sub_geom_utm)
+            capped_final.append((sub_mask, sub_geom))
+    final_entries = capped_final
+
     zones = []
     for mask, geom in final_entries:
         entry = _zone_entry(mask, geom)
