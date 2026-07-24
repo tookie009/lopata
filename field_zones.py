@@ -1740,6 +1740,7 @@ def compute_field_zones(
     # re-threads shared edges through one shared network again - the same guarantee the first pass
     # already relies on, just re-established at the point where it can no longer be invalidated by
     # anything that runs afterward.
+    pre_resimplify_entries = final_entries
     final_geoms = [geom for _mask, geom in final_entries]
     final_dust_area_m2 = DUST_PART_MAX_PIXELS * resolution_m ** 2
     resimplified = _simplify_zone_boundaries(
@@ -1793,6 +1794,29 @@ def compute_field_zones(
             sub_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), sub_geom_utm)
             capped_final.append((sub_mask, sub_geom))
     final_entries = capped_final
+
+    # This second simplification pass is meant to clean up zones a later step (rebalancing,
+    # merging, snapping) regenerated raw from a pixel mask since the first pass - but for a zone
+    # nothing downstream ever touched, its geometry already went through _fill_field_edge_gaps'
+    # second call, the zone_polygon re-clip, and dust-stripping since the first pass, and rerunning
+    # the whole shared-boundary-network reconstruction on top of that isn't guaranteed to be an
+    # improvement: verified on a real field/target combination where every zone came back with
+    # MORE vertices after this pass than before it (10-31 before vs 32-119 after), not fewer -
+    # already-applied gap-filling/re-clipping changes the network's topology enough that redoing
+    # Douglas-Peucker on it doesn't reliably recover the first pass's cleaner result. Keep whichever
+    # of the two versions has fewer vertices per zone - skipped whenever this pass's rebalance/
+    # split above changed the zone count, since index alignment with the pre-pass list no longer
+    # holds and there's nothing meaningful left to compare.
+    if len(final_entries) == len(pre_resimplify_entries):
+        def _vertex_count(geom) -> int:
+            if geom.geom_type == "Polygon":
+                return len(geom.exterior.coords)
+            return sum(len(p.exterior.coords) for p in geom.geoms)
+
+        final_entries = [
+            before if _vertex_count(before[1]) <= _vertex_count(after[1]) else after
+            for before, after in zip(pre_resimplify_entries, final_entries)
+        ]
 
     zones = []
     for mask, geom in final_entries:
