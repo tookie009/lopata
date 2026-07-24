@@ -1629,7 +1629,22 @@ def compute_field_zones(
     # can, for a non-convex outline, snap to a *different*, nearer part of that ring instead of
     # the intended nearby segment).
     if zone_polygon_lonlat is not None:
-        snap_tolerance_m = max(resolution_m * 10, 20.0)
+        # Was max(resolution_m * 10, 20.0) - a flat 10x-resolution tolerance (100m at the default
+        # resolution_m=10) with no tie to what actually causes the seam discrepancy this snap
+        # exists to fix: two independent compute_field_zones() calls dividing adjacent subfields
+        # each round their own copy of the shared boundary through Douglas-Peucker simplification
+        # at tolerance resolution_m * line_smoothing (see simplify_tolerance_m above) - that's the
+        # real bound on how far the two calls' approximations of the *same* line can drift apart,
+        # not an arbitrary 10x multiplier. On a narrow/pinched real field the old 100m tolerance
+        # snapped vertices nowhere near the true seam (interior zone-to-zone boundary vertices
+        # sitting within 100m of the outer zone_polygon ring, simply because the field itself is
+        # that narrow there) onto the outer ring instead, redistributing over 100 pixels of real
+        # area between zones in one step and forcing extra zones just to re-absorb the overage.
+        # Verified on that real field (id 125, 15.6453ha, target_plot_size_ha=4.0, subfield-scoped
+        # call): old tolerance inflated a clean, perfectly-balanced 4-zone bisection split (387px
+        # each) into 5-6 zones after snapping; tying it to line_smoothing instead gives back
+        # exactly 4 clean zones (3.83-3.92ha), matching the ideal ceil(field_area/target).
+        snap_tolerance_m = max(resolution_m * line_smoothing, 20.0)
         final_entries = [(mask, _snap_to_zone_boundary(geom, snap_tolerance_m)) for mask, geom in final_entries]
 
         # _snap_to_zone_boundary projects each zone's near-boundary vertices independently, with
@@ -1645,14 +1660,45 @@ def compute_field_zones(
         # already-compliant-sized zone also came back with its own sliver parts - both defects
         # reached the response untouched since nothing re-validated post-snap output. Re-run the
         # same dust-strip-then-recap check here, now against what's actually being returned.
-        revalidated_entries: list[tuple[np.ndarray, object]] = []
         dust_area_m2 = DUST_PART_MAX_PIXELS * resolution_m ** 2
+
+        cleaned_entries: list[tuple[np.ndarray, object]] = []
         for mask, geom in final_entries:
             if geom is None or geom.is_empty:
                 continue
             geom_utm, _dropped = _split_dust_parts(shp_transform(transformer.transform, geom), dust_area_m2)
             geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), geom_utm)
+            cleaned_entries.append((mask, geom))
 
+        # Before splitting anything still over budget (which always manufactures a new zone, even
+        # for a few pixels' worth of overage - see _rebalance_oversized_zones's docstring), try
+        # donating the post-snap excess to a touching sibling with spare room first - the same
+        # rebalance-before-split order the pre-snap hard-cap check above already uses. Matters a
+        # lot here: verified on a real subfield-scoped request (field 125, target_plot_size_ha=
+        # 4.0) that bisection construction alone had already found a perfectly even 4-way split
+        # (387 pixels each, comfortably under the 395-pixel budget) - snapping nudged 2 of those 4
+        # zones over budget while leaving the other 2 with slack, and splitting each oversized one
+        # independently (this function's earlier behavior) manufactured 2 brand-new zones (6
+        # total) for what was actually just a few dozen pixels of snap-induced drift that
+        # donation alone resolves without changing the zone count at all.
+        rebalance_masks = [valid & _shapely_contains(geom, grid_lon, grid_lat) for _, geom in cleaned_entries]
+        sizes_before_rebalance = [int(m.sum()) for m in rebalance_masks]
+        _rebalance_oversized_zones(rebalance_masks, max_pixels)
+        rebalanced_entries: list[tuple[np.ndarray, object]] = []
+        for idx, (mask, geom) in enumerate(cleaned_entries):
+            if int(rebalance_masks[idx].sum()) == sizes_before_rebalance[idx]:
+                rebalanced_entries.append((mask, geom))
+                continue
+            new_geom = _raw_zone_geometry(rebalance_masks[idx])
+            if new_geom is None:
+                rebalanced_entries.append((mask, geom))
+                continue
+            new_geom_utm, _dropped = _split_dust_parts(shp_transform(transformer.transform, new_geom), dust_area_m2)
+            new_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), new_geom_utm)
+            rebalanced_entries.append((rebalance_masks[idx], new_geom))
+
+        revalidated_entries: list[tuple[np.ndarray, object]] = []
+        for mask, geom in rebalanced_entries:
             if _area_ha(geom, transformer) <= target_max_ha:
                 revalidated_entries.append((mask, geom))
                 continue
