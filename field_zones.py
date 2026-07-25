@@ -1380,18 +1380,19 @@ def _compute_zone_sample_points(
         chosen = _farthest_point_sample(pool, max_points)
         return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
 
-    # A gentle "S" - one full sine oscillation across the whole transect - rather than
+    # A very gentle "S" - one full sine oscillation across the whole transect - rather than
     # zigzagging out to the full width each step: alternating to the true min/max of s put
     # points right on the zone's own boundary on a narrow field (verified on a real ~5ha
     # strip field: points landed hugging both edges instead of crossing through the
-    # interior). amplitude is a modest fraction of the half-width, so the wander stays well
-    # inside the zone - explicitly requested ("delikatne S", a gentle S, not a sharp zigzag
-    # touching the edges each time) with a hand-drawn reference line crossing mostly through
-    # the middle. sin(0) = sin(2*pi) = 0, so both ends of the transect also land near-center
-    # rather than at a corner of the *width* - the corner-to-corner reach from t_min/t_max
-    # is along the zone's LENGTH, this only softens how far it wanders sideways.
+    # interior). amplitude is a small fraction of the half-width - just enough room to dodge a
+    # local bad-NDVI patch sideways - so the path reads as a straight diagonal, not a wavy
+    # line: explicitly requested ("po przekatnej", along the diagonal) with a hand-drawn
+    # reference showing near-straight lines crossing between zones at their shared corners.
+    # sin(0) = sin(2*pi) = 0, so both ends of the transect also land near-center rather than at
+    # a corner of the *width* - the corner-to-corner reach from t_min/t_max is along the zone's
+    # LENGTH, this only softens how far it wanders sideways.
     half_width = (s.max() - s.min()) / 2.0
-    amplitude = 0.18 * half_width
+    amplitude = 0.08 * half_width
     targets = [
         (
             t_min + (i + 0.5) / max_points * (t_max - t_min),
@@ -2284,64 +2285,60 @@ def compute_field_zones(
     for zone_id, z in enumerate(zones):
         z["zone_id"] = zone_id
 
-    # Chooses each zone's own sample_points orientation (forward or start<->end reversed) to
-    # minimize total driving between CONSECUTIVE zones' seams - requested directly: "koniec w
-    # jednym subpolu blisko poczatku drugiego, zeby duzo nie jezdzic" (one zone's end near the
-    # next one's start), then explicitly extended twice more: "rozszerz na wiecej stref" (consider
-    # the whole chain, not just each pair in isolation - reorienting zone i to suit zone i-1 could
-    # easily leave its now-different end badly placed for zone i+1) and "probuj ZAWSZE" (always
-    # try, not only between zones that happen to touch - a good seam is worth optimizing even
-    # between two zones with no shared border, since the frontend still draws a route straight
-    # from one's last point to the next one's first regardless of whether they're geometric
-    # neighbors). A short two-state (forward/reversed) DP over the whole chain picks every zone's
-    # orientation together, minimizing the sum of every seam's gap at once instead of greedily
-    # fixing one seam at a time.
+    # Reorders the zones themselves into a spatial visiting sequence (greedy nearest-neighbor
+    # tour) and chooses each zone's own sample_points orientation (forward or start<->end
+    # reversed) together, so that walking every zone's points in the order returned here traces
+    # diagonal lines that connect end-to-start across several neighboring zones, not just within
+    # one zone in isolation - requested directly with a hand-drawn reference showing several
+    # zones' diagonals meeting at their shared corners, forming one zigzagging path across a
+    # whole cluster rather than an isolated line per zone reached in arbitrary order.
     #
-    # Still a best-effort nicety, not a route optimizer - acknowledged directly as not a hard
-    # requirement, and harder for this to help a lot as zone count grows, since zones stay sorted
-    # by ndvi_mean (the contract above), rarely a spatial sweep. The frontend concatenates
-    # sample_points in exactly this list order to build a route (see
-    # PointService.generateAutoPoints), which is what makes "consecutive in this list" the right
-    # thing to optimize regardless of geometric adjacency.
+    # An EARLIER version kept zones in their ndvi_mean-sorted array order (the "sorted ascending
+    # by mean NDVI" contract just above) and only chose orientation via a fixed-order DP - but
+    # ndvi rank is rarely a spatial sweep, so consecutive zones in that order were frequently on
+    # opposite sides of the field, leaving the DP little genuinely-adjacent structure to exploit.
+    # zone_id VALUES still reflect ndvi rank (assigned above, before this reordering, and carried
+    # per-feature regardless of array position) - nothing reads array position as an implicit
+    # ndvi ranking (checked: the frontend only ever reads the zone_id/ndvi_mean fields directly),
+    # so reordering the array itself for routing purposes doesn't break that contract, only
+    # decouples "which zone_id a feature has" from "where it sits in the features list".
+    #
+    # Greedy nearest-neighbor (not a full TSP solve): starting from zone 0, repeatedly visits
+    # whichever remaining zone has a start-or-end point closest to the current zone's own end -
+    # a well-known, cheap heuristic, good enough for the "best-effort, not a route optimizer"
+    # bar already set for this feature (still true here: not a hard requirement, and this can't
+    # find a perfect tour, just a reasonable one, especially as zone count grows).
     n_zones = len(zones)
     if n_zones >= 2:
-        ends_fwd = [z["sample_points"][-1] if z["sample_points"] else None for z in zones]
         starts_fwd = [z["sample_points"][0] if z["sample_points"] else None for z in zones]
-        # Reversed orientation swaps which end is the "start"/"end" of the walk through this
-        # zone - a zone with 0 or 1 points is unaffected either way (nothing to reverse).
-        starts = [starts_fwd, ends_fwd]
-        ends = [ends_fwd, starts_fwd]
+        ends_fwd = [z["sample_points"][-1] if z["sample_points"] else None for z in zones]
 
         def _dist2(a, b) -> float:
             return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
 
-        # dp[state] = lowest total seam cost so far with the zone just placed in that orientation;
-        # back[i][state] = which state the PREVIOUS zone was in to achieve that.
-        dp = [0.0, 0.0]
-        back: list[list[int]] = []
-        for i in range(1, n_zones):
-            next_dp = [0.0, 0.0]
-            back.append([0, 0])
-            for cur_state in (0, 1):
-                best_cost, best_prev = None, 0
-                for prev_state in (0, 1):
-                    cost = dp[prev_state]
-                    if ends[prev_state][i - 1] is not None and starts[cur_state][i] is not None:
-                        cost += _dist2(ends[prev_state][i - 1], starts[cur_state][i])
+        order = [0]
+        reversed_flags = [False]
+        remaining = set(range(1, n_zones))
+        while remaining:
+            cur_idx = order[-1]
+            cur_end = starts_fwd[cur_idx] if reversed_flags[-1] else ends_fwd[cur_idx]
+            best_idx, best_reversed, best_cost = None, False, None
+            for idx in remaining:
+                for is_reversed, entry_point in ((False, starts_fwd[idx]), (True, ends_fwd[idx])):
+                    cost = 0.0 if cur_end is None or entry_point is None else _dist2(cur_end, entry_point)
                     if best_cost is None or cost < best_cost:
-                        best_cost, best_prev = cost, prev_state
-                next_dp[cur_state] = best_cost
-                back[-1][cur_state] = best_prev
-            dp = next_dp
+                        best_cost, best_idx, best_reversed = cost, idx, is_reversed
+            order.append(best_idx)
+            reversed_flags.append(best_reversed)
+            remaining.discard(best_idx)
 
-        states = [0] * n_zones
-        states[-1] = 0 if dp[0] <= dp[1] else 1
-        for i in range(n_zones - 1, 0, -1):
-            states[i - 1] = back[i - 1][states[i]]
-
-        for i, state in enumerate(states):
-            if state == 1 and zones[i]["sample_points"]:
-                zones[i]["sample_points"] = list(reversed(zones[i]["sample_points"]))
+        reordered_zones = []
+        for idx, is_reversed in zip(order, reversed_flags):
+            z = zones[idx]
+            if is_reversed and z["sample_points"]:
+                z["sample_points"] = list(reversed(z["sample_points"]))
+            reordered_zones.append(z)
+        zones = reordered_zones
 
     return {
         "type": "FeatureCollection",
