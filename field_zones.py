@@ -56,9 +56,13 @@ MAX_ZONE_SIZE_DEVIATION_PCT = 25.0
 # [LOW, HIGH] percentile of that zone's own NDVI values before spatially spreading candidates -
 # drops local anomalies (puddles, bare patches, machinery tracks) that would otherwise make an
 # unrepresentative soil-sample location, while keeping the middle bulk of genuinely typical
-# pixels to choose from.
-SAMPLE_POINT_PERCENTILE_LOW = 12.5
-SAMPLE_POINT_PERCENTILE_HIGH = 87.5
+# pixels to choose from. Tightened from 12.5/87.5 to 20/80 on request - the wider band was
+# technically correct (every chosen point verified to fall inside it) but still let points land
+# in a zone's own yellowish/transitional pixels when that zone had wide internal NDVI variation,
+# which read as "extreme" on the map even though it wasn't an outlier relative to the zone
+# itself. A single, named, easy-to-retune knob on purpose - expect this to get adjusted again.
+SAMPLE_POINT_PERCENTILE_LOW = 20.0
+SAMPLE_POINT_PERCENTILE_HIGH = 80.0
 # Below this many pixels, a percentile split isn't meaningful (e.g. 3 pixels -> "middle 75%" is
 # either 1 or all 3 depending on rounding) - skip the filter rather than let it arbitrarily
 # exclude a real candidate in an already-tiny zone.
