@@ -1255,6 +1255,158 @@ def _farthest_point_sample(points_m: np.ndarray, n: int) -> list[int]:
     return chosen
 
 
+def _compute_zone_sample_points(
+    ndvi: np.ndarray,
+    grid_lon: np.ndarray,
+    grid_lat: np.ndarray,
+    transformer,
+    mask: np.ndarray,
+    geom,
+    max_points: int,
+) -> list[list[float]]:
+    """Zigzag transect spanning the zone's own long axis corner-to-corner, alternating
+    side-to-side across its width as it advances - the "W-pattern" a soil-sampling transect
+    walks, and what a competing app's screenshot showed (one connected zigzag line per zone,
+    not a scattered point cloud). The frontend already draws a route connecting sample_points
+    in the order returned here, so that order matters: walking it in sequence traces one
+    mostly-continuous path instead of criss-crossing the zone unpredictably.
+
+    NDVI-extreme avoidance (see SAMPLE_POINT_PERCENTILE_LOW/HIGH's module docstring for why)
+    is a per-slice PREFERENCE here, not a pre-filter: the transect's own reach (its axis and
+    t_min/t_max) is computed from EVERY valid pixel in the zone, so an NDVI outlier sitting
+    right at a corner doesn't shrink how far the line extends - each along-axis slice then
+    prefers whichever of ITS candidates is furthest to the target side AND not an NDVI
+    outlier, falling back to the furthest candidate regardless of NDVI only if every
+    candidate in that slice is one. Explicitly requested after the first (pre-filtered)
+    version came out too short/central - "od jednego rogu pola do drugiego" (corner to
+    corner), avoiding extremes without giving up reach. Filters on the RAW ndvi (not
+    smoothed_ndvi) since smoothing is exactly what would wash out the local anomalies
+    (puddles, bare patches, tracks) this is meant to detect and avoid.
+
+    Extracted out of compute_field_zones's own _select_sample_points closure (which is now a
+    thin wrapper around this) so compute_field_zones's single_zone_override early-exit path can
+    call it directly too, before that closure would otherwise have been defined - both need the
+    exact same selection logic, not two copies of it."""
+    if max_points <= 0 or not mask.any():
+        return []
+    values = ndvi[mask]
+    lons = grid_lon[mask]
+    lats = grid_lat[mask]
+
+    # Vectorization/simplification/gap-filling earlier in compute_field_zones can leave the
+    # final zone polygon slightly different from its own raster mask - re-check candidates
+    # against the geometry actually being returned, not just the mask that produced it.
+    # Done BEFORE the NDVI filter below (unlike the pre-filtered version) so the percentile
+    # thresholds and the transect's own axis/reach are both computed from the same "real"
+    # candidate set the zone will actually be judged by.
+    if geom is not None and not geom.is_empty and len(lons):
+        inside = _shapely_contains(geom, lons, lats)
+        if inside.any():
+            values, lons, lats = values[inside], lons[inside], lats[inside]
+
+    if len(lons) == 0:
+        return []
+
+    if len(values) >= MIN_PIXELS_FOR_PERCENTILE_FILTER:
+        lo, hi = np.percentile(values, [SAMPLE_POINT_PERCENTILE_LOW, SAMPLE_POINT_PERCENTILE_HIGH])
+        ndvi_safe = (values >= lo) & (values <= hi)
+        if not ndvi_safe.any():
+            # Degenerately removed every pixel (e.g. a perfectly uniform zone, where lo ==
+            # hi) - treat everything as safe rather than having nothing to prefer below.
+            ndvi_safe = np.ones(len(values), dtype=bool)
+    else:
+        ndvi_safe = np.ones(len(values), dtype=bool)
+
+    xs, ys = transformer.transform(lons, lats)
+    points_m = np.column_stack([xs, ys])
+
+    if len(points_m) < 2:
+        return [[float(lons[0]), float(lats[0])]]
+
+    # PCA via SVD on the mean-centered candidates: the first right-singular vector is the
+    # direction of greatest spread (the zone's own long axis), the second is perpendicular to
+    # it - exactly what's needed to project every candidate onto "how far along the
+    # transect" (t) and "which side of it" (s).
+    centroid = points_m.mean(axis=0)
+    centered = points_m - centroid
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    primary_axis = vt[0]
+    secondary_axis = vt[1] if vt.shape[0] > 1 else np.array([-primary_axis[1], primary_axis[0]])
+    t = centered @ primary_axis
+    s = centered @ secondary_axis
+
+    if len(points_m) <= max_points:
+        # Too few real candidates to be selective about layout - return all of them, ordered
+        # along the transect so the route still traces roughly one direction instead of
+        # whatever order the raster mask happened to yield them in.
+        order = np.argsort(t)
+        return [[float(lons[i]), float(lats[i])] for i in order]
+
+    t_min, t_max = t.min(), t.max()
+    if t_max - t_min < 1e-6:
+        # Degenerate: every candidate projects to ~the same point along the axis (a very
+        # compact/near-circular zone) - no meaningful "line" to walk, fall back to the old
+        # maximize-mutual-distance spread rather than collapsing every bin onto one point.
+        safe_idx = np.where(ndvi_safe)[0]
+        pool = points_m[safe_idx] if len(safe_idx) >= max_points else points_m
+        pool_lons = lons[safe_idx] if len(safe_idx) >= max_points else lons
+        pool_lats = lats[safe_idx] if len(safe_idx) >= max_points else lats
+        chosen = _farthest_point_sample(pool, max_points)
+        return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
+
+    # A gentle "S" - one full sine oscillation across the whole transect - rather than
+    # zigzagging out to the full width each step: alternating to the true min/max of s put
+    # points right on the zone's own boundary on a narrow field (verified on a real ~5ha
+    # strip field: points landed hugging both edges instead of crossing through the
+    # interior). amplitude is a modest fraction of the half-width, so the wander stays well
+    # inside the zone - explicitly requested ("delikatne S", a gentle S, not a sharp zigzag
+    # touching the edges each time) with a hand-drawn reference line crossing mostly through
+    # the middle. sin(0) = sin(2*pi) = 0, so both ends of the transect also land near-center
+    # rather than at a corner of the *width* - the corner-to-corner reach from t_min/t_max
+    # is along the zone's LENGTH, this only softens how far it wanders sideways.
+    half_width = (s.max() - s.min()) / 2.0
+    amplitude = 0.18 * half_width
+    targets = [
+        (
+            t_min + (i + 0.5) / max_points * (t_max - t_min),
+            amplitude * math.sin(2 * math.pi * (i + 0.5) / max_points),
+        )
+        for i in range(max_points)
+    ]
+
+    # For each target position on the S-curve, greedily claim the nearest still-unused
+    # candidate - preferring NDVI-safe candidates globally over unsafe ones, not just within
+    # whatever along-axis slice this target happens to fall in. A per-slice-only preference
+    # (the previous version) still placed points on real NDVI anomalies whenever an entire
+    # slice was extreme (a large reddish patch spanning most of a slice's width, not just a
+    # few outlier pixels) - reported directly against a real field: the transect ran straight
+    # through a visibly anomalous patch at one end of a zone. Searching all safe candidates
+    # first, regardless of which slice they're nominally in, lets a nearby safe pixel from an
+    # adjacent slice cover for one that has none, so a genuinely large extreme patch gets
+    # walked around instead of through - only once every safe candidate is already claimed
+    # does this fall back to the nearest unsafe one, and only for the leftover targets.
+    safe_idx = np.where(ndvi_safe)[0]
+    unsafe_idx = np.where(~ndvi_safe)[0]
+    used = np.zeros(len(t), dtype=bool)
+    chosen_indices: list[int] = []
+    for t_target, s_target in targets:
+        for pool in (safe_idx, unsafe_idx):
+            available = pool[~used[pool]]
+            if len(available) == 0:
+                continue
+            dist2 = (t[available] - t_target) ** 2 + (s[available] - s_target) ** 2
+            pick = available[np.argmin(dist2)]
+            used[pick] = True
+            chosen_indices.append(pick)
+            break
+
+    # Return in along-axis order (not target-assignment order, which can differ slightly once
+    # candidates get claimed out of order) so the route still traces smoothly from one end to
+    # the other instead of jumping around.
+    chosen_indices.sort(key=lambda i: t[i])
+    return [[float(lons[i]), float(lats[i])] for i in chosen_indices]
+
+
 def compute_field_zones(
     polygon_lonlat: list[tuple[float, float]],
     target_plot_size_ha: float,
@@ -1264,6 +1416,7 @@ def compute_field_zones(
     max_sample_points_per_zone: int = DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE,
     field_id: int | None = None,
     zone_polygon_lonlat: list[tuple[float, float]] | None = None,
+    single_zone_override: bool = False,
 ) -> dict:
     """Builds zones by seeded region growing (see _balanced_contiguous_zones) - each zone is
     grown outward from a seed pixel to an explicit, near-equal pixel-count share of the field, so
@@ -1287,6 +1440,21 @@ def compute_field_zones(
     zone_polygon_lonlat is the actual area to divide into zones (a subset of polygon_lonlat).
     n_zones, valid-pixel masking, and every returned geometry are scoped to zone_polygon_lonlat;
     None means "divide the whole polygon_lonlat" (today's only behavior, unchanged).
+
+    single_zone_override: explicit opt-in to skip zone division entirely and return zone_polygon
+    (or polygon_lonlat, when zone_polygon_lonlat isn't given) as ONE zone, whatever its area -
+    the only way to get a returned zone bigger than MAX_SUBFIELD_AREA_HA, which every other path
+    through this function enforces unconditionally (see that constant's own docstring - it's
+    meant as a hard, non-negotiable cap everywhere else). Requested explicitly for the case where
+    a user wants exactly one sample covering a whole field larger than 4ha, with an explicit
+    confirmation on the caller's side - kret is expected to only ever forward this when
+    zone_polygon_lonlat is absent (see FieldZonesService), i.e. "the entire registered field,
+    not a manually-drawn piece of it". A deliberately separate, minimal code path rather than
+    threading a bypass flag through construction/splitting/rebalancing below (which are all
+    built assuming that cap is never negotiable) - safer than poking a hole in logic this
+    heavily tuned. Still gets real NDVI-aware sample_points (via _compute_zone_sample_points),
+    same as every normally-sized zone - the whole point of doing this in lopata rather than
+    letting the frontend fall back to blind geometric point placement for an oversized zone.
     """
     field_polygon = Polygon(polygon_lonlat)
     if not field_polygon.is_valid or field_polygon.area == 0:
@@ -1424,6 +1592,40 @@ def compute_field_zones(
         raise LookupError(
             "Brak prawidlowych pikseli NDVI wewnatrz podanego pola (zla data/zachmurzenie/geometria)"
         )
+
+    if single_zone_override:
+        # See this function's own docstring for single_zone_override - deliberately bypasses
+        # everything below (n_zones/max_pixels budgeting, region growing, splitting, gap-filling,
+        # boundary simplification) since none of it applies when the whole zone_polygon is
+        # already the one and only zone being returned. target_plot_size_ha is accepted but
+        # unused in this mode - kret still sends it (a POST body field), but it has no meaning
+        # here.
+        zone_area_ha = _area_ha(zone_polygon, transformer)
+        return {
+            "type": "FeatureCollection",
+            "field_area_ha": round(field_area_ha, 4),
+            "target_plot_size_ha": target_plot_size_ha,
+            "n_zones": 1,
+            "raster_size": {"width": width_px, "height": height_px},
+            "construction_algorithm": "single_zone_override",
+            "ndvi_metadata": ndvi_metadata,
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "zone_id": 0,
+                        "ndvi_mean": round(float(ndvi[valid].mean()), 4),
+                        "ndvi_min": round(float(ndvi[valid].min()), 4),
+                        "ndvi_max": round(float(ndvi[valid].max()), 4),
+                        "area_ha": round(zone_area_ha, 4),
+                        "sample_points": _compute_zone_sample_points(
+                            ndvi, grid_lon, grid_lat, transformer, valid, zone_polygon, max_sample_points_per_zone
+                        ),
+                    },
+                    "geometry": mapping(zone_polygon),
+                }
+            ],
+        }
 
     # Smooth before clustering so zones come out as coherent regions instead of a pixel-level
     # speckle - see _box_blur's docstring. Radius scales with how large a single zone is
@@ -1612,142 +1814,9 @@ def compute_field_zones(
         zone_geoms = cleaned_geoms
 
     def _select_sample_points(mask: np.ndarray, geom, max_points: int) -> list[list[float]]:
-        """Zigzag transect spanning the zone's own long axis corner-to-corner, alternating
-        side-to-side across its width as it advances - the "W-pattern" a soil-sampling transect
-        walks, and what a competing app's screenshot showed (one connected zigzag line per zone,
-        not a scattered point cloud). The frontend already draws a route connecting sample_points
-        in the order returned here, so that order matters: walking it in sequence traces one
-        mostly-continuous path instead of criss-crossing the zone unpredictably.
-
-        NDVI-extreme avoidance (see SAMPLE_POINT_PERCENTILE_LOW/HIGH's module docstring for why)
-        is a per-slice PREFERENCE here, not a pre-filter: the transect's own reach (its axis and
-        t_min/t_max) is computed from EVERY valid pixel in the zone, so an NDVI outlier sitting
-        right at a corner doesn't shrink how far the line extends - each along-axis slice then
-        prefers whichever of ITS candidates is furthest to the target side AND not an NDVI
-        outlier, falling back to the furthest candidate regardless of NDVI only if every
-        candidate in that slice is one. Explicitly requested after the first (pre-filtered)
-        version came out too short/central - "od jednego rogu pola do drugiego" (corner to
-        corner), avoiding extremes without giving up reach. Filters on the RAW ndvi (not
-        smoothed_ndvi) since smoothing is exactly what would wash out the local anomalies
-        (puddles, bare patches, tracks) this is meant to detect and avoid."""
-        if max_points <= 0 or not mask.any():
-            return []
-        values = ndvi[mask]
-        lons = grid_lon[mask]
-        lats = grid_lat[mask]
-
-        # Vectorization/simplification/gap-filling earlier in compute_field_zones can leave the
-        # final zone polygon slightly different from its own raster mask - re-check candidates
-        # against the geometry actually being returned, not just the mask that produced it.
-        # Done BEFORE the NDVI filter below (unlike the pre-filtered version) so the percentile
-        # thresholds and the transect's own axis/reach are both computed from the same "real"
-        # candidate set the zone will actually be judged by.
-        if geom is not None and not geom.is_empty and len(lons):
-            inside = _shapely_contains(geom, lons, lats)
-            if inside.any():
-                values, lons, lats = values[inside], lons[inside], lats[inside]
-
-        if len(lons) == 0:
-            return []
-
-        if len(values) >= MIN_PIXELS_FOR_PERCENTILE_FILTER:
-            lo, hi = np.percentile(values, [SAMPLE_POINT_PERCENTILE_LOW, SAMPLE_POINT_PERCENTILE_HIGH])
-            ndvi_safe = (values >= lo) & (values <= hi)
-            if not ndvi_safe.any():
-                # Degenerately removed every pixel (e.g. a perfectly uniform zone, where lo ==
-                # hi) - treat everything as safe rather than having nothing to prefer below.
-                ndvi_safe = np.ones(len(values), dtype=bool)
-        else:
-            ndvi_safe = np.ones(len(values), dtype=bool)
-
-        xs, ys = transformer.transform(lons, lats)
-        points_m = np.column_stack([xs, ys])
-
-        if len(points_m) < 2:
-            return [[float(lons[0]), float(lats[0])]]
-
-        # PCA via SVD on the mean-centered candidates: the first right-singular vector is the
-        # direction of greatest spread (the zone's own long axis), the second is perpendicular to
-        # it - exactly what's needed to project every candidate onto "how far along the
-        # transect" (t) and "which side of it" (s).
-        centroid = points_m.mean(axis=0)
-        centered = points_m - centroid
-        _, _, vt = np.linalg.svd(centered, full_matrices=False)
-        primary_axis = vt[0]
-        secondary_axis = vt[1] if vt.shape[0] > 1 else np.array([-primary_axis[1], primary_axis[0]])
-        t = centered @ primary_axis
-        s = centered @ secondary_axis
-
-        if len(points_m) <= max_points:
-            # Too few real candidates to be selective about layout - return all of them, ordered
-            # along the transect so the route still traces roughly one direction instead of
-            # whatever order the raster mask happened to yield them in.
-            order = np.argsort(t)
-            return [[float(lons[i]), float(lats[i])] for i in order]
-
-        t_min, t_max = t.min(), t.max()
-        if t_max - t_min < 1e-6:
-            # Degenerate: every candidate projects to ~the same point along the axis (a very
-            # compact/near-circular zone) - no meaningful "line" to walk, fall back to the old
-            # maximize-mutual-distance spread rather than collapsing every bin onto one point.
-            safe_idx = np.where(ndvi_safe)[0]
-            pool = points_m[safe_idx] if len(safe_idx) >= max_points else points_m
-            pool_lons = lons[safe_idx] if len(safe_idx) >= max_points else lons
-            pool_lats = lats[safe_idx] if len(safe_idx) >= max_points else lats
-            chosen = _farthest_point_sample(pool, max_points)
-            return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
-
-        # A gentle "S" - one full sine oscillation across the whole transect - rather than
-        # zigzagging out to the full width each step: alternating to the true min/max of s put
-        # points right on the zone's own boundary on a narrow field (verified on a real ~5ha
-        # strip field: points landed hugging both edges instead of crossing through the
-        # interior). amplitude is a modest fraction of the half-width, so the wander stays well
-        # inside the zone - explicitly requested ("delikatne S", a gentle S, not a sharp zigzag
-        # touching the edges each time) with a hand-drawn reference line crossing mostly through
-        # the middle. sin(0) = sin(2*pi) = 0, so both ends of the transect also land near-center
-        # rather than at a corner of the *width* - the corner-to-corner reach from t_min/t_max
-        # is along the zone's LENGTH, this only softens how far it wanders sideways.
-        half_width = (s.max() - s.min()) / 2.0
-        amplitude = 0.18 * half_width
-        targets = [
-            (
-                t_min + (i + 0.5) / max_points * (t_max - t_min),
-                amplitude * math.sin(2 * math.pi * (i + 0.5) / max_points),
-            )
-            for i in range(max_points)
-        ]
-
-        # For each target position on the S-curve, greedily claim the nearest still-unused
-        # candidate - preferring NDVI-safe candidates globally over unsafe ones, not just within
-        # whatever along-axis slice this target happens to fall in. A per-slice-only preference
-        # (the previous version) still placed points on real NDVI anomalies whenever an entire
-        # slice was extreme (a large reddish patch spanning most of a slice's width, not just a
-        # few outlier pixels) - reported directly against a real field: the transect ran straight
-        # through a visibly anomalous patch at one end of a zone. Searching all safe candidates
-        # first, regardless of which slice they're nominally in, lets a nearby safe pixel from an
-        # adjacent slice cover for one that has none, so a genuinely large extreme patch gets
-        # walked around instead of through - only once every safe candidate is already claimed
-        # does this fall back to the nearest unsafe one, and only for the leftover targets.
-        safe_idx = np.where(ndvi_safe)[0]
-        unsafe_idx = np.where(~ndvi_safe)[0]
-        used = np.zeros(len(t), dtype=bool)
-        chosen_indices: list[int] = []
-        for t_target, s_target in targets:
-            for pool in (safe_idx, unsafe_idx):
-                available = pool[~used[pool]]
-                if len(available) == 0:
-                    continue
-                dist2 = (t[available] - t_target) ** 2 + (s[available] - s_target) ** 2
-                pick = available[np.argmin(dist2)]
-                used[pick] = True
-                chosen_indices.append(pick)
-                break
-
-        # Return in along-axis order (not target-assignment order, which can differ slightly once
-        # candidates get claimed out of order) so the route still traces smoothly from one end to
-        # the other instead of jumping around.
-        chosen_indices.sort(key=lambda i: t[i])
-        return [[float(lons[i]), float(lats[i])] for i in chosen_indices]
+        """Thin wrapper binding _compute_zone_sample_points to this call's own ndvi/grid_lon/
+        grid_lat/transformer - see that function's docstring for the actual selection logic."""
+        return _compute_zone_sample_points(ndvi, grid_lon, grid_lat, transformer, mask, geom, max_points)
 
     def _zone_entry(mask: np.ndarray, geom) -> dict | None:
         if geom is None:

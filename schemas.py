@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from field_zones import DEFAULT_LINE_SMOOTHING, DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE
 
@@ -91,6 +91,16 @@ class FieldZonesRequest(BaseModel):
             "Nieobowiazkowy - inne wywolujace moga go pominac."
         ),
     )
+    single_zone_override: bool = Field(
+        False,
+        description=(
+            "Jawna zgoda na pominiecie podzialu i zwrocenie polygon (lub zone_polygon, gdy podany) "
+            "jako JEDNEJ strefy, niezaleznie od jej powierzchni - jedyny sposob na otrzymanie "
+            "strefy wiekszej niz MAX_SUBFIELD_AREA_HA. Dozwolone tylko gdy zone_polygon jest puste "
+            "(czyli chodzi o cale zarejestrowane pole, nie recznie narysowany kawalek) - patrz "
+            "walidacja ponizej i docstring single_zone_override w field_zones.compute_field_zones."
+        ),
+    )
 
     @field_validator("polygon")
     @classmethod
@@ -103,3 +113,16 @@ class FieldZonesRequest(BaseModel):
         cls, value: list[tuple[float, float]] | None
     ) -> list[tuple[float, float]] | None:
         return _validate_lonlat_polygon(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _validate_single_zone_override(self) -> "FieldZonesRequest":
+        # "tylko jezeli jest to jedno pole" (only when it's one whole field) - a manually-drawn
+        # subfield (zone_polygon set) is exactly the case this is NOT meant for, since that's
+        # already the user choosing to divide something smaller than the full field. Enforced
+        # server-side (not just in the frontend) since this bypasses the one hard, otherwise
+        # unconditional cap in field_zones.py - see MAX_SUBFIELD_AREA_HA's own docstring.
+        if self.single_zone_override and self.zone_polygon is not None:
+            raise ValueError(
+                "single_zone_override jest dozwolone tylko dla calego pola (bez zone_polygon)"
+            )
+        return self
