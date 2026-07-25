@@ -72,6 +72,17 @@ MIN_PIXELS_FOR_PERCENTILE_FILTER = 8
 # boundary only if eroding by this much would leave nothing (a zone too small/narrow to have any
 # interior this far from every edge) - better a point close to the edge than none at all.
 SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M = 10.0
+# How far the sample-point line is allowed to wander sideways off a perfectly straight diagonal
+# (as a fraction of the zone's own half-width along the shared axis - see
+# _compute_zone_sample_points), purely to dodge a locally bad-NDVI patch. 0.0 = a dead-straight
+# diagonal (the ideal target for every point sits exactly on the shared axis through the zone's
+# own centroid; the nearest-candidate search below can still, and does, pick a slightly
+# off-axis real pixel when the on-axis one is a worst-percentile outlier - see that function's
+# own "prefer safe candidates first" search). Set to 0 on request ("linie faktycznie po
+# przekatnej", "zygzak ZZZZZ") after a nonzero sine wander (this used to be 0.18, then 0.08)
+# still read as visibly curved rather than a crisp diagonal - a single, named, easy-to-retune
+# knob on purpose if some wander is ever wanted back.
+SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION = 0.0
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -1398,19 +1409,17 @@ def _compute_zone_sample_points(
         chosen = _farthest_point_sample(pool, max_points)
         return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
 
-    # A very gentle "S" - one full sine oscillation across the whole transect - rather than
-    # zigzagging out to the full width each step: alternating to the true min/max of s put
-    # points right on the zone's own boundary on a narrow field (verified on a real ~5ha
-    # strip field: points landed hugging both edges instead of crossing through the
-    # interior). amplitude is a small fraction of the half-width - just enough room to dodge a
-    # local bad-NDVI patch sideways - so the path reads as a straight diagonal, not a wavy
-    # line: explicitly requested ("po przekatnej", along the diagonal) with a hand-drawn
-    # reference showing near-straight lines crossing between zones at their shared corners.
-    # sin(0) = sin(2*pi) = 0, so both ends of the transect also land near-center rather than at
-    # a corner of the *width* - the corner-to-corner reach from t_min/t_max is along the zone's
-    # LENGTH, this only softens how far it wanders sideways.
+    # SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION of the half-width, as a sine wander across the whole
+    # transect - see that constant's own docstring (0.0 by default: a dead-straight diagonal,
+    # explicitly requested - "linie faktycznie po przekatnej", "zygzak ZZZZZ" - after a nonzero
+    # wander still read as visibly curved rather than crisp). Alternating to the true min/max of
+    # s instead of a small/zero fraction was tried and rejected earlier: on a narrow field it put
+    # points right on the zone's own boundary (verified on a real ~5ha strip field). sin(0) =
+    # sin(2*pi) = 0, so both ends of the transect land exactly on-axis too, not at a corner of
+    # the *width* - the corner-to-corner reach from t_min/t_max is along the zone's LENGTH, this
+    # only ever controls how far it's allowed to wander sideways.
     half_width = (s.max() - s.min()) / 2.0
-    amplitude = 0.08 * half_width
+    amplitude = SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION * half_width
     targets = [
         (
             t_min + (i + 0.5) / max_points * (t_max - t_min),
