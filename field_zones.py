@@ -52,21 +52,26 @@ MAX_ZONE_SIZE_RATIO = 1.15
 # _merge_undersized_zones pass on the low side, since nothing enforced a floor before this).
 MAX_ZONE_SIZE_DEVIATION_PCT = 25.0
 
-# Sample-point selection (see _select_sample_points): within a zone, discard pixels outside the
-# [LOW, HIGH] percentile of that zone's own NDVI values before spatially spreading candidates -
-# drops local anomalies (puddles, bare patches, machinery tracks) that would otherwise make an
-# unrepresentative soil-sample location, while keeping the middle bulk of genuinely typical
-# pixels to choose from. Tightened from 12.5/87.5 to 20/80 on request - the wider band was
-# technically correct (every chosen point verified to fall inside it) but still let points land
-# in a zone's own yellowish/transitional pixels when that zone had wide internal NDVI variation,
-# which read as "extreme" on the map even though it wasn't an outlier relative to the zone
-# itself. A single, named, easy-to-retune knob on purpose - expect this to get adjusted again.
-SAMPLE_POINT_PERCENTILE_LOW = 20.0
-SAMPLE_POINT_PERCENTILE_HIGH = 80.0
-# Below this many pixels, a percentile split isn't meaningful (e.g. 3 pixels -> "middle 75%" is
-# either 1 or all 3 depending on rounding) - skip the filter rather than let it arbitrarily
+# Sample-point selection (see _compute_zone_sample_points): within a zone, discard pixels in the
+# bottom SAMPLE_POINT_WORST_PERCENTILE of that zone's own NDVI values before spatially spreading
+# candidates - drops the worst-performing patches (bare ground, stress, waterlogging, machinery
+# tracks) that would otherwise make an unrepresentative soil-sample location. Deliberately
+# ONE-SIDED, unlike the two-sided [12.5,87.5]/[20,80] band this used to be: a HIGH-NDVI pixel is
+# exactly what a good sample location looks like, not an "extreme" to steer away from - only ever
+# exclude the worst end of the zone's own distribution, never the best. A single, named,
+# easy-to-retune knob on purpose - expect this to get adjusted again.
+SAMPLE_POINT_WORST_PERCENTILE = 20.0
+# Below this many pixels, a percentile split isn't meaningful (e.g. 3 pixels -> "worst 20%" is
+# either 0 or 1 pixel depending on rounding) - skip the filter rather than let it arbitrarily
 # exclude a real candidate in an already-tiny zone.
 MIN_PIXELS_FOR_PERCENTILE_FILTER = 8
+# Sample points must land at least this far (meters) inside the zone's own boundary - a point
+# right on the edge risks actually sampling the neighboring zone/field in practice (GPS drift,
+# imprecise walking), and looks wrong on the map regardless. Applied as a geometric erosion of
+# the zone polygon (see _compute_zone_sample_points), falling back to the zone's true (uneroded)
+# boundary only if eroding by this much would leave nothing (a zone too small/narrow to have any
+# interior this far from every edge) - better a point close to the edge than none at all.
+SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M = 10.0
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -1271,17 +1276,20 @@ def _compute_zone_sample_points(
     in the order returned here, so that order matters: walking it in sequence traces one
     mostly-continuous path instead of criss-crossing the zone unpredictably.
 
-    NDVI-extreme avoidance (see SAMPLE_POINT_PERCENTILE_LOW/HIGH's module docstring for why)
-    is a per-slice PREFERENCE here, not a pre-filter: the transect's own reach (its axis and
-    t_min/t_max) is computed from EVERY valid pixel in the zone, so an NDVI outlier sitting
-    right at a corner doesn't shrink how far the line extends - each along-axis slice then
-    prefers whichever of ITS candidates is furthest to the target side AND not an NDVI
-    outlier, falling back to the furthest candidate regardless of NDVI only if every
-    candidate in that slice is one. Explicitly requested after the first (pre-filtered)
-    version came out too short/central - "od jednego rogu pola do drugiego" (corner to
-    corner), avoiding extremes without giving up reach. Filters on the RAW ndvi (not
-    smoothed_ndvi) since smoothing is exactly what would wash out the local anomalies
-    (puddles, bare patches, tracks) this is meant to detect and avoid.
+    NDVI-extreme avoidance (see SAMPLE_POINT_WORST_PERCENTILE's module docstring for why, and
+    why it's one-sided - only the worst pixels are avoided, never the best) is a per-slice
+    PREFERENCE here, not a pre-filter: the transect's own reach (its axis and t_min/t_max) is
+    computed from EVERY valid pixel in the zone, so a bad-NDVI pixel sitting right at a corner
+    doesn't shrink how far the line extends - each along-axis slice then prefers whichever of
+    ITS candidates is furthest to the target side AND not in the worst percentile, falling back
+    to the furthest candidate regardless of NDVI only if every candidate in that slice is one.
+    Explicitly requested after the first (pre-filtered) version came out too short/central -
+    "od jednego rogu pola do drugiego" (corner to corner), avoiding the worst pixels without
+    giving up reach. Filters on the RAW ndvi (not smoothed_ndvi) since smoothing is exactly what
+    would wash out the local anomalies (puddles, bare patches, tracks) this is meant to detect.
+
+    Also keeps candidates at least SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M inside the zone's
+    own boundary - see that constant's own docstring.
 
     Extracted out of compute_field_zones's own _select_sample_points closure (which is now a
     thin wrapper around this) so compute_field_zones's single_zone_override early-exit path can
@@ -1295,12 +1303,30 @@ def _compute_zone_sample_points(
 
     # Vectorization/simplification/gap-filling earlier in compute_field_zones can leave the
     # final zone polygon slightly different from its own raster mask - re-check candidates
-    # against the geometry actually being returned, not just the mask that produced it.
+    # against the geometry actually being returned, not just the mask that produced it. Checked
+    # against an INWARD-eroded copy (SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M), not geom itself,
+    # so no candidate survives closer to the edge than that. Erosion is done in UTM meters (a
+    # degree-based buffer would distort unevenly with latitude), then reprojected back to the
+    # lon/lat space lons/lats are already in. Falls back to the true (uneroded) geom if eroding
+    # this much would leave nothing - a zone too small/narrow to have any interior that far from
+    # every edge still needs candidates to choose from.
     # Done BEFORE the NDVI filter below (unlike the pre-filtered version) so the percentile
-    # thresholds and the transect's own axis/reach are both computed from the same "real"
+    # threshold and the transect's own axis/reach are both computed from the same "real"
     # candidate set the zone will actually be judged by.
-    if geom is not None and not geom.is_empty and len(lons):
-        inside = _shapely_contains(geom, lons, lats)
+    containment_geom = geom
+    if geom is not None and not geom.is_empty:
+        try:
+            utm_geom = shp_transform(transformer.transform, geom)
+            eroded_utm = utm_geom.buffer(-SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M)
+            if not eroded_utm.is_empty:
+                containment_geom = shp_transform(
+                    lambda x, y: transformer.transform(x, y, direction="INVERSE"), eroded_utm
+                )
+        except Exception as e:
+            logger.warning("sample-point boundary erosion failed, using uneroded zone geometry: %s", e)
+
+    if containment_geom is not None and not containment_geom.is_empty and len(lons):
+        inside = _shapely_contains(containment_geom, lons, lats)
         if inside.any():
             values, lons, lats = values[inside], lons[inside], lats[inside]
 
@@ -1308,11 +1334,11 @@ def _compute_zone_sample_points(
         return []
 
     if len(values) >= MIN_PIXELS_FOR_PERCENTILE_FILTER:
-        lo, hi = np.percentile(values, [SAMPLE_POINT_PERCENTILE_LOW, SAMPLE_POINT_PERCENTILE_HIGH])
-        ndvi_safe = (values >= lo) & (values <= hi)
+        worst_cutoff = np.percentile(values, SAMPLE_POINT_WORST_PERCENTILE)
+        ndvi_safe = values >= worst_cutoff
         if not ndvi_safe.any():
-            # Degenerately removed every pixel (e.g. a perfectly uniform zone, where lo ==
-            # hi) - treat everything as safe rather than having nothing to prefer below.
+            # Degenerately removed every pixel (e.g. a perfectly uniform zone, where every value
+            # ties the cutoff) - treat everything as safe rather than having nothing to prefer.
             ndvi_safe = np.ones(len(values), dtype=bool)
     else:
         ndvi_safe = np.ones(len(values), dtype=bool)
@@ -1833,10 +1859,6 @@ def compute_field_zones(
             "area_ha": round(area_ha, 4),
             "geometry": mapping(geom),
             "sample_points": _select_sample_points(mask, geom, max_sample_points_per_zone),
-            # Kept only for the cross-zone endpoint-orientation pass near the end of
-            # compute_field_zones - never serialized (the response is built by picking specific
-            # keys out of each zone dict, this one just isn't among them).
-            "_geom": geom,
         }
 
     # Final hard-cap enforcement. Everything above (pixel-level _split_oversized_zones, then
@@ -2265,21 +2287,22 @@ def compute_field_zones(
     # Chooses each zone's own sample_points orientation (forward or start<->end reversed) to
     # minimize total driving between CONSECUTIVE zones' seams - requested directly: "koniec w
     # jednym subpolu blisko poczatku drugiego, zeby duzo nie jezdzic" (one zone's end near the
-    # next one's start), then explicitly "rozszerz na wiecej stref" (extend to more zones) after
-    # a first version that only ever compared zone i against zone i-1 in isolation: reorienting
-    # zone i to suit zone i-1 could easily leave its (now different) end badly placed for zone
-    # i+1, one seam improving at the next one's expense. A short two-state (forward/reversed) DP
-    # over the whole chain picks every zone's orientation together, minimizing the sum of every
-    # touching seam's gap at once instead of greedily fixing one seam at a time.
+    # next one's start), then explicitly extended twice more: "rozszerz na wiecej stref" (consider
+    # the whole chain, not just each pair in isolation - reorienting zone i to suit zone i-1 could
+    # easily leave its now-different end badly placed for zone i+1) and "probuj ZAWSZE" (always
+    # try, not only between zones that happen to touch - a good seam is worth optimizing even
+    # between two zones with no shared border, since the frontend still draws a route straight
+    # from one's last point to the next one's first regardless of whether they're geometric
+    # neighbors). A short two-state (forward/reversed) DP over the whole chain picks every zone's
+    # orientation together, minimizing the sum of every seam's gap at once instead of greedily
+    # fixing one seam at a time.
     #
     # Still a best-effort nicety, not a route optimizer - acknowledged directly as not a hard
-    # requirement, and harder for this to help at all as zone count grows: zones stay sorted by
-    # ndvi_mean (the contract above), which is rarely a spatial sweep, so this only pays off where
-    # two NDVI-adjacent-in-the-list zones also happen to be geometric neighbors - a seam between
-    # two zones that don't touch costs nothing regardless of orientation (skipped outright), so
-    # there's never a reason not to run this. The frontend concatenates sample_points in exactly
-    # this list order to build a route (see PointService.generateAutoPoints), which is what makes
-    # "consecutive in this list" the right thing to optimize.
+    # requirement, and harder for this to help a lot as zone count grows, since zones stay sorted
+    # by ndvi_mean (the contract above), rarely a spatial sweep. The frontend concatenates
+    # sample_points in exactly this list order to build a route (see
+    # PointService.generateAutoPoints), which is what makes "consecutive in this list" the right
+    # thing to optimize regardless of geometric adjacency.
     n_zones = len(zones)
     if n_zones >= 2:
         ends_fwd = [z["sample_points"][-1] if z["sample_points"] else None for z in zones]
@@ -2288,9 +2311,6 @@ def compute_field_zones(
         # zone - a zone with 0 or 1 points is unaffected either way (nothing to reverse).
         starts = [starts_fwd, ends_fwd]
         ends = [ends_fwd, starts_fwd]
-        touches = [
-            zones[i]["_geom"].intersects(zones[i + 1]["_geom"]) for i in range(n_zones - 1)
-        ]
 
         def _dist2(a, b) -> float:
             return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
@@ -2306,7 +2326,7 @@ def compute_field_zones(
                 best_cost, best_prev = None, 0
                 for prev_state in (0, 1):
                     cost = dp[prev_state]
-                    if touches[i - 1] and ends[prev_state][i - 1] is not None and starts[cur_state][i] is not None:
+                    if ends[prev_state][i - 1] is not None and starts[cur_state][i] is not None:
                         cost += _dist2(ends[prev_state][i - 1], starts[cur_state][i])
                     if best_cost is None or cost < best_cost:
                         best_cost, best_prev = cost, prev_state
