@@ -1609,10 +1609,20 @@ def compute_field_zones(
 
     def _select_sample_points(mask: np.ndarray, geom, max_points: int) -> list[list[float]]:
         """Candidate sampling points within one zone, biased away from that zone's own NDVI
-        extremes and spatially spread out - see SAMPLE_POINT_PERCENTILE_LOW/HIGH's module
-        docstring for why, and _farthest_point_sample for the spreading step. Filters on the
-        RAW ndvi (not smoothed_ndvi) since smoothing is exactly what would wash out the local
-        anomalies (puddles, bare patches, tracks) this is meant to detect and avoid."""
+        extremes - see SAMPLE_POINT_PERCENTILE_LOW/HIGH's module docstring for why. Filters on
+        the RAW ndvi (not smoothed_ndvi) since smoothing is exactly what would wash out the local
+        anomalies (puddles, bare patches, tracks) this is meant to detect and avoid.
+
+        Arranged as a zigzag transect along the zone's own long axis (found via PCA over the
+        surviving candidates), alternating side-to-side across its width, rather than spread out
+        to maximize mutual distance - requested explicitly after a competing app's screenshot
+        showed one connected zigzag "W" line walking each zone, not a scattered point cloud. The
+        frontend already draws a route connecting sample_points in the order returned here, so
+        that order matters: walking it in sequence traces one mostly-continuous path instead of
+        criss-crossing the zone unpredictably. Every returned point is still a real member of the
+        NDVI-filtered candidate set - the zigzag only decides which candidate to prefer within
+        each along-axis slice, never invents a new location, so there's no separate "is this
+        still valid" check needed afterward."""
         if max_points <= 0 or not mask.any():
             return []
         values = ndvi[mask]
@@ -1640,8 +1650,60 @@ def compute_field_zones(
             return []
 
         xs, ys = transformer.transform(lons, lats)
-        chosen = _farthest_point_sample(np.column_stack([xs, ys]), max_points)
-        return [[float(lons[i]), float(lats[i])] for i in chosen]
+        points_m = np.column_stack([xs, ys])
+
+        if len(points_m) < 2:
+            return [[float(lons[0]), float(lats[0])]]
+
+        # PCA via SVD on the mean-centered candidates: the first right-singular vector is the
+        # direction of greatest spread (the zone's own long axis), the second is perpendicular to
+        # it - exactly what's needed to project every candidate onto "how far along the
+        # transect" (t) and "which side of it" (s).
+        centroid = points_m.mean(axis=0)
+        centered = points_m - centroid
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        primary_axis = vt[0]
+        secondary_axis = vt[1] if vt.shape[0] > 1 else np.array([-primary_axis[1], primary_axis[0]])
+        t = centered @ primary_axis
+        s = centered @ secondary_axis
+
+        if len(points_m) <= max_points:
+            # Too few real candidates to be selective about layout - return all of them, ordered
+            # along the transect so the route still traces roughly one direction instead of
+            # whatever order the raster mask happened to yield them in.
+            order = np.argsort(t)
+            return [[float(lons[i]), float(lats[i])] for i in order]
+
+        t_min, t_max = t.min(), t.max()
+        if t_max - t_min < 1e-6:
+            # Degenerate: every candidate projects to ~the same point along the axis (a very
+            # compact/near-circular zone) - no meaningful "line" to walk, fall back to the old
+            # maximize-mutual-distance spread rather than collapsing every bin onto one point.
+            chosen = _farthest_point_sample(points_m, max_points)
+            return [[float(lons[i]), float(lats[i])] for i in chosen]
+
+        interior_edges = np.linspace(t_min, t_max, max_points + 1)[1:-1]
+        bin_idx = np.digitize(t, interior_edges)
+
+        chosen_indices: list[int] = []
+        for i in range(max_points):
+            candidate_idx = np.where(bin_idx == i)[0]
+            if len(candidate_idx) == 0:
+                continue
+            side_s = s[candidate_idx]
+            # Alternate which side of the transect to prefer each step, zigzagging across the
+            # zone's width as t advances - the "W-pattern" a soil-sampling transect walks.
+            pick = candidate_idx[np.argmax(side_s) if i % 2 == 0 else np.argmin(side_s)]
+            chosen_indices.append(pick)
+
+        if len(chosen_indices) < max(2, max_points // 2):
+            # Enough empty bins (an oddly-shaped zone where candidates cluster unevenly along the
+            # axis) that the zigzag came out too sparse to look intentional - the old spread-out
+            # fallback is a safer default than a half-empty, lopsided transect.
+            chosen = _farthest_point_sample(points_m, max_points)
+            return [[float(lons[i]), float(lats[i])] for i in chosen]
+
+        return [[float(lons[i]), float(lats[i])] for i in chosen_indices]
 
     def _zone_entry(mask: np.ndarray, geom) -> dict | None:
         if geom is None:
