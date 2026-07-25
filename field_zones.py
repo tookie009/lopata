@@ -72,17 +72,16 @@ MIN_PIXELS_FOR_PERCENTILE_FILTER = 8
 # boundary only if eroding by this much would leave nothing (a zone too small/narrow to have any
 # interior this far from every edge) - better a point close to the edge than none at all.
 SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M = 10.0
-# How far the sample-point line is allowed to wander sideways off a perfectly straight diagonal
-# (as a fraction of the zone's own half-width along the shared axis - see
-# _compute_zone_sample_points), purely to dodge a locally bad-NDVI patch. 0.0 = a dead-straight
-# diagonal (the ideal target for every point sits exactly on the shared axis through the zone's
-# own centroid; the nearest-candidate search below can still, and does, pick a slightly
-# off-axis real pixel when the on-axis one is a worst-percentile outlier - see that function's
-# own "prefer safe candidates first" search). Set to 0 on request ("linie faktycznie po
-# przekatnej", "zygzak ZZZZZ") after a nonzero sine wander (this used to be 0.18, then 0.08)
-# still read as visibly curved rather than a crisp diagonal - a single, named, easy-to-retune
-# knob on purpose if some wander is ever wanted back.
-SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION = 0.0
+# How far the sample-point line's two ends sit off-center (as a fraction of the zone's own
+# half-width along the shared axis - see _compute_zone_sample_points), i.e. how close to the
+# zone's actual CORNERS the line's endpoints land, along a straight diagonal ramp (not a sine
+# wander - see that function's own docstring for two earlier, rejected attempts: a small sine
+# wander at 0.18 then 0.08 still read as curved rather than diagonal, and 0.0 - literally
+# straight along the shared axis - had no sideways component at all). Close to but just under
+# 1.0 so the line's ends reach near the true corners while the nearest-candidate search still
+# has a little room on either side to prefer a safe (non-worst-percentile) pixel over the
+# literal geometric corner when they differ. A single, named, easy-to-retune knob on purpose.
+SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION = 0.9
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -1280,6 +1279,7 @@ def _compute_zone_sample_points(
     geom,
     max_points: int,
     shared_axis: tuple[np.ndarray, np.ndarray] | None = None,
+    diagonal_sign: float = 1.0,
 ) -> list[list[float]]:
     """Zigzag transect spanning the zone's own long axis corner-to-corner, alternating
     side-to-side across its width as it advances - the "W-pattern" a soil-sampling transect
@@ -1300,6 +1300,12 @@ def _compute_zone_sample_points(
     call. Falls back to this zone's own PCA (the original per-zone behavior) when not given -
     single_zone_override's one-zone case has no "neighbors" to match, so there's nothing to
     share an axis with there.
+
+    diagonal_sign (+1.0 or -1.0) picks WHICH of a zone's two corner-to-corner diagonals to walk
+    (e.g. top-left-to-bottom-right vs top-right-to-bottom-left) - a zone has two genuinely
+    different diagonals, not just one line walkable in two directions, so compute_field_zones
+    computes both (see its zone-visiting tour) and picks whichever one actually connects best to
+    the previous zone's end point.
 
     NDVI-extreme avoidance (see SAMPLE_POINT_WORST_PERCENTILE's module docstring for why, and
     why it's one-sided - only the worst pixels are avoided, never the best) is a per-slice
@@ -1409,21 +1415,23 @@ def _compute_zone_sample_points(
         chosen = _farthest_point_sample(pool, max_points)
         return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
 
-    # SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION of the half-width, as a sine wander across the whole
-    # transect - see that constant's own docstring (0.0 by default: a dead-straight diagonal,
-    # explicitly requested - "linie faktycznie po przekatnej", "zygzak ZZZZZ" - after a nonzero
-    # wander still read as visibly curved rather than crisp). Alternating to the true min/max of
-    # s instead of a small/zero fraction was tried and rejected earlier: on a narrow field it put
-    # points right on the zone's own boundary (verified on a real ~5ha strip field). sin(0) =
-    # sin(2*pi) = 0, so both ends of the transect land exactly on-axis too, not at a corner of
-    # the *width* - the corner-to-corner reach from t_min/t_max is along the zone's LENGTH, this
-    # only ever controls how far it's allowed to wander sideways.
+    # A genuine corner-to-corner DIAGONAL, not a sideways wander: s_target moves LINEARLY from
+    # -amplitude at the start of the transect to +amplitude at its end (diagonal_sign flips which
+    # of the zone's two diagonals this is - top-left-to-bottom-right vs top-right-to-bottom-left).
+    # Two earlier attempts got this wrong in different ways, both verified against real
+    # screenshots: a small sine wander (amplitudes 0.18, then 0.08 of the half-width) still read
+    # as a curved line hugging the zone's own center, not reaching its corners at all; s_target
+    # pinned to 0 (amplitude 0.0, "dead straight") was even further from a diagonal - a straight
+    # line along the shared axis has NO sideways component whatsoever. What was actually
+    # requested ("od jednego rogu podpola do drugiego przeciwleglego, po przekatnej") needs BOTH
+    # axes moving together, corner to corner: SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION close to 1.0
+    # so the line's ends land near the zone's actual corners, not its edge midpoints.
     half_width = (s.max() - s.min()) / 2.0
-    amplitude = SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION * half_width
+    amplitude = SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION * half_width * diagonal_sign
     targets = [
         (
             t_min + (i + 0.5) / max_points * (t_max - t_min),
-            amplitude * math.sin(2 * math.pi * (i + 0.5) / max_points),
+            amplitude * (2 * (i + 0.5) / max_points - 1),
         )
         for i in range(max_points)
     ]
@@ -1881,12 +1889,14 @@ def compute_field_zones(
             cleaned_geoms.append(_from_utm(kept_utm))
         zone_geoms = cleaned_geoms
 
-    def _select_sample_points(mask: np.ndarray, geom, max_points: int) -> list[list[float]]:
+    def _select_sample_points(
+        mask: np.ndarray, geom, max_points: int, diagonal_sign: float = 1.0
+    ) -> list[list[float]]:
         """Thin wrapper binding _compute_zone_sample_points to this call's own ndvi/grid_lon/
         grid_lat/transformer/shared_axis - see that function's docstring for the actual
         selection logic."""
         return _compute_zone_sample_points(
-            ndvi, grid_lon, grid_lat, transformer, mask, geom, max_points, shared_axis
+            ndvi, grid_lon, grid_lat, transformer, mask, geom, max_points, shared_axis, diagonal_sign
         )
 
     def _zone_entry(mask: np.ndarray, geom) -> dict | None:
@@ -1895,6 +1905,14 @@ def compute_field_zones(
         area_ha = _area_ha(geom, transformer)
         if area_ha < 1e-4:
             return None
+        # Both of this zone's two corner-to-corner diagonals, computed up front - the
+        # zone-visiting tour near the end of compute_field_zones picks whichever one (and which
+        # traversal direction of it) actually connects best to the previous zone, then commits
+        # to that single choice as "sample_points". Never serialized itself (the response is
+        # built by picking specific keys out of each zone dict), same pattern _geom used to
+        # follow here before it was removed as unused - this one IS used, by that tour.
+        diagonal_a = _select_sample_points(mask, geom, max_sample_points_per_zone, diagonal_sign=1.0)
+        diagonal_b = _select_sample_points(mask, geom, max_sample_points_per_zone, diagonal_sign=-1.0)
         return {
             # Reported from the raw (unsmoothed) NDVI, not the blurred values clustering
             # actually ran on - stats should reflect what's really there, not the smoothing.
@@ -1902,8 +1920,13 @@ def compute_field_zones(
             "ndvi_min": round(float(ndvi[mask].min()), 4),
             "ndvi_max": round(float(ndvi[mask].max()), 4),
             "area_ha": round(area_ha, 4),
+            "_sample_point_diagonals": [diagonal_a, diagonal_b],
             "geometry": mapping(geom),
-            "sample_points": _select_sample_points(mask, geom, max_sample_points_per_zone),
+            # Placeholder - always overwritten by the zone-visiting tour below with whichever of
+            # _sample_point_diagonals (and which traversal direction) it actually picks. Defaults
+            # to diagonal_a here only so this key always exists even for a field with fewer than
+            # 2 zones (the tour is skipped entirely when n_zones < 2, see below).
+            "sample_points": diagonal_a,
         }
 
     # Final hard-cap enforcement. Everything above (pixel-level _split_oversized_zones, then
@@ -2330,12 +2353,17 @@ def compute_field_zones(
         z["zone_id"] = zone_id
 
     # Reorders the zones themselves into a spatial visiting sequence (greedy nearest-neighbor
-    # tour) and chooses each zone's own sample_points orientation (forward or start<->end
-    # reversed) together, so that walking every zone's points in the order returned here traces
-    # diagonal lines that connect end-to-start across several neighboring zones, not just within
-    # one zone in isolation - requested directly with a hand-drawn reference showing several
-    # zones' diagonals meeting at their shared corners, forming one zigzagging path across a
-    # whole cluster rather than an isolated line per zone reached in arbitrary order.
+    # tour) and chooses, for each zone, WHICH of its two corner-to-corner diagonals to walk and
+    # in which direction (4 combinations - see _zone_entry's _sample_point_diagonals) together,
+    # so that walking every zone's points in the order returned here traces diagonal lines that
+    # connect end-to-start across several neighboring zones, not just within one zone in
+    # isolation - requested directly with a hand-drawn reference showing several zones'
+    # diagonals meeting at their shared corners, forming one zigzagging path across a whole
+    # cluster rather than an isolated line per zone reached in arbitrary order. A zone only has
+    # ONE genuine diagonal reachable from a given entry corner - the other diagonal starts at a
+    # DIFFERENT corner - so picking the best of 2 candidates (not just reversing 1) is what
+    # actually lets the tour choose, at each zone, whichever corner is closest to where the
+    # previous zone's diagonal just ended.
     #
     # An EARLIER version kept zones in their ndvi_mean-sorted array order (the "sorted ascending
     # by mean NDVI" contract just above) and only chose orientation via a fixed-order DP - but
@@ -2347,40 +2375,51 @@ def compute_field_zones(
     # so reordering the array itself for routing purposes doesn't break that contract, only
     # decouples "which zone_id a feature has" from "where it sits in the features list".
     #
-    # Greedy nearest-neighbor (not a full TSP solve): starting from zone 0, repeatedly visits
-    # whichever remaining zone has a start-or-end point closest to the current zone's own end -
-    # a well-known, cheap heuristic, good enough for the "best-effort, not a route optimizer"
-    # bar already set for this feature (still true here: not a hard requirement, and this can't
-    # find a perfect tour, just a reasonable one, especially as zone count grows).
+    # Greedy nearest-neighbor (not a full TSP solve): starting from zone 0's first diagonal
+    # (forward), repeatedly visits whichever remaining zone/diagonal/direction combination has a
+    # start point closest to the current zone's own end - a well-known, cheap heuristic, good
+    # enough for the "best-effort, not a route optimizer" bar already set for this feature (still
+    # true here: not a hard requirement, and this can't find a perfect tour, just a reasonable
+    # one, especially as zone count grows).
     n_zones = len(zones)
     if n_zones >= 2:
-        starts_fwd = [z["sample_points"][0] if z["sample_points"] else None for z in zones]
-        ends_fwd = [z["sample_points"][-1] if z["sample_points"] else None for z in zones]
 
         def _dist2(a, b) -> float:
             return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
 
+        # candidate_lines[idx] = the zone's 2 diagonals, each as (start_point, end_point,
+        # ordered_points) for its forward traversal - reversed traversal is derived on the fly
+        # below (swap start/end, reverse the point list) rather than pre-computing 4 full lists.
+        candidate_lines = []
+        for z in zones:
+            diagonals = z.get("_sample_point_diagonals") or [z["sample_points"]]
+            entries = [pts for pts in diagonals if pts]
+            if not entries:
+                entries = [[]]
+            candidate_lines.append(entries)
+
         order = [0]
-        reversed_flags = [False]
+        chosen_points = [candidate_lines[0][0]]
         remaining = set(range(1, n_zones))
         while remaining:
-            cur_idx = order[-1]
-            cur_end = starts_fwd[cur_idx] if reversed_flags[-1] else ends_fwd[cur_idx]
-            best_idx, best_reversed, best_cost = None, False, None
+            cur_points = chosen_points[-1]
+            cur_end = cur_points[-1] if cur_points else None
+            best_idx, best_points, best_cost = None, None, None
             for idx in remaining:
-                for is_reversed, entry_point in ((False, starts_fwd[idx]), (True, ends_fwd[idx])):
-                    cost = 0.0 if cur_end is None or entry_point is None else _dist2(cur_end, entry_point)
-                    if best_cost is None or cost < best_cost:
-                        best_cost, best_idx, best_reversed = cost, idx, is_reversed
+                for diag_points in candidate_lines[idx]:
+                    for candidate_points in (diag_points, list(reversed(diag_points))):
+                        entry_point = candidate_points[0] if candidate_points else None
+                        cost = 0.0 if cur_end is None or entry_point is None else _dist2(cur_end, entry_point)
+                        if best_cost is None or cost < best_cost:
+                            best_cost, best_idx, best_points = cost, idx, candidate_points
             order.append(best_idx)
-            reversed_flags.append(best_reversed)
+            chosen_points.append(best_points)
             remaining.discard(best_idx)
 
         reordered_zones = []
-        for idx, is_reversed in zip(order, reversed_flags):
+        for idx, points in zip(order, chosen_points):
             z = zones[idx]
-            if is_reversed and z["sample_points"]:
-                z["sample_points"] = list(reversed(z["sample_points"]))
+            z["sample_points"] = points
             reordered_zones.append(z)
         zones = reordered_zones
 
