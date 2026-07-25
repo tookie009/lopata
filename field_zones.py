@@ -2189,29 +2189,66 @@ def compute_field_zones(
     for zone_id, z in enumerate(zones):
         z["zone_id"] = zone_id
 
-    # Reverses a zone's own sample_points sequence (start<->end) whenever that puts its start
-    # closer to the PREVIOUS zone's end - requested directly: "koniec w jednym subpolu blisko
-    # poczatku drugiego, zeby duzo nie jezdzic" (one zone's end near the next one's start, so
-    # there's not much driving between them). Explicitly a best-effort nicety, not a route
-    # optimizer - acknowledged by the user as not a hard requirement, harder to guarantee at all
-    # once there are many zones: only ever reorients zone i using zone i-1 (the frontend
-    # concatenates sample_points in this exact list order to build a route - see
-    # PointService.generateAutoPoints), and only when the two actually touch. Zones stay sorted
-    # by ndvi_mean (the contract above), which is rarely a spatial sweep - this only pays off
-    # where two NDVI-adjacent-in-the-list zones also happen to be geometric neighbors, but costs
-    # nothing when they're not (skipped outright), so it's free to leave on unconditionally.
-    for i in range(1, len(zones)):
-        prev_points = zones[i - 1]["sample_points"]
-        cur_points = zones[i]["sample_points"]
-        if not prev_points or len(cur_points) < 2:
-            continue
-        if not zones[i - 1]["_geom"].intersects(zones[i]["_geom"]):
-            continue
-        prev_end = prev_points[-1]
-        dist2_forward = (prev_end[0] - cur_points[0][0]) ** 2 + (prev_end[1] - cur_points[0][1]) ** 2
-        dist2_reversed = (prev_end[0] - cur_points[-1][0]) ** 2 + (prev_end[1] - cur_points[-1][1]) ** 2
-        if dist2_reversed < dist2_forward:
-            zones[i]["sample_points"] = list(reversed(cur_points))
+    # Chooses each zone's own sample_points orientation (forward or start<->end reversed) to
+    # minimize total driving between CONSECUTIVE zones' seams - requested directly: "koniec w
+    # jednym subpolu blisko poczatku drugiego, zeby duzo nie jezdzic" (one zone's end near the
+    # next one's start), then explicitly "rozszerz na wiecej stref" (extend to more zones) after
+    # a first version that only ever compared zone i against zone i-1 in isolation: reorienting
+    # zone i to suit zone i-1 could easily leave its (now different) end badly placed for zone
+    # i+1, one seam improving at the next one's expense. A short two-state (forward/reversed) DP
+    # over the whole chain picks every zone's orientation together, minimizing the sum of every
+    # touching seam's gap at once instead of greedily fixing one seam at a time.
+    #
+    # Still a best-effort nicety, not a route optimizer - acknowledged directly as not a hard
+    # requirement, and harder for this to help at all as zone count grows: zones stay sorted by
+    # ndvi_mean (the contract above), which is rarely a spatial sweep, so this only pays off where
+    # two NDVI-adjacent-in-the-list zones also happen to be geometric neighbors - a seam between
+    # two zones that don't touch costs nothing regardless of orientation (skipped outright), so
+    # there's never a reason not to run this. The frontend concatenates sample_points in exactly
+    # this list order to build a route (see PointService.generateAutoPoints), which is what makes
+    # "consecutive in this list" the right thing to optimize.
+    n_zones = len(zones)
+    if n_zones >= 2:
+        ends_fwd = [z["sample_points"][-1] if z["sample_points"] else None for z in zones]
+        starts_fwd = [z["sample_points"][0] if z["sample_points"] else None for z in zones]
+        # Reversed orientation swaps which end is the "start"/"end" of the walk through this
+        # zone - a zone with 0 or 1 points is unaffected either way (nothing to reverse).
+        starts = [starts_fwd, ends_fwd]
+        ends = [ends_fwd, starts_fwd]
+        touches = [
+            zones[i]["_geom"].intersects(zones[i + 1]["_geom"]) for i in range(n_zones - 1)
+        ]
+
+        def _dist2(a, b) -> float:
+            return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
+        # dp[state] = lowest total seam cost so far with the zone just placed in that orientation;
+        # back[i][state] = which state the PREVIOUS zone was in to achieve that.
+        dp = [0.0, 0.0]
+        back: list[list[int]] = []
+        for i in range(1, n_zones):
+            next_dp = [0.0, 0.0]
+            back.append([0, 0])
+            for cur_state in (0, 1):
+                best_cost, best_prev = None, 0
+                for prev_state in (0, 1):
+                    cost = dp[prev_state]
+                    if touches[i - 1] and ends[prev_state][i - 1] is not None and starts[cur_state][i] is not None:
+                        cost += _dist2(ends[prev_state][i - 1], starts[cur_state][i])
+                    if best_cost is None or cost < best_cost:
+                        best_cost, best_prev = cost, prev_state
+                next_dp[cur_state] = best_cost
+                back[-1][cur_state] = best_prev
+            dp = next_dp
+
+        states = [0] * n_zones
+        states[-1] = 0 if dp[0] <= dp[1] else 1
+        for i in range(n_zones - 1, 0, -1):
+            states[i - 1] = back[i - 1][states[i]]
+
+        for i, state in enumerate(states):
+            if state == 1 and zones[i]["sample_points"]:
+                zones[i]["sample_points"] = list(reversed(zones[i]["sample_points"]))
 
     return {
         "type": "FeatureCollection",
