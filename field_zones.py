@@ -1704,7 +1704,7 @@ def compute_field_zones(
         # rather than at a corner of the *width* - the corner-to-corner reach from t_min/t_max
         # is along the zone's LENGTH, this only softens how far it wanders sideways.
         half_width = (s.max() - s.min()) / 2.0
-        amplitude = 0.3 * half_width
+        amplitude = 0.18 * half_width
         targets = [
             (
                 t_min + (i + 0.5) / max_points * (t_max - t_min),
@@ -1760,6 +1760,10 @@ def compute_field_zones(
             "area_ha": round(area_ha, 4),
             "geometry": mapping(geom),
             "sample_points": _select_sample_points(mask, geom, max_sample_points_per_zone),
+            # Kept only for the cross-zone endpoint-orientation pass near the end of
+            # compute_field_zones - never serialized (the response is built by picking specific
+            # keys out of each zone dict, this one just isn't among them).
+            "_geom": geom,
         }
 
     # Final hard-cap enforcement. Everything above (pixel-level _split_oversized_zones, then
@@ -2184,6 +2188,30 @@ def compute_field_zones(
     zones.sort(key=lambda z: z["ndvi_mean"])
     for zone_id, z in enumerate(zones):
         z["zone_id"] = zone_id
+
+    # Reverses a zone's own sample_points sequence (start<->end) whenever that puts its start
+    # closer to the PREVIOUS zone's end - requested directly: "koniec w jednym subpolu blisko
+    # poczatku drugiego, zeby duzo nie jezdzic" (one zone's end near the next one's start, so
+    # there's not much driving between them). Explicitly a best-effort nicety, not a route
+    # optimizer - acknowledged by the user as not a hard requirement, harder to guarantee at all
+    # once there are many zones: only ever reorients zone i using zone i-1 (the frontend
+    # concatenates sample_points in this exact list order to build a route - see
+    # PointService.generateAutoPoints), and only when the two actually touch. Zones stay sorted
+    # by ndvi_mean (the contract above), which is rarely a spatial sweep - this only pays off
+    # where two NDVI-adjacent-in-the-list zones also happen to be geometric neighbors, but costs
+    # nothing when they're not (skipped outright), so it's free to leave on unconditionally.
+    for i in range(1, len(zones)):
+        prev_points = zones[i - 1]["sample_points"]
+        cur_points = zones[i]["sample_points"]
+        if not prev_points or len(cur_points) < 2:
+            continue
+        if not zones[i - 1]["_geom"].intersects(zones[i]["_geom"]):
+            continue
+        prev_end = prev_points[-1]
+        dist2_forward = (prev_end[0] - cur_points[0][0]) ** 2 + (prev_end[1] - cur_points[0][1]) ** 2
+        dist2_reversed = (prev_end[0] - cur_points[-1][0]) ** 2 + (prev_end[1] - cur_points[-1][1]) ** 2
+        if dist2_reversed < dist2_forward:
+            zones[i]["sample_points"] = list(reversed(cur_points))
 
     return {
         "type": "FeatureCollection",
