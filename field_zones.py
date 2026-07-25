@@ -1608,46 +1608,53 @@ def compute_field_zones(
         zone_geoms = cleaned_geoms
 
     def _select_sample_points(mask: np.ndarray, geom, max_points: int) -> list[list[float]]:
-        """Candidate sampling points within one zone, biased away from that zone's own NDVI
-        extremes - see SAMPLE_POINT_PERCENTILE_LOW/HIGH's module docstring for why. Filters on
-        the RAW ndvi (not smoothed_ndvi) since smoothing is exactly what would wash out the local
-        anomalies (puddles, bare patches, tracks) this is meant to detect and avoid.
+        """Zigzag transect spanning the zone's own long axis corner-to-corner, alternating
+        side-to-side across its width as it advances - the "W-pattern" a soil-sampling transect
+        walks, and what a competing app's screenshot showed (one connected zigzag line per zone,
+        not a scattered point cloud). The frontend already draws a route connecting sample_points
+        in the order returned here, so that order matters: walking it in sequence traces one
+        mostly-continuous path instead of criss-crossing the zone unpredictably.
 
-        Arranged as a zigzag transect along the zone's own long axis (found via PCA over the
-        surviving candidates), alternating side-to-side across its width, rather than spread out
-        to maximize mutual distance - requested explicitly after a competing app's screenshot
-        showed one connected zigzag "W" line walking each zone, not a scattered point cloud. The
-        frontend already draws a route connecting sample_points in the order returned here, so
-        that order matters: walking it in sequence traces one mostly-continuous path instead of
-        criss-crossing the zone unpredictably. Every returned point is still a real member of the
-        NDVI-filtered candidate set - the zigzag only decides which candidate to prefer within
-        each along-axis slice, never invents a new location, so there's no separate "is this
-        still valid" check needed afterward."""
+        NDVI-extreme avoidance (see SAMPLE_POINT_PERCENTILE_LOW/HIGH's module docstring for why)
+        is a per-slice PREFERENCE here, not a pre-filter: the transect's own reach (its axis and
+        t_min/t_max) is computed from EVERY valid pixel in the zone, so an NDVI outlier sitting
+        right at a corner doesn't shrink how far the line extends - each along-axis slice then
+        prefers whichever of ITS candidates is furthest to the target side AND not an NDVI
+        outlier, falling back to the furthest candidate regardless of NDVI only if every
+        candidate in that slice is one. Explicitly requested after the first (pre-filtered)
+        version came out too short/central - "od jednego rogu pola do drugiego" (corner to
+        corner), avoiding extremes without giving up reach. Filters on the RAW ndvi (not
+        smoothed_ndvi) since smoothing is exactly what would wash out the local anomalies
+        (puddles, bare patches, tracks) this is meant to detect and avoid."""
         if max_points <= 0 or not mask.any():
             return []
         values = ndvi[mask]
         lons = grid_lon[mask]
         lats = grid_lat[mask]
 
-        if len(values) >= MIN_PIXELS_FOR_PERCENTILE_FILTER:
-            lo, hi = np.percentile(values, [SAMPLE_POINT_PERCENTILE_LOW, SAMPLE_POINT_PERCENTILE_HIGH])
-            keep = (values >= lo) & (values <= hi)
-            if keep.any():
-                lons, lats = lons[keep], lats[keep]
-            # else: the filter degenerately removed every pixel (e.g. a perfectly uniform zone,
-            # where lo == hi) - fall through with the unfiltered candidates rather than
-            # returning zero points for an otherwise-fine zone.
-
         # Vectorization/simplification/gap-filling earlier in compute_field_zones can leave the
         # final zone polygon slightly different from its own raster mask - re-check candidates
         # against the geometry actually being returned, not just the mask that produced it.
+        # Done BEFORE the NDVI filter below (unlike the pre-filtered version) so the percentile
+        # thresholds and the transect's own axis/reach are both computed from the same "real"
+        # candidate set the zone will actually be judged by.
         if geom is not None and not geom.is_empty and len(lons):
             inside = _shapely_contains(geom, lons, lats)
             if inside.any():
-                lons, lats = lons[inside], lats[inside]
+                values, lons, lats = values[inside], lons[inside], lats[inside]
 
         if len(lons) == 0:
             return []
+
+        if len(values) >= MIN_PIXELS_FOR_PERCENTILE_FILTER:
+            lo, hi = np.percentile(values, [SAMPLE_POINT_PERCENTILE_LOW, SAMPLE_POINT_PERCENTILE_HIGH])
+            ndvi_safe = (values >= lo) & (values <= hi)
+            if not ndvi_safe.any():
+                # Degenerately removed every pixel (e.g. a perfectly uniform zone, where lo ==
+                # hi) - treat everything as safe rather than having nothing to prefer below.
+                ndvi_safe = np.ones(len(values), dtype=bool)
+        else:
+            ndvi_safe = np.ones(len(values), dtype=bool)
 
         xs, ys = transformer.transform(lons, lats)
         points_m = np.column_stack([xs, ys])
@@ -1679,8 +1686,12 @@ def compute_field_zones(
             # Degenerate: every candidate projects to ~the same point along the axis (a very
             # compact/near-circular zone) - no meaningful "line" to walk, fall back to the old
             # maximize-mutual-distance spread rather than collapsing every bin onto one point.
-            chosen = _farthest_point_sample(points_m, max_points)
-            return [[float(lons[i]), float(lats[i])] for i in chosen]
+            safe_idx = np.where(ndvi_safe)[0]
+            pool = points_m[safe_idx] if len(safe_idx) >= max_points else points_m
+            pool_lons = lons[safe_idx] if len(safe_idx) >= max_points else lons
+            pool_lats = lats[safe_idx] if len(safe_idx) >= max_points else lats
+            chosen = _farthest_point_sample(pool, max_points)
+            return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
 
         interior_edges = np.linspace(t_min, t_max, max_points + 1)[1:-1]
         bin_idx = np.digitize(t, interior_edges)
@@ -1690,18 +1701,27 @@ def compute_field_zones(
             candidate_idx = np.where(bin_idx == i)[0]
             if len(candidate_idx) == 0:
                 continue
-            side_s = s[candidate_idx]
+            # Prefer this slice's NDVI-safe candidates; only fall back to every candidate in the
+            # slice (including outliers) if none of them are safe - keeps the transect's reach
+            # intact even where a whole slice happens to sit on an NDVI anomaly.
+            safe_in_slice = candidate_idx[ndvi_safe[candidate_idx]]
+            pool = safe_in_slice if len(safe_in_slice) > 0 else candidate_idx
+            side_s = s[pool]
             # Alternate which side of the transect to prefer each step, zigzagging across the
             # zone's width as t advances - the "W-pattern" a soil-sampling transect walks.
-            pick = candidate_idx[np.argmax(side_s) if i % 2 == 0 else np.argmin(side_s)]
+            pick = pool[np.argmax(side_s) if i % 2 == 0 else np.argmin(side_s)]
             chosen_indices.append(pick)
 
         if len(chosen_indices) < max(2, max_points // 2):
             # Enough empty bins (an oddly-shaped zone where candidates cluster unevenly along the
             # axis) that the zigzag came out too sparse to look intentional - the old spread-out
             # fallback is a safer default than a half-empty, lopsided transect.
-            chosen = _farthest_point_sample(points_m, max_points)
-            return [[float(lons[i]), float(lats[i])] for i in chosen]
+            safe_idx = np.where(ndvi_safe)[0]
+            pool = points_m[safe_idx] if len(safe_idx) >= max_points else points_m
+            pool_lons = lons[safe_idx] if len(safe_idx) >= max_points else lons
+            pool_lats = lats[safe_idx] if len(safe_idx) >= max_points else lats
+            chosen = _farthest_point_sample(pool, max_points)
+            return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
 
         return [[float(lons[i]), float(lats[i])] for i in chosen_indices]
 
