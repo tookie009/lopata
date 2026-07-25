@@ -1693,9 +1693,6 @@ def compute_field_zones(
             chosen = _farthest_point_sample(pool, max_points)
             return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
 
-        interior_edges = np.linspace(t_min, t_max, max_points + 1)[1:-1]
-        bin_idx = np.digitize(t, interior_edges)
-
         # A gentle "S" - one full sine oscillation across the whole transect - rather than
         # zigzagging out to the full width each step: alternating to the true min/max of s put
         # points right on the zone's own boundary on a narrow field (verified on a real ~5ha
@@ -1708,33 +1705,44 @@ def compute_field_zones(
         # is along the zone's LENGTH, this only softens how far it wanders sideways.
         half_width = (s.max() - s.min()) / 2.0
         amplitude = 0.3 * half_width
+        targets = [
+            (
+                t_min + (i + 0.5) / max_points * (t_max - t_min),
+                amplitude * math.sin(2 * math.pi * (i + 0.5) / max_points),
+            )
+            for i in range(max_points)
+        ]
 
+        # For each target position on the S-curve, greedily claim the nearest still-unused
+        # candidate - preferring NDVI-safe candidates globally over unsafe ones, not just within
+        # whatever along-axis slice this target happens to fall in. A per-slice-only preference
+        # (the previous version) still placed points on real NDVI anomalies whenever an entire
+        # slice was extreme (a large reddish patch spanning most of a slice's width, not just a
+        # few outlier pixels) - reported directly against a real field: the transect ran straight
+        # through a visibly anomalous patch at one end of a zone. Searching all safe candidates
+        # first, regardless of which slice they're nominally in, lets a nearby safe pixel from an
+        # adjacent slice cover for one that has none, so a genuinely large extreme patch gets
+        # walked around instead of through - only once every safe candidate is already claimed
+        # does this fall back to the nearest unsafe one, and only for the leftover targets.
+        safe_idx = np.where(ndvi_safe)[0]
+        unsafe_idx = np.where(~ndvi_safe)[0]
+        used = np.zeros(len(t), dtype=bool)
         chosen_indices: list[int] = []
-        for i in range(max_points):
-            candidate_idx = np.where(bin_idx == i)[0]
-            if len(candidate_idx) == 0:
-                continue
-            # Prefer this slice's NDVI-safe candidates; only fall back to every candidate in the
-            # slice (including outliers) if none of them are safe - keeps the transect's reach
-            # intact even where a whole slice happens to sit on an NDVI anomaly.
-            safe_in_slice = candidate_idx[ndvi_safe[candidate_idx]]
-            pool = safe_in_slice if len(safe_in_slice) > 0 else candidate_idx
-            t_norm = (i + 0.5) / max_points
-            s_target = amplitude * math.sin(2 * math.pi * t_norm)
-            pick = pool[np.argmin(np.abs(s[pool] - s_target))]
-            chosen_indices.append(pick)
+        for t_target, s_target in targets:
+            for pool in (safe_idx, unsafe_idx):
+                available = pool[~used[pool]]
+                if len(available) == 0:
+                    continue
+                dist2 = (t[available] - t_target) ** 2 + (s[available] - s_target) ** 2
+                pick = available[np.argmin(dist2)]
+                used[pick] = True
+                chosen_indices.append(pick)
+                break
 
-        if len(chosen_indices) < max(2, max_points // 2):
-            # Enough empty bins (an oddly-shaped zone where candidates cluster unevenly along the
-            # axis) that the zigzag came out too sparse to look intentional - the old spread-out
-            # fallback is a safer default than a half-empty, lopsided transect.
-            safe_idx = np.where(ndvi_safe)[0]
-            pool = points_m[safe_idx] if len(safe_idx) >= max_points else points_m
-            pool_lons = lons[safe_idx] if len(safe_idx) >= max_points else lons
-            pool_lats = lats[safe_idx] if len(safe_idx) >= max_points else lats
-            chosen = _farthest_point_sample(pool, max_points)
-            return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
-
+        # Return in along-axis order (not target-assignment order, which can differ slightly once
+        # candidates get claimed out of order) so the route still traces smoothly from one end to
+        # the other instead of jumping around.
+        chosen_indices.sort(key=lambda i: t[i])
         return [[float(lons[i]), float(lats[i])] for i in chosen_indices]
 
     def _zone_entry(mask: np.ndarray, geom) -> dict | None:
