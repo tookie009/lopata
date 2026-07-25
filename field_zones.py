@@ -7,7 +7,7 @@ import numpy as np
 import shapely
 from pyproj import Transformer
 from shapely.errors import GEOSException
-from shapely.geometry import Point, Polygon, box, mapping
+from shapely.geometry import MultiPolygon, Point, Polygon, box, mapping
 from shapely.ops import transform as shp_transform
 from shapely.ops import linemerge, polygonize, unary_union
 from shapely.vectorized import contains as _shapely_contains
@@ -276,6 +276,102 @@ def _safe_buffer0(geom):
                 "unrepaired rather than failing the whole request"
             )
             return geom
+
+
+# ~0.5m - deliberately tiny (both known real cases were 1e-8 to 1e-14 degrees, i.e. sub-mm/pure
+# floating-point noise - see _remove_self_touching_spikes's own docstring). A looser threshold
+# (tried: ~2m, then ~5.5cm) flagged near-duplicate vertices on every single field in
+# test_real_fields.py's corpus - they're apparently a routine, invisible byproduct of this
+# pipeline in general, not something to react to on vertex-distance alone. What actually makes a
+# spike visible is a real detour between the two near-duplicate visits (see the >=2-intervening-
+# vertex requirement below), not raw closeness - so this stays tight to avoid ever touching a
+# legitimately close (but real) pair of simplified vertices.
+SELF_TOUCH_SPIKE_TOLERANCE_M = 0.5
+
+
+def _clean_ring_self_touch(ring_coords_utm: list) -> list:
+    """See _remove_self_touching_spikes - operates on one ring's UTM-meter coordinates (a plain
+    coordinate list, ring-closing point included as the last element)."""
+    pts = list(ring_coords_utm[:-1])  # drop the closing point, always == pts[0]
+    if len(pts) < 6:
+        return ring_coords_utm  # not enough margin to remove a detour and still have a valid ring
+
+    changed = True
+    while changed:
+        changed = False
+        n = len(pts)
+        if n < 6:
+            break
+        for i in range(n):
+            # j starts at i+3: a real detour needs at least 2 intervening vertices (i+1, i+2)
+            # between the pinch and its near-duplicate - an adjacent or single-vertex-apart near-
+            # duplicate is a harmless redundant point (extremely common, see the tolerance
+            # constant's own comment), not a visible spike.
+            for j in range(i + 3, n):
+                # Splicing out (i, j] leaves n - (j - i) points - a floor of 4 guarantees the
+                # result is always a valid ring (>=3 distinct vertices + closing point), never a
+                # degenerate line/point. This also naturally rejects the ring-closure wraparound
+                # case (i=0 paired with j=n-1: those are adjacent THROUGH the closing edge, not a
+                # real detour - remaining would be 1, well under the floor - so no separate
+                # circular-distance check is needed on top of this).
+                if n - (j - i) < 4:
+                    continue
+                dx = pts[i][0] - pts[j][0]
+                dy = pts[i][1] - pts[j][1]
+                if math.hypot(dx, dy) <= SELF_TOUCH_SPIKE_TOLERANCE_M:
+                    # Splice out the whole detour (i+1..j inclusive) - pts[i] itself is the pinch
+                    # point both sides of the loop already agree on, so it's kept as the ring's
+                    # sole representative of that location.
+                    pts = pts[: i + 1] + pts[j + 1 :]
+                    changed = True
+                    break
+            if changed:
+                break
+
+    pts.append(pts[0])
+    return pts
+
+
+def _remove_self_touching_spikes(geom, transformer: Transformer):
+    """Cuts a self-touching spike/flag out of geom's ring(s): a real out-and-back detour (>=2
+    intervening vertices) that returns to within SELF_TOUCH_SPIKE_TOLERANCE_M of an earlier vertex
+    renders as a thin line floating away from the zone with no visible connection to it, since the
+    two sides of the detour sit almost exactly on top of each other. Root-caused on a real field
+    (id 346, "Luboszyce Małe 23", 2026-07) via direct ring inspection: a 10-vertex ring visited
+    essentially the same point three times (indices 0, 3, 4, differing only in the 13th-14th
+    decimal) with a real ~65m-and-back excursion between the first two visits. This is a plain
+    whole-field division (no zone_polygon_lonlat override) - a different code path from
+    _snap_to_zone_boundary, which only runs for the subfield-scoped case.
+
+    Deliberately geometry-only, not a raster/mask-level fix (e.g. morphological opening to strip
+    thin mask spurs before vectorizing) - this file's zone construction is heavily tuned around
+    several genuinely non-convex/narrow real fields (see field 318, "Lubów 155", curling around a
+    river bend), and a mask-level change risks stripping legitimately thin real zone parts on
+    those fields. This only ever removes a detour that returns to within
+    SELF_TOUCH_SPIKE_TOLERANCE_M of its own start - it can't touch a real, non-self-touching
+    narrow strip, so it carries none of that risk.
+
+    Runs in UTM meters (isotropic, unlike lon/lat degrees) via `transformer` - same pattern as
+    _snap_to_zone_boundary/_area_ha elsewhere in this file. Only cleans exterior rings (holes are
+    left as-is - the bug's own reports were always on a zone's outer boundary).
+    """
+    def _clean_polygon(poly: Polygon) -> Polygon:
+        utm_exterior = [transformer.transform(x, y) for x, y in poly.exterior.coords]
+        cleaned_utm = _clean_ring_self_touch(utm_exterior)
+        if len(cleaned_utm) == len(utm_exterior):
+            return poly  # nothing changed - skip the round-trip reprojection entirely
+        cleaned_lonlat = [transformer.transform(x, y, direction="INVERSE") for x, y in cleaned_utm]
+        new_poly = Polygon(cleaned_lonlat, list(poly.interiors))
+        if not new_poly.is_valid:
+            new_poly = _safe_buffer0(new_poly)
+        return new_poly
+
+    if geom.geom_type == "Polygon":
+        return _clean_polygon(geom)
+    if geom.geom_type == "MultiPolygon":
+        cleaned_parts = [_clean_polygon(p) for p in geom.geoms]
+        return _polygonal_only(MultiPolygon(cleaned_parts))
+    return geom
 
 
 def _safe_intersection(a, b):
@@ -2338,8 +2434,14 @@ def compute_field_zones(
         final_entries[target_i] = (merged_mask, merged_geom)
         del final_entries[smallest_i]
 
+    # Last cleanup before entries turn into response features - see _remove_self_touching_spikes's
+    # own docstring for the exact bug (a ring detouring out and back to within centimeters of an
+    # earlier vertex, rendering as a thin line floating away from the zone). Runs after every
+    # other geometry-mutating step above (undersized-zone merge included), since any of them could
+    # in principle reintroduce this pattern.
     zones = []
     for mask, geom in final_entries:
+        geom = _remove_self_touching_spikes(geom, transformer)
         entry = _zone_entry(mask, geom)
         if entry is not None:
             zones.append(entry)

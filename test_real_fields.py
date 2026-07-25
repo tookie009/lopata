@@ -17,6 +17,8 @@ regression against every real field already known to have exposed a bug this ses
 re-deriving reproduction steps from scratch each time.
 """
 
+import math
+
 from pyproj import Transformer
 
 import field_zones as fz
@@ -170,6 +172,19 @@ FIELDS = [
             "324490.458073172 413583.312477297))"
         ),
     },
+    {
+        "field_id": 346,
+        "name": "Luboszyce Małe 23",
+        "wkt_2180": (
+            "POLYGON ((322865.440519103 417673.922003122, 322861.389000997 417675.187102562, "
+            "322752.865149537 417614.190231157, 322740.7566008 417607.467917402, "
+            "322682.416593051 417577.755072403, 322517.492491266 417495.106438644, "
+            "322582.018769102 417432.631044804, 322617.319712635 417411.523863893, "
+            "322787.488288525 417382.112880778, 322954.250043809 417496.047364214, "
+            "322955.115184978 417500.824148754, 322954.014583046 417502.948604573, "
+            "322894.416134821 417617.961418313, 322865.440519103 417673.922003122))"
+        ),
+    },
 ]
 
 TARGET_SIZES_HA = [1.0, 2.0, 3.0, 4.0]
@@ -196,7 +211,6 @@ def run() -> bool:
             areas = sorted(f["properties"]["area_ha"] for f in result["features"])
             types = [f["geometry"]["type"] for f in result["features"]]
             field_area_ha = result["field_area_ha"]
-            import math
 
             target_max_ha = min(4.0, target_ha * 1.25)
             ideal_n_zones = math.ceil(field_area_ha / target_ha)
