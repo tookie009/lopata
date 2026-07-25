@@ -1268,6 +1268,7 @@ def _compute_zone_sample_points(
     mask: np.ndarray,
     geom,
     max_points: int,
+    shared_axis: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> list[list[float]]:
     """Zigzag transect spanning the zone's own long axis corner-to-corner, alternating
     side-to-side across its width as it advances - the "W-pattern" a soil-sampling transect
@@ -1275,6 +1276,19 @@ def _compute_zone_sample_points(
     not a scattered point cloud). The frontend already draws a route connecting sample_points
     in the order returned here, so that order matters: walking it in sequence traces one
     mostly-continuous path instead of criss-crossing the zone unpredictably.
+
+    shared_axis (primary, secondary unit vectors in UTM meters), when given, is used INSTEAD of
+    computing this zone's own PCA axis from its own candidates - so every zone's line runs in
+    the SAME direction as its neighbors, rather than each zone's line following its own
+    individual shape. Requested directly after a real multi-zone field showed adjacent zones'
+    lines running in unrelated directions (one horizontal, the next vertical) - even the best
+    possible zone-visiting order and per-zone orientation (see compute_field_zones's own
+    nearest-neighbor tour) can't make two lines running in incompatible directions look like one
+    continuous diagonal crossing their shared boundary. compute_field_zones computes this once
+    from every valid pixel in the whole area being divided and passes it to every zone's own
+    call. Falls back to this zone's own PCA (the original per-zone behavior) when not given -
+    single_zone_override's one-zone case has no "neighbors" to match, so there's nothing to
+    share an axis with there.
 
     NDVI-extreme avoidance (see SAMPLE_POINT_WORST_PERCENTILE's module docstring for why, and
     why it's one-sided - only the worst pixels are avoided, never the best) is a per-slice
@@ -1349,15 +1363,19 @@ def _compute_zone_sample_points(
     if len(points_m) < 2:
         return [[float(lons[0]), float(lats[0])]]
 
-    # PCA via SVD on the mean-centered candidates: the first right-singular vector is the
-    # direction of greatest spread (the zone's own long axis), the second is perpendicular to
-    # it - exactly what's needed to project every candidate onto "how far along the
-    # transect" (t) and "which side of it" (s).
+    # The direction to project every candidate onto for "how far along the transect" (t) and
+    # "which side of it" (s) - either the shared, field-wide axis passed in (see this function's
+    # own docstring for why), or (when not given) this zone's own PCA via SVD on the
+    # mean-centered candidates: the first right-singular vector is the direction of greatest
+    # spread, the second is perpendicular to it.
     centroid = points_m.mean(axis=0)
     centered = points_m - centroid
-    _, _, vt = np.linalg.svd(centered, full_matrices=False)
-    primary_axis = vt[0]
-    secondary_axis = vt[1] if vt.shape[0] > 1 else np.array([-primary_axis[1], primary_axis[0]])
+    if shared_axis is not None:
+        primary_axis, secondary_axis = shared_axis
+    else:
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        primary_axis = vt[0]
+        secondary_axis = vt[1] if vt.shape[0] > 1 else np.array([-primary_axis[1], primary_axis[0]])
     t = centered @ primary_axis
     s = centered @ secondary_axis
 
@@ -1620,6 +1638,20 @@ def compute_field_zones(
             "Brak prawidlowych pikseli NDVI wewnatrz podanego pola (zla data/zachmurzenie/geometria)"
         )
 
+    # Computed once, from every valid pixel in the whole area being divided (not per zone), and
+    # passed to every zone's own _compute_zone_sample_points call - see that function's own
+    # docstring for why a SHARED axis matters (every zone's diagonal running the same direction
+    # as its neighbors, not each one following its own individually-shaped PCA axis).
+    shared_axis: tuple[np.ndarray, np.ndarray] | None = None
+    _valid_xs, _valid_ys = transformer.transform(grid_lon[valid], grid_lat[valid])
+    _valid_points_m = np.column_stack([_valid_xs, _valid_ys])
+    if len(_valid_points_m) >= 2:
+        _centered = _valid_points_m - _valid_points_m.mean(axis=0)
+        _, _, _vt = np.linalg.svd(_centered, full_matrices=False)
+        _primary = _vt[0]
+        _secondary = _vt[1] if _vt.shape[0] > 1 else np.array([-_primary[1], _primary[0]])
+        shared_axis = (_primary, _secondary)
+
     if single_zone_override:
         # See this function's own docstring for single_zone_override - deliberately bypasses
         # everything below (n_zones/max_pixels budgeting, region growing, splitting, gap-filling,
@@ -1842,8 +1874,11 @@ def compute_field_zones(
 
     def _select_sample_points(mask: np.ndarray, geom, max_points: int) -> list[list[float]]:
         """Thin wrapper binding _compute_zone_sample_points to this call's own ndvi/grid_lon/
-        grid_lat/transformer - see that function's docstring for the actual selection logic."""
-        return _compute_zone_sample_points(ndvi, grid_lon, grid_lat, transformer, mask, geom, max_points)
+        grid_lat/transformer/shared_axis - see that function's docstring for the actual
+        selection logic."""
+        return _compute_zone_sample_points(
+            ndvi, grid_lon, grid_lat, transformer, mask, geom, max_points, shared_axis
+        )
 
     def _zone_entry(mask: np.ndarray, geom) -> dict | None:
         if geom is None:
