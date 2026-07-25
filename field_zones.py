@@ -1696,6 +1696,19 @@ def compute_field_zones(
         interior_edges = np.linspace(t_min, t_max, max_points + 1)[1:-1]
         bin_idx = np.digitize(t, interior_edges)
 
+        # A gentle "S" - one full sine oscillation across the whole transect - rather than
+        # zigzagging out to the full width each step: alternating to the true min/max of s put
+        # points right on the zone's own boundary on a narrow field (verified on a real ~5ha
+        # strip field: points landed hugging both edges instead of crossing through the
+        # interior). amplitude is a modest fraction of the half-width, so the wander stays well
+        # inside the zone - explicitly requested ("delikatne S", a gentle S, not a sharp zigzag
+        # touching the edges each time) with a hand-drawn reference line crossing mostly through
+        # the middle. sin(0) = sin(2*pi) = 0, so both ends of the transect also land near-center
+        # rather than at a corner of the *width* - the corner-to-corner reach from t_min/t_max
+        # is along the zone's LENGTH, this only softens how far it wanders sideways.
+        half_width = (s.max() - s.min()) / 2.0
+        amplitude = 0.3 * half_width
+
         chosen_indices: list[int] = []
         for i in range(max_points):
             candidate_idx = np.where(bin_idx == i)[0]
@@ -1706,10 +1719,9 @@ def compute_field_zones(
             # intact even where a whole slice happens to sit on an NDVI anomaly.
             safe_in_slice = candidate_idx[ndvi_safe[candidate_idx]]
             pool = safe_in_slice if len(safe_in_slice) > 0 else candidate_idx
-            side_s = s[pool]
-            # Alternate which side of the transect to prefer each step, zigzagging across the
-            # zone's width as t advances - the "W-pattern" a soil-sampling transect walks.
-            pick = pool[np.argmax(side_s) if i % 2 == 0 else np.argmin(side_s)]
+            t_norm = (i + 0.5) / max_points
+            s_target = amplitude * math.sin(2 * math.pi * t_norm)
+            pick = pool[np.argmin(np.abs(s[pool] - s_target))]
             chosen_indices.append(pick)
 
         if len(chosen_indices) < max(2, max_points // 2):
