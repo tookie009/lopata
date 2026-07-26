@@ -1378,29 +1378,6 @@ def _farthest_point_sample(points_m: np.ndarray, n: int) -> list[int]:
     return chosen
 
 
-def _turn_angle_within_limit(points_m: np.ndarray, chosen_indices: list[int], candidate_idx: int) -> bool:
-    """True if appending points_m[candidate_idx] after chosen_indices' last two entries keeps the
-    turn (change in walking direction across those three points) within
-    SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES - see that constant's own docstring for why. Always true
-    with fewer than 2 points chosen so far (no turn is defined yet with only one prior point), and
-    true whenever either segment is near-zero-length rather than blocking on it - a coincident/
-    duplicate point is a separate concern this isn't meant to catch."""
-    if len(chosen_indices) < 2:
-        return True
-    prev2 = points_m[chosen_indices[-2]]
-    prev1 = points_m[chosen_indices[-1]]
-    candidate = points_m[candidate_idx]
-    v1 = prev1 - prev2
-    v2 = candidate - prev1
-    n1 = np.linalg.norm(v1)
-    n2 = np.linalg.norm(v2)
-    if n1 < 1e-9 or n2 < 1e-9:
-        return True
-    cos_angle = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
-    turn_deg = math.degrees(math.acos(cos_angle))
-    return turn_deg <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES
-
-
 def _compute_zone_sample_points(
     ndvi: np.ndarray,
     grid_lon: np.ndarray,
@@ -1567,6 +1544,20 @@ def _compute_zone_sample_points(
         for i in range(max_points)
     ]
 
+    # Direction of the intended diagonal in (t, s) space - from (t_min, -amplitude) to
+    # (t_max, +amplitude), exactly what `targets` above walks along. `proj` (each candidate's
+    # position projected onto this direction) is what both endpoint selection and the final
+    # return order are keyed on below - a single, consistent "distance along the true diagonal"
+    # measure, computed once here since amplitude/t_min/t_max are already fixed at this point.
+    diag_dt = t_max - t_min
+    diag_ds = 2 * amplitude
+    diag_len = math.hypot(diag_dt, diag_ds)
+    if diag_len > 1e-9:
+        dir_t, dir_s = diag_dt / diag_len, diag_ds / diag_len
+    else:
+        dir_t, dir_s = 1.0, 0.0
+    proj = t * dir_t + s * dir_s
+
     # For each target position on the S-curve, greedily claim the nearest still-unused
     # candidate - preferring NDVI-safe candidates globally over unsafe ones, not just within
     # whatever along-axis slice this target happens to fall in. A per-slice-only preference
@@ -1581,48 +1572,157 @@ def _compute_zone_sample_points(
     safe_idx = np.where(ndvi_safe)[0]
     unsafe_idx = np.where(~ndvi_safe)[0]
     used = np.zeros(len(t), dtype=bool)
-    chosen_indices: list[int] = []
-    # Targets are already in increasing-t (along-axis) order, so this loop advances along the
-    # transect roughly the same way the final (t-sorted) output does - tracking the last two
-    # chosen points here lets each new pick respect SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES against
-    # the path as actually walked so far, not just against its own idealized target slot.
+    # Maintained in ascending `proj` order as points get picked below (via bisect insertion) -
+    # this list IS the final return order (no separate final sort needed), and lets every new
+    # pick's turn-angle be validated against its true prospective final neighbors, not just
+    # whichever two points happened to be assigned immediately before it in target-processing
+    # order (see _turn_ok_at_insertion's own docstring for why that distinction matters).
+    sorted_chosen: list[int] = []
+
+    def _insertion_pos(candidate_idx: int) -> int:
+        cand_proj = proj[candidate_idx]
+        lo, hi = 0, len(sorted_chosen)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if proj[sorted_chosen[mid]] < cand_proj:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def _turn_violation_degrees(candidate_idx: int) -> float:
+        """Worst of the (up to) three turn angles, in degrees, that inserting candidate_idx into
+        sorted_chosen at its natural (by proj) position would create - 0.0 if none of its
+        affected triples exceed the limit. Checks all three turns the insertion can affect (the
+        new point's own two edges, plus each existing neighbor's other side, since splicing a
+        point in also changes what used to be a direct neighbor-to-neighbor edge into two shorter
+        ones).
+
+        The previous version of this check (_turn_angle_within_limit, since removed - this
+        replaces its only call site) validated against chosen_indices[-2:] - the last TWO points
+        assigned in target-processing order. That's only a proxy for "the actual final
+        neighbors", and the proxy breaks down exactly when a target's greedily-nearest candidate
+        isn't close to that target's own (t_target, s_target) - confirmed on a real field/zone:
+        the check passed (each step looked locally smooth against assignment order) while the
+        actual returned sequence (previously sorted by proj only after the fact) still contained
+        turns over 100 degrees, because the point actually checked-against and the point that
+        ended up adjacent after sorting were not the same pair. Checking against the true
+        insertion-order neighbors here closes that gap.
+
+        Returns a continuous severity (not just pass/fail) so the greedy loop below can pick the
+        LEAST-bad candidate on the rare target no candidate satisfies outright, instead of the
+        nearest-to-target one regardless of how sharp a turn it forces - see that loop's own
+        comment for why the earlier boolean-only version still let through 148-168 degree turns.
+        """
+        pos = _insertion_pos(candidate_idx)
+        prev_i = sorted_chosen[pos - 1] if pos > 0 else None
+        prev_prev_i = sorted_chosen[pos - 2] if pos > 1 else None
+        next_i = sorted_chosen[pos] if pos < len(sorted_chosen) else None
+        next_next_i = sorted_chosen[pos + 1] if pos + 1 < len(sorted_chosen) else None
+        worst = 0.0
+        for a_idx, b_idx, c_idx in (
+            (prev_prev_i, prev_i, candidate_idx),
+            (prev_i, candidate_idx, next_i),
+            (candidate_idx, next_i, next_next_i),
+        ):
+            if a_idx is None or c_idx is None:
+                continue
+            v1 = points_m[b_idx] - points_m[a_idx]
+            v2 = points_m[c_idx] - points_m[b_idx]
+            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+            if n1 < 1e-9 or n2 < 1e-9:
+                continue
+            cos_angle = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+            worst = max(worst, math.degrees(math.acos(cos_angle)))
+        return worst
+
+    def _turn_ok_at_insertion(candidate_idx: int) -> bool:
+        return _turn_violation_degrees(candidate_idx) <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES
+
     for t_target, s_target in targets:
+        # Search BOTH pools before accepting a turn-violating pick - the previous version broke
+        # out after the safe pool as soon as it had ANY available candidate, even if every one of
+        # them violated the turn-angle limit and it fell back to nearest-to-target regardless of
+        # angle, without ever trying the unsafe pool (which might have held a compliant one).
+        # Confirmed on a real field/zone: this was the actual source of several 148-168 degree
+        # turns that the insertion-aware check above was supposed to prevent but didn't, because
+        # it was only ever consulted for its pass/fail verdict, never for "how bad is the least
+        # bad option" when nothing in reach fully complies.
+        best_pick = None
+        best_violation = None
+        best_dist2 = None
+        picked_good = False
         for pool in (safe_idx, unsafe_idx):
             available = pool[~used[pool]]
             if len(available) == 0:
                 continue
             dist2 = (t[available] - t_target) ** 2 + (s[available] - s_target) ** 2
-            ranked = available[np.argsort(dist2)]
-            pick = next(
-                (cand for cand in ranked if _turn_angle_within_limit(points_m, chosen_indices, cand)),
-                ranked[0],
-            )
-            used[pick] = True
-            chosen_indices.append(pick)
-            break
+            order = np.argsort(dist2)
+            ranked = available[order]
+            ranked_dist2 = dist2[order]
+            for cand, cand_dist2 in zip(ranked, ranked_dist2):
+                violation = _turn_violation_degrees(cand)
+                if violation <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES:
+                    best_pick = cand
+                    picked_good = True
+                    break
+                if best_violation is None or violation < best_violation - 1e-9 or (
+                    abs(violation - best_violation) <= 1e-9 and cand_dist2 < best_dist2
+                ):
+                    best_violation = violation
+                    best_dist2 = cand_dist2
+                    best_pick = cand
+            if picked_good:
+                break
+        if best_pick is None:
+            continue
+        used[best_pick] = True
+        sorted_chosen.insert(_insertion_pos(best_pick), best_pick)
 
-    # Return in order of progress along the intended corner-to-corner diagonal (not target-
-    # assignment order, which can differ slightly once candidates get claimed out of order) so
-    # the route still traces smoothly from one end to the other instead of jumping around.
+    # Try to extend each end further out toward its true corner - "corner to corner" is the
+    # explicit design goal (SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION close to 1.0), but the loop
+    # above ranks every target (including the first/last) by distance to its own idealized
+    # (t_target, s_target), which can leave the actual most-extreme candidate unclaimed whenever
+    # its own s doesn't happen to match -amplitude/+amplitude - confirmed on a real field/zone:
+    # the true proj-minimum candidate existed but lost that distance race to one with a very
+    # different s, leaving a real ~29% of the zone's own area completely unreached.
     #
-    # Sorting by t alone (an earlier version of this) still let a real local reversal through -
-    # confirmed on a real field's zone where two chosen candidates had t=-49.32/s=-70.87 and
-    # t=-46.44/s=-92.85: t-sort puts the first one first, but the second is actually EARLIER
-    # along the true diagonal (its much lower s more than compensates for its slightly higher t) -
-    # walking them in t-order visited the second point then doubled back to the first, a real
-    # physical detour that t alone can't see since it only reflects the primary-axis component,
-    # not the target's full (t, s) position. Projecting onto the diagonal's own direction
-    # (spanning (t_min, -amplitude) to (t_max, +amplitude), exactly what the targets above were
-    # laid out along) accounts for both axes together instead.
-    diag_dt = t_max - t_min
-    diag_ds = 2 * amplitude
-    diag_len = math.hypot(diag_dt, diag_ds)
-    if diag_len > 1e-9:
-        dir_t, dir_s = diag_dt / diag_len, diag_ds / diag_len
-    else:
-        dir_t, dir_s = 1.0, 0.0
-    chosen_indices.sort(key=lambda i: t[i] * dir_t + s[i] * dir_s)
-    return [[float(lons[i]), float(lats[i])] for i in chosen_indices]
+    # Done as a SEPARATE pass after the main loop (not by special-casing the first/last target
+    # inside it) because forcing the absolute extreme immediately, before anything else has been
+    # chosen, has no real neighbor yet to validate the turn against - tried that first and it
+    # produced a new, worse defect on a real zone (a 168.8 degree turn right at the start, since
+    # the forced corner point ended up isolated from wherever the very next point landed). This
+    # pass runs once the interior is already a coherent, turn-checked sequence, so extending an
+    # end can be validated against its real, already-decided neighbor - and simply doesn't extend
+    # that end if no further candidate passes the turn-angle check, rather than forcing one.
+    for end in ("start", "end"):
+        if len(sorted_chosen) < 2 or len(sorted_chosen) >= max_points:
+            # At the requested point count already - this pass only extends REACH, it must never
+            # add more points than max_points actually asked for (an earlier version of this
+            # didn't check that and silently returned 16 points for a 15-point request).
+            continue
+        current_end_idx = sorted_chosen[0] if end == "start" else sorted_chosen[-1]
+        extended = False
+        for pool in (safe_idx, unsafe_idx):  # prefer NDVI-safe reach, same order as the main loop
+            if extended:
+                break
+            more_extreme = pool[proj[pool] < proj[current_end_idx]] if end == "start" \
+                else pool[proj[pool] > proj[current_end_idx]]
+            more_extreme = more_extreme[~used[more_extreme]]
+            if len(more_extreme) == 0:
+                continue
+            order = np.argsort(proj[more_extreme]) if end == "start" else np.argsort(-proj[more_extreme])
+            for cand in more_extreme[order]:
+                if _turn_ok_at_insertion(cand):
+                    used[cand] = True
+                    sorted_chosen.insert(_insertion_pos(cand), cand)
+                    extended = True
+                    break
+                # A closer (less extreme) candidate might still pass even if the absolute
+                # extreme doesn't - keep trying inward until one does or the pool's exhausted,
+                # rather than giving up on extending this end entirely after one rejection.
+
+    return [[float(lons[i]), float(lats[i])] for i in sorted_chosen]
 
 
 def compute_field_zones(
