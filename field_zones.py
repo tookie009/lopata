@@ -82,6 +82,18 @@ SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M = 10.0
 # has a little room on either side to prefer a safe (non-worst-percentile) pixel over the
 # literal geometric corner when they differ. A single, named, easy-to-retune knob on purpose.
 SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION = 0.9
+# Maximum allowed change in walking direction (degrees) between three consecutive sample points -
+# 0 means "must continue perfectly straight", 180 means "no limit at all" (a full U-turn is
+# allowed). Enforced during candidate selection in _compute_zone_sample_points: each point is
+# normally just "nearest available candidate to its target slot on the ideal line" with no regard
+# for the two points already chosen before it, which can occasionally zigzag sharply (a nearby
+# NDVI-safe pixel can sit well off to one side of the ideal line) even though the overall transect
+# still looks diagonal. Requested directly ("uniknac, ze punkty skrecaja 90 stopni w innym
+# kierunku wzgledem poprzedniego punktu") - a single, named, easy-to-retune knob on purpose, same
+# as SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION above. Falls back to the nearest candidate regardless
+# of turn angle if NOTHING available satisfies the limit (same "err toward showing something"
+# policy as the rest of this function) rather than leaving a target slot without a point at all.
+SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES = 60.0
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -1366,6 +1378,29 @@ def _farthest_point_sample(points_m: np.ndarray, n: int) -> list[int]:
     return chosen
 
 
+def _turn_angle_within_limit(points_m: np.ndarray, chosen_indices: list[int], candidate_idx: int) -> bool:
+    """True if appending points_m[candidate_idx] after chosen_indices' last two entries keeps the
+    turn (change in walking direction across those three points) within
+    SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES - see that constant's own docstring for why. Always true
+    with fewer than 2 points chosen so far (no turn is defined yet with only one prior point), and
+    true whenever either segment is near-zero-length rather than blocking on it - a coincident/
+    duplicate point is a separate concern this isn't meant to catch."""
+    if len(chosen_indices) < 2:
+        return True
+    prev2 = points_m[chosen_indices[-2]]
+    prev1 = points_m[chosen_indices[-1]]
+    candidate = points_m[candidate_idx]
+    v1 = prev1 - prev2
+    v2 = candidate - prev1
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 < 1e-9 or n2 < 1e-9:
+        return True
+    cos_angle = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+    turn_deg = math.degrees(math.acos(cos_angle))
+    return turn_deg <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES
+
+
 def _compute_zone_sample_points(
     ndvi: np.ndarray,
     grid_lon: np.ndarray,
@@ -1547,13 +1582,21 @@ def _compute_zone_sample_points(
     unsafe_idx = np.where(~ndvi_safe)[0]
     used = np.zeros(len(t), dtype=bool)
     chosen_indices: list[int] = []
+    # Targets are already in increasing-t (along-axis) order, so this loop advances along the
+    # transect roughly the same way the final (t-sorted) output does - tracking the last two
+    # chosen points here lets each new pick respect SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES against
+    # the path as actually walked so far, not just against its own idealized target slot.
     for t_target, s_target in targets:
         for pool in (safe_idx, unsafe_idx):
             available = pool[~used[pool]]
             if len(available) == 0:
                 continue
             dist2 = (t[available] - t_target) ** 2 + (s[available] - s_target) ** 2
-            pick = available[np.argmin(dist2)]
+            ranked = available[np.argsort(dist2)]
+            pick = next(
+                (cand for cand in ranked if _turn_angle_within_limit(points_m, chosen_indices, cand)),
+                ranked[0],
+            )
             used[pick] = True
             chosen_indices.append(pick)
             break
