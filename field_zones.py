@@ -1679,13 +1679,25 @@ def _compute_zone_sample_points(
         used[best_pick] = True
         sorted_chosen.insert(_insertion_pos(best_pick), best_pick)
 
-    # Try to extend each end further out toward its true corner - "corner to corner" is the
-    # explicit design goal (SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION close to 1.0), but the loop
-    # above ranks every target (including the first/last) by distance to its own idealized
-    # (t_target, s_target), which can leave the actual most-extreme candidate unclaimed whenever
-    # its own s doesn't happen to match -amplitude/+amplitude - confirmed on a real field/zone:
-    # the true proj-minimum candidate existed but lost that distance race to one with a very
-    # different s, leaving a real ~29% of the zone's own area completely unreached.
+    # Try to extend each end further out toward its true corner by REPLACING that end's point
+    # with a more extreme one - "corner to corner" is the explicit design goal
+    # (SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION close to 1.0), but the loop above ranks every
+    # target (including the first/last) by distance to its own idealized (t_target, s_target),
+    # which can leave the actual most-extreme candidate unclaimed whenever its own s doesn't
+    # happen to match -amplitude/+amplitude - confirmed on a real field/zone: the true
+    # proj-minimum candidate existed but lost that distance race to one with a very different s,
+    # leaving a real ~29% of the zone's own area completely unreached.
+    #
+    # MUST be a replacement, not an addition: an earlier version only added a point when
+    # len(sorted_chosen) < max_points, which reads as reasonable but is a no-op in the
+    # overwhelmingly common case, since the main loop above already assigns one point per
+    # target and there are exactly max_points targets - len(sorted_chosen) is almost always
+    # already == max_points by the time this pass runs, so that guard skipped the whole pass on
+    # nearly every real zone. Confirmed on a real field/zone (target=3.0ha, field 346): the
+    # "2.24ha" zone's sample points still only spanned less than half the zone's own lon/lat
+    # extent even after this pass supposedly ran. Replacing the current end (removing it from
+    # sorted_chosen/used first) instead of appending keeps the point COUNT unchanged while still
+    # letting reach improve on every zone, not just the rare one the main loop under-filled.
     #
     # Done as a SEPARATE pass after the main loop (not by special-casing the first/last target
     # inside it) because forcing the absolute extreme immediately, before anything else has been
@@ -1696,18 +1708,23 @@ def _compute_zone_sample_points(
     # end can be validated against its real, already-decided neighbor - and simply doesn't extend
     # that end if no further candidate passes the turn-angle check, rather than forcing one.
     for end in ("start", "end"):
-        if len(sorted_chosen) < 2 or len(sorted_chosen) >= max_points:
-            # At the requested point count already - this pass only extends REACH, it must never
-            # add more points than max_points actually asked for (an earlier version of this
-            # didn't check that and silently returned 16 points for a 15-point request).
+        if len(sorted_chosen) < 2:
             continue
-        current_end_idx = sorted_chosen[0] if end == "start" else sorted_chosen[-1]
+        old_end_idx = sorted_chosen[0] if end == "start" else sorted_chosen[-1]
+        # Temporarily pull the current end out so the turn-check below validates the candidate
+        # against its true remaining neighbor (what the end will actually be adjacent to if the
+        # swap goes through), not against the very point it's about to replace.
+        if end == "start":
+            sorted_chosen.pop(0)
+        else:
+            sorted_chosen.pop()
+        used[old_end_idx] = False
         extended = False
         for pool in (safe_idx, unsafe_idx):  # prefer NDVI-safe reach, same order as the main loop
             if extended:
                 break
-            more_extreme = pool[proj[pool] < proj[current_end_idx]] if end == "start" \
-                else pool[proj[pool] > proj[current_end_idx]]
+            more_extreme = pool[proj[pool] < proj[old_end_idx]] if end == "start" \
+                else pool[proj[pool] > proj[old_end_idx]]
             more_extreme = more_extreme[~used[more_extreme]]
             if len(more_extreme) == 0:
                 continue
@@ -1721,6 +1738,11 @@ def _compute_zone_sample_points(
                 # A closer (less extreme) candidate might still pass even if the absolute
                 # extreme doesn't - keep trying inward until one does or the pool's exhausted,
                 # rather than giving up on extending this end entirely after one rejection.
+        if not extended:
+            # No replacement candidate reaches further without breaking the turn-angle limit -
+            # put the original end back exactly as it was rather than losing a point.
+            used[old_end_idx] = True
+            sorted_chosen.insert(_insertion_pos(old_end_idx), old_end_idx)
 
     return [[float(lons[i]), float(lats[i])] for i in sorted_chosen]
 
