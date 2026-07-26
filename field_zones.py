@@ -93,7 +93,7 @@ SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION = 0.9
 # as SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION above. Falls back to the nearest candidate regardless
 # of turn angle if NOTHING available satisfies the limit (same "err toward showing something"
 # policy as the rest of this function) rather than leaving a target slot without a point at all.
-SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES = 60.0
+SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES = 30.0
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -1601,10 +1601,27 @@ def _compute_zone_sample_points(
             chosen_indices.append(pick)
             break
 
-    # Return in along-axis order (not target-assignment order, which can differ slightly once
-    # candidates get claimed out of order) so the route still traces smoothly from one end to
-    # the other instead of jumping around.
-    chosen_indices.sort(key=lambda i: t[i])
+    # Return in order of progress along the intended corner-to-corner diagonal (not target-
+    # assignment order, which can differ slightly once candidates get claimed out of order) so
+    # the route still traces smoothly from one end to the other instead of jumping around.
+    #
+    # Sorting by t alone (an earlier version of this) still let a real local reversal through -
+    # confirmed on a real field's zone where two chosen candidates had t=-49.32/s=-70.87 and
+    # t=-46.44/s=-92.85: t-sort puts the first one first, but the second is actually EARLIER
+    # along the true diagonal (its much lower s more than compensates for its slightly higher t) -
+    # walking them in t-order visited the second point then doubled back to the first, a real
+    # physical detour that t alone can't see since it only reflects the primary-axis component,
+    # not the target's full (t, s) position. Projecting onto the diagonal's own direction
+    # (spanning (t_min, -amplitude) to (t_max, +amplitude), exactly what the targets above were
+    # laid out along) accounts for both axes together instead.
+    diag_dt = t_max - t_min
+    diag_ds = 2 * amplitude
+    diag_len = math.hypot(diag_dt, diag_ds)
+    if diag_len > 1e-9:
+        dir_t, dir_s = diag_dt / diag_len, diag_ds / diag_len
+    else:
+        dir_t, dir_s = 1.0, 0.0
+    chosen_indices.sort(key=lambda i: t[i] * dir_t + s[i] * dir_s)
     return [[float(lons[i]), float(lats[i])] for i in chosen_indices]
 
 
