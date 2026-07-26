@@ -295,10 +295,23 @@ def _safe_buffer0(geom):
 # (tried: ~2m, then ~5.5cm) flagged near-duplicate vertices on every single field in
 # test_real_fields.py's corpus - they're apparently a routine, invisible byproduct of this
 # pipeline in general, not something to react to on vertex-distance alone. What actually makes a
-# spike visible is a real detour between the two near-duplicate visits (see the >=2-intervening-
-# vertex requirement below), not raw closeness - so this stays tight to avoid ever touching a
-# legitimately close (but real) pair of simplified vertices.
+# spike visible is a real detour between the two near-duplicate visits (see
+# SELF_TOUCH_MIN_DETOUR_LENGTH_M below), not raw closeness - so this stays tight to avoid ever
+# touching a legitimately close (but real) pair of simplified vertices.
 SELF_TOUCH_SPIKE_TOLERANCE_M = 0.5
+
+# A detour must stray at least this far from its own pinch point to count as a real spike, rather
+# than just another near-duplicate vertex sitting right next to the pinch (routine simplification/
+# vectorization noise). This used to be enforced indirectly by requiring >=2 intervening vertices
+# between the pinch and its near-duplicate - on the assumption that a SINGLE intervening vertex is
+# always that harmless kind of noise. Field 346 ("Luboszyce Małe 23", 2026-07, a second real
+# occurrence) disproved that: a ring visited essentially the same point twice with exactly ONE
+# intervening vertex 73m away - a real, clearly visible spike the vertex-count rule let straight
+# through because it never even reached the distance check. Measuring the actual detour length
+# instead of just counting vertices catches both without reopening the false positives the
+# vertex-count rule was originally meant to avoid (a genuinely adjacent duplicate stays under this
+# floor; a real spike, so far only ever seen at 65m+, clears it by two orders of magnitude).
+SELF_TOUCH_MIN_DETOUR_LENGTH_M = 2.0
 
 
 def _clean_ring_self_touch(ring_coords_utm: list) -> list:
@@ -315,11 +328,10 @@ def _clean_ring_self_touch(ring_coords_utm: list) -> list:
         if n < 6:
             break
         for i in range(n):
-            # j starts at i+3: a real detour needs at least 2 intervening vertices (i+1, i+2)
-            # between the pinch and its near-duplicate - an adjacent or single-vertex-apart near-
-            # duplicate is a harmless redundant point (extremely common, see the tolerance
-            # constant's own comment), not a visible spike.
-            for j in range(i + 3, n):
+            # j starts at i+2 (exactly one intervening vertex, i+1) rather than i+3 - see
+            # SELF_TOUCH_MIN_DETOUR_LENGTH_M's own docstring for why a single intervening vertex
+            # can still be a real spike, not just harmless noise.
+            for j in range(i + 2, n):
                 # Splicing out (i, j] leaves n - (j - i) points - a floor of 4 guarantees the
                 # result is always a valid ring (>=3 distinct vertices + closing point), never a
                 # degenerate line/point. This also naturally rejects the ring-closure wraparound
@@ -330,7 +342,17 @@ def _clean_ring_self_touch(ring_coords_utm: list) -> list:
                     continue
                 dx = pts[i][0] - pts[j][0]
                 dy = pts[i][1] - pts[j][1]
-                if math.hypot(dx, dy) <= SELF_TOUCH_SPIKE_TOLERANCE_M:
+                if math.hypot(dx, dy) > SELF_TOUCH_SPIKE_TOLERANCE_M:
+                    continue
+                # Only a genuine detour if at least one intervening vertex actually strays far
+                # from the pinch point - otherwise this is just another near-duplicate vertex
+                # sitting right next to it, not a visible spike (see
+                # SELF_TOUCH_MIN_DETOUR_LENGTH_M's own docstring).
+                is_real_detour = any(
+                    math.hypot(pts[k][0] - pts[i][0], pts[k][1] - pts[i][1]) >= SELF_TOUCH_MIN_DETOUR_LENGTH_M
+                    for k in range(i + 1, j)
+                )
+                if is_real_detour:
                     # Splice out the whole detour (i+1..j inclusive) - pts[i] itself is the pinch
                     # point both sides of the loop already agree on, so it's kept as the ring's
                     # sole representative of that location.
