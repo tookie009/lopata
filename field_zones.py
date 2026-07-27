@@ -1662,18 +1662,43 @@ def _compute_zone_sample_points(
         # rarely exercised before it): connecting its raw output in that order produced routes
         # with a path-length up to ~50x the straight-line start-to-end distance on some real zones
         # once this fallback started triggering more often (see SAMPLE_POINT_MIN_ACCEPT_FRACTION).
-        # Re-ordering the CHOSEN points (not re-selecting them - the set stays whatever the
-        # farthest-point criterion picked) by their own principal axis traces roughly the same
-        # "long direction" a straight guide-line chord would, at negligible cost since there are
-        # only ever up to max_points of them.
+        #
+        # A first attempt re-ordered the CHOSEN points (without re-selecting them) by projecting
+        # onto their own PCA major axis, on the theory that this traces the same "long direction"
+        # a straight guide-line chord would. Confirmed WRONG against real production data: this
+        # only works when the candidate cloud is itself elongated along one axis. An interior zone
+        # (roughly as wide as it is tall - exactly the shape a poor-chord-fit zone tends to have,
+        # since an elongated zone is usually what gives the chord a good fit in the first place)
+        # has real spread across BOTH axes, and a single projection collapses that perpendicular
+        # spread into sort-order noise - reported directly by the user as "completely random"
+        # points on multiple zones of two different fields. Verified numerically on the exact
+        # reported points of one such zone: PCA-sort reproduced the exact reported (bad) path
+        # length, while a greedy nearest-neighbor walk over the SAME chosen points cut path length
+        # by ~35% and traces a coherent, if winding, line through the zone - not as clean as a
+        # true straight chord, but a real path instead of a scatter, and consistent with the
+        # explicitly-acceptable "S-shape" the user described.
         if len(chosen) > 2:
             chosen_pts = pool[chosen]
             centered = chosen_pts - chosen_pts.mean(axis=0)
             cov = np.cov(centered.T)
             eigvals, eigvecs = np.linalg.eigh(cov)
             major_axis = eigvecs[:, int(np.argmax(eigvals))]
-            proj = centered @ major_axis
-            chosen = [chosen[i] for i in np.argsort(proj)]
+            # Deterministic start: the extreme point along the cloud's own major axis, so the
+            # walk still begins from one "end" of the zone rather than an arbitrary point.
+            start_pos = int(np.argmin(centered @ major_axis))
+            remaining = set(range(len(chosen)))
+            remaining.remove(start_pos)
+            order = [start_pos]
+            current = start_pos
+            while remaining:
+                next_pos = min(
+                    remaining,
+                    key=lambda i: float(np.sum((chosen_pts[i] - chosen_pts[current]) ** 2)),
+                )
+                order.append(next_pos)
+                remaining.remove(next_pos)
+                current = next_pos
+            chosen = [chosen[i] for i in order]
 
         return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
 

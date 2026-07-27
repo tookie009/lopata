@@ -276,6 +276,73 @@ def _check_sample_point_continuity(result: dict) -> list[str]:
     return issues
 
 
+# A single-largest-step check (see _check_sample_point_continuity above) is blind to a path made
+# of many medium-sized back-and-forth jumps instead of one dominant outlier - exactly what a
+# poorly-ordered point cloud looks like, and exactly what this check is for (see its own docstring
+# for the real production bug that exposed the gap: this was checked against the reported points
+# and was clean, since no SINGLE step exceeded 50% of the diagonal, even though the overall path
+# was a scatter with reported/optimal length ratio ~1.53).
+SAMPLE_POINT_MAX_PATH_INEFFICIENCY_RATIO = 1.4
+
+
+def _nn_greedy_path_length(xy: np.ndarray) -> float:
+    """Independent reference: greedy nearest-neighbor walk (own implementation, not calling into
+    field_zones.py) over the same point SET, starting from the point most extreme along the
+    cloud's own PCA major axis - see field_zones.py's _farthest_point_fallback for why this choice
+    of start point. Used only as a "how good could this path have been" yardstick, not as the
+    actual route construction method."""
+    n = len(xy)
+    if n < 2:
+        return 0.0
+    centered = xy - xy.mean(axis=0)
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    axis = eigvecs[:, int(np.argmax(eigvals))]
+    start = int(np.argmin(centered @ axis))
+    remaining = set(range(n))
+    remaining.remove(start)
+    current = start
+    total = 0.0
+    while remaining:
+        dists = {i: float(np.linalg.norm(xy[i] - xy[current])) for i in remaining}
+        nxt = min(dists, key=dists.get)
+        total += dists[nxt]
+        remaining.remove(nxt)
+        current = nxt
+    return total
+
+
+def _check_sample_point_path_efficiency(result: dict) -> list[str]:
+    """Flags a zone whose sample_points, connected in the ORDER RETURNED, form a path much longer
+    than a reasonable nearest-neighbor ordering of the same points would - catches a generally
+    scattered/zigzagging route that _check_sample_point_continuity's single-largest-step check
+    cannot (see SAMPLE_POINT_MAX_PATH_INEFFICIENCY_RATIO's own docstring)."""
+    issues = []
+    for feature in result["features"]:
+        points = feature["properties"].get("sample_points")
+        if not points or len(points) < 4:
+            continue
+        lons = np.array([p[0] for p in points])
+        lats = np.array([p[1] for p in points])
+        lat0 = math.radians(float(np.mean(lats)))
+        m_per_deg_lat = 111320.0
+        m_per_deg_lon = 111320.0 * math.cos(lat0)
+        xy = np.column_stack([lons * m_per_deg_lon, lats * m_per_deg_lat])
+
+        reported_length = float(np.sum(np.linalg.norm(np.diff(xy, axis=0), axis=1)))
+        best_length = _nn_greedy_path_length(xy)
+        if best_length < 1e-6:
+            continue
+        ratio = reported_length / best_length
+        if ratio > SAMPLE_POINT_MAX_PATH_INEFFICIENCY_RATIO:
+            issues.append(
+                f"zone {feature['properties'].get('zone_id')} sample_points path is {ratio:.2f}x "
+                f"longer than a reasonable nearest-neighbor ordering ({reported_length:.0f}m vs "
+                f"{best_length:.0f}m) - possible scattered/zigzag route"
+            )
+    return issues
+
+
 def run() -> bool:
     """Returns True if every field/target combination looks clean, False if anything worth a
     second look was found - printed either way."""
@@ -302,6 +369,7 @@ def run() -> bool:
             if result["n_zones"] > ideal_n_zones:
                 issues.append(f"more zones than ideal (ideal={ideal_n_zones})")
             issues.extend(_check_sample_point_continuity(result))
+            issues.extend(_check_sample_point_path_efficiency(result))
 
             status = "OK" if not issues else "CHECK: " + "; ".join(issues)
             if issues:
