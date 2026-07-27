@@ -196,6 +196,26 @@ FIELDS = [
             "322894.416134821 417617.961418313, 322865.440519103 417673.922003122))"
         ),
     },
+    {
+        "field_id": 369,
+        "name": "Bełcz Wielki 288",
+        "wkt_2180": (
+            "POLYGON ((317734.037248305 421672.764327361, 317675.732645355 421650.069200154, "
+            "317646.952161015 421637.766808175, 317620.026028503 421623.629528131, "
+            "317640.30026766 421603.907338141, 317734.612258964 421446.799382376, "
+            "317755.048295998 421454.95722094, 317809.562423461 421462.208581606, "
+            "317881.413698832 421464.49387734, 317995.665294163 421450.143102633, "
+            "318130.319966961 421432.783736277, 318171.107409146 421426.126976953, "
+            "318241.417863191 421426.863811485, 318348.61965217 421435.753109713, "
+            "318389.43411876 421439.832980609, 318505.355106704 421446.653436433, "
+            "318543.866587376 421525.673873149, 318365.234978209 421658.443291507, "
+            "318223.489187282 421760.266230517, 318085.900362888 421859.033135546, "
+            "318054.561944289 421840.98739975, 317953.581732094 421783.426530764, "
+            "317913.163466091 421760.096621441, 317858.355520951 421728.466108583, "
+            "317815.934204398 421706.333292574, 317777.829874377 421690.639553031, "
+            "317734.037248305 421672.764327361))"
+        ),
+    },
 ]
 
 TARGET_SIZES_HA = [1.0, 2.0, 3.0, 4.0]
@@ -206,6 +226,53 @@ def _wkt_to_lonlat(wkt_2180: str) -> list[tuple[float, float]]:
     pairs = [tuple(map(float, p.strip().split())) for p in coords_str.split(",")]
     transformer = Transformer.from_crs("EPSG:2180", "EPSG:4326", always_xy=True)
     return [transformer.transform(x, y) for x, y in pairs]
+
+
+SAMPLE_POINT_MAX_STEP_FRACTION_OF_DIAGONAL = 0.5
+
+
+def _check_sample_point_continuity(result: dict) -> list[str]:
+    """Flags a zone whose ordered sample_points contain a consecutive-step distance that's large
+    relative to the ZONE'S OWN SIZE (bounding-box diagonal, in meters) - the signature of a route
+    jumping between two disconnected clusters instead of tracing one coherent line (reported live
+    on field 369 "Bełcz Wielki 288": a ~3.9ha zone's route jumped ~100-1800m to an
+    abandoned-then-resumed cluster, comparable to or exceeding the zone's own extent).
+
+    Deliberately NOT a step-to-step ratio (max/median): tried first and rejected - at small
+    target_plot_size_ha, median spacing is naturally tiny (~10-15m, close to pixel resolution),
+    so the ordinary endpoint-extension pass in _compute_zone_sample_points (which replaces each
+    end with the most extreme still-unused candidate, reaching a few extra tens of meters to the
+    chord's true tip) trips a ratio-based check on nearly every zone in the existing corpus with
+    no real bug present - confirmed experimentally, false positives on 6 of the 6 already-known
+    fields. Comparing against the zone's own diagonal instead stays meaningful across every zone
+    size/target combination and doesn't confuse a normal tip-reaching step with an actual
+    disconnected-cluster jump.
+
+    Needs >= 4 points (>= 3 steps) to have anything meaningful to check."""
+    issues = []
+    for feature in result["features"]:
+        points = feature["properties"].get("sample_points") or []
+        if len(points) < 4:
+            continue
+        transformer = fz._to_utm_transformer(points[0][0], points[0][1])
+        xs, ys = transformer.transform([p[0] for p in points], [p[1] for p in points])
+        pts_m = np.column_stack([xs, ys])
+        steps = np.hypot(*(pts_m[1:] - pts_m[:-1]).T)
+        max_step = steps.max()
+
+        minx, miny, maxx, maxy = shape(feature["geometry"]).bounds
+        (cx0, cx1), (cy0, cy1) = transformer.transform([minx, maxx], [miny, maxy])
+        diagonal_m = math.hypot(cx1 - cx0, cy1 - cy0)
+        if diagonal_m <= 1e-6:
+            continue
+
+        if max_step > SAMPLE_POINT_MAX_STEP_FRACTION_OF_DIAGONAL * diagonal_m:
+            issues.append(
+                f"zone {feature['properties'].get('zone_id')} sample_points jump {max_step:.0f}m, "
+                f"{100 * max_step / diagonal_m:.0f}% of the zone's own {diagonal_m:.0f}m diagonal "
+                "- possible disconnected-cluster route"
+            )
+    return issues
 
 
 def _check_exclusions(result: dict, exclusion_union) -> list[str]:
@@ -255,6 +322,7 @@ def run() -> bool:
                 issues.append("degenerate near-zero-area zone")
             if result["n_zones"] > ideal_n_zones:
                 issues.append(f"more zones than ideal (ideal={ideal_n_zones})")
+            issues.extend(_check_sample_point_continuity(result))
             if exclusion_union is not None:
                 issues.extend(_check_exclusions(result, exclusion_union))
 

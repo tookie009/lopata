@@ -119,6 +119,18 @@ SAMPLE_POINT_CONTINUITY_DISTANCE_WEIGHT = 0.6
 # of turn angle if NOTHING available satisfies the limit (same "err toward showing something"
 # policy as the rest of this function) rather than leaving a target slot without a point at all.
 SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES = 30.0
+# A candidate whose best achievable (t,s) distance from its target position exceeds this many
+# times the zone's own expected point-to-point spacing (chord_len / max_points) is rejected - that
+# target is simply skipped (fewer points for this zone) rather than forced onto an outlier
+# candidate. The greedy target-matching loop below had no upper bound on this distance at all -
+# confirmed on a real field (369, "Bełcz Wielki 288"): a genuinely convex zone (ruling out a
+# shape-based explanation) had a real gap in nearby candidate density for part of its guide line,
+# and the unbounded search reached ~111m sideways (vs. ~17m expected spacing) to fill two targets
+# there, producing an isolated jump amid otherwise tight, even spacing - visible on the map as the
+# route abandoning one cluster and jumping to a stranded one. Same "accept fewer points over a bad
+# placement" policy the endpoint-extension pass below already uses, just not previously applied
+# to this main loop.
+SAMPLE_POINT_MAX_REACH_MULTIPLE = 3.0
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -1838,6 +1850,12 @@ def _compute_zone_sample_points(
     def _turn_ok_at_insertion(candidate_idx: int) -> bool:
         return _turn_violation_degrees(candidate_idx) <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES
 
+    # A target with no real candidate within this distance of its ideal (t_target, 0) position is
+    # skipped outright (see the reach-cap check below) rather than forced onto whatever's nearest
+    # however far that is - see SAMPLE_POINT_MAX_REACH_MULTIPLE's own docstring for the real bug
+    # this closes.
+    max_reach2 = (SAMPLE_POINT_MAX_REACH_MULTIPLE * (chord_len / max_points)) ** 2
+
     for t_target, s_target in targets:
         # Search BOTH pools before accepting a turn-violating pick - the previous version broke
         # out after the safe pool as soon as it had ANY available candidate, even if every one of
@@ -1848,6 +1866,7 @@ def _compute_zone_sample_points(
         # it was only ever consulted for its pass/fail verdict, never for "how bad is the least
         # bad option" when nothing in reach fully complies.
         best_pick = None
+        best_pick_dist2 = None
         best_violation = None
         best_dist2 = None
         picked_good = False
@@ -1863,6 +1882,7 @@ def _compute_zone_sample_points(
                 violation = _turn_violation_degrees(cand)
                 if violation <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES:
                     best_pick = cand
+                    best_pick_dist2 = cand_dist2
                     picked_good = True
                     break
                 if best_violation is None or violation < best_violation - 1e-9 or (
@@ -1871,9 +1891,14 @@ def _compute_zone_sample_points(
                     best_violation = violation
                     best_dist2 = cand_dist2
                     best_pick = cand
+                    best_pick_dist2 = cand_dist2
             if picked_good:
                 break
         if best_pick is None:
+            continue
+        if best_pick_dist2 is not None and best_pick_dist2 > max_reach2:
+            # Nothing close enough for this target - skip it (fewer points for this zone) rather
+            # than force a distant jump. See SAMPLE_POINT_MAX_REACH_MULTIPLE.
             continue
         used[best_pick] = True
         sorted_chosen.insert(_insertion_pos(best_pick), best_pick)
