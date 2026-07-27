@@ -127,6 +127,16 @@ SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES = 30.0
 # krecik's all-or-nothing frontend check turned into full random-grid replacements on production
 # more often than the original bug ever did.
 SAMPLE_POINT_MAX_REACH_MULTIPLE = 3.0
+# Final sanity-check thresholds on the chord-based walk's OWN chosen points (see the check right
+# before _compute_zone_sample_points's return) - below/above these, the greedy walk is treated as
+# having failed silently (drifted off the chord and/or backtracked) even though every individual
+# step passed its own turn-angle check, and _farthest_point_fallback is used instead. Values
+# mirror test_real_fields.py's own continuity/path-efficiency checks (same real bug class), not
+# independently tuned - the two overlap somewhat (a walk that gives up on half the chord is often
+# also inefficient), but coverage catches a case efficiency alone can miss (a short, internally
+# "efficient" partial line that just never reaches the chord's back half).
+SAMPLE_POINT_MIN_CHORD_COVERAGE_FRACTION = 0.6
+SAMPLE_POINT_MAX_PATH_INEFFICIENCY_RATIO = 1.4
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -1990,6 +2000,52 @@ def _compute_zone_sample_points(
             # put the original end back exactly as it was rather than losing a point.
             used[old_end_idx] = True
             sorted_chosen.insert(_insertion_pos(old_end_idx), old_end_idx)
+
+    # Final sanity check: the greedy, turn-angle-constrained walk above can lock itself onto a
+    # trajectory that drifts steadily away from the chord (each individual step passing the turn
+    # check, none of them badly) and then never recovers, because jumping back to the chord for a
+    # later target would itself be a sharp turn relative to whatever direction the walk has
+    # already committed to - confirmed on a real, ordinary, near-perfectly-convex zone (field 127
+    # "Tworzanice 60" @4ha): despite real NDVI-safe candidates existing across the FULL chord
+    # length (verified directly against the raw candidate pool), the chosen path only ever
+    # covered the first half of the chord and drifted to over 125m off it by the end - a
+    # different failure shape than SAFE_PREFERENCE_MAX_REACH_MULTIPLE's own bug (that one hugged
+    # the zone's boundary; this one just gives up on reaching the chord's back half at all), so
+    # bounding the safe/unsafe reach alone doesn't catch it. Rather than chase every way this
+    # greedy walk can fail, treat its own output as untrusted until it clears two cheap checks
+    # against the SAME chosen points:
+    #   - t-coverage: the chosen points should span most of the chord's own length - a real
+    #     transect across the zone does; a walk that quietly gave up partway through doesn't.
+    #   - path efficiency: connecting the chosen points in the order returned shouldn't be much
+    #     longer than a plain nearest-neighbor ordering of that same point set - a coherent
+    #     transect is close to its own NN-optimal; a drifting/backtracking walk isn't.
+    # Falls back to _farthest_point_fallback (maximize-mutual-distance + NN-ordered) - already
+    # this function's fallback for "no usable chord at all" - since a real, if less clean, spread
+    # covering the whole zone beats a clean-looking partial line that misses half of it.
+    if len(sorted_chosen) >= 4:
+        chosen_t = t[sorted_chosen]
+        t_coverage = (chosen_t.max() - chosen_t.min()) / chord_len if chord_len > 1e-9 else 1.0
+
+        chosen_pts = points_m[sorted_chosen]
+        path_length = float(np.sum(np.linalg.norm(np.diff(chosen_pts, axis=0), axis=1)))
+        remaining = set(range(len(chosen_pts)))
+        nn_start = 0
+        remaining.remove(nn_start)
+        nn_current = nn_start
+        nn_length = 0.0
+        while remaining:
+            nn_next = min(remaining, key=lambda i: float(np.linalg.norm(chosen_pts[i] - chosen_pts[nn_current])))
+            nn_length += float(np.linalg.norm(chosen_pts[nn_next] - chosen_pts[nn_current]))
+            remaining.remove(nn_next)
+            nn_current = nn_next
+        path_inefficiency = path_length / nn_length if nn_length > 1e-9 else 1.0
+
+        if t_coverage < SAMPLE_POINT_MIN_CHORD_COVERAGE_FRACTION or path_inefficiency > SAMPLE_POINT_MAX_PATH_INEFFICIENCY_RATIO:
+            logger.warning(
+                "chord-based sample points failed sanity check (t_coverage=%.2f, path_inefficiency=%.2f) "
+                "- falling back to farthest-point sampling", t_coverage, path_inefficiency,
+            )
+            return _farthest_point_fallback()
 
     return [[float(lons[i]), float(lats[i])] for i in sorted_chosen]
 

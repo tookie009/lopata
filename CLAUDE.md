@@ -59,13 +59,45 @@ progu zachłanny dobór po prostu akceptuje bliższego "niebezpiecznego" sąsiad
 plamę. `_best_candidate` liczy teraz NAJLEPSZEGO kandydata w OBU pulach (`_best_in_pool`), zamiast
 przerywać na pierwszym trafieniu w puli bezpiecznej.
 
-**Znany kompromis, świadomie zaakceptowany przez użytkownika**: to poprawia strefy z dużą plamą
-złego NDVI blisko cięciwy, ale na innym polu (320 "Borszyn Wielki 276/4" @2-4ha) wprowadza nowy,
-mniejszy zygzak w jednej strefie (flaga `_check_sample_point_path_efficiency`: trasa 1.5-1.58x
-dłuższa niż optymalna) - ten sam wzorzec "naprawa jednej strefy kosztem innej", który już wcześniej
-występował w tym pliku. Dwie inne próby (lokalna naprawa "wyskoków" post-hoc; zygzak zależny od
-lokalnej szerokości strefy dla stref "klepsydrowych") zostały przetestowane i odrzucone - patrz
-pamięć `ndvi_sample_point_reach_cap_investigation` (2026-07-27) po szczegóły obu ślepych zaułków.
+Przy wdrożeniu ten fix wprowadził nowy, mniejszy zygzak na innym polu (320 "Borszyn Wielki 276/4"
+@2-4ha) - naprawiony od razu tego samego dnia przez ogólny mechanizm bezpieczeństwa opisany niżej
+("Sanity-check + fallback"), nie przez dalsze strojenie tego bugu z osobna. Dwie inne próby
+(lokalna naprawa "wyskoków" post-hoc; zygzak zależny od lokalnej szerokości strefy dla stref
+"klepsydrowych") zostały przetestowane i odrzucone po drodze - patrz pamięć
+`ndvi_sample_point_reach_cap_investigation` (2026-07-27) po szczegóły obu ślepych zaułków.
+
+## Sanity-check + fallback: nie ufaj własnemu wynikowi zachłannego spaceru po cięciwie
+
+Ten sam dzień, kolejny realny przypadek (pole 127 "Tworzanice 60" @4ha): zwykła, niemal idealnie
+wypukła strefa (convex hull ratio 0.99999!), z realnymi kandydatami NDVI rozłożonymi na CAŁEJ
+długości cięciwy (zweryfikowane bezpośrednio: pula kandydatów pokrywała t=19 do t=253 na cięciwie
+o długości 270) - a mimo to wybrane punkty pokryły tylko PIERWSZĄ POŁOWĘ cięciwy (t=26 do t=139),
+z `s` (odchylenie od cięciwy) rosnącym niemal liniowo do 126m, zanim algorytm po prostu przestał
+próbować dotrzeć do drugiej połowy. `SAFE_PREFERENCE_MAX_REACH_MULTIPLE` tu nie pomaga - to inny
+mechanizm: zachłanny spacer, ograniczony limitem kąta skrętu, potrafi zablokować się na trajektorii
+odjeżdżającej od cięciwy (każdy pojedynczy krok mieści się w limicie), a próba "doskoczenia" z
+powrotem do dalszej części cięciwy przy kolejnym celu wygląda jak zbyt ostry skręt względem TEJ
+trajektorii, więc `_best_candidate` woli "najmniej zły" wybór blisko już-złej ścieżki niż prawdziwy
+cel. Osobny mechanizm od buga naprawionego wyżej, ale ten sam rodzaj: pojedyncze kroki wyglądają
+lokalnie OK, całość - nie.
+
+Zamiast gonić kolejny wariant tego samego zachłannego-spaceru-z-limitem-skrętu, dodany został ogólny
+mechanizm ochronny na końcu `_compute_zone_sample_points`: po zbudowaniu `sorted_chosen` (po obu
+przebiegach doboru i przedłużaniu końców), liczone są dwie tanie miary na WŁASNYCH wybranych
+punktach - `SAMPLE_POINT_MIN_CHORD_COVERAGE_FRACTION` (czy wybrane punkty pokrywają rozsądną część
+`chord.length`, domyślnie min. 60%) i `SAMPLE_POINT_MAX_PATH_INEFFICIENCY_RATIO` (czy trasa w
+zwróconej kolejności nie jest dużo dłuższa niż zachłanne najbliższy-sąsiad po tym samym zbiorze
+punktów, domyślnie maks. 1.4x - te same progi/idea co własne testy `test_real_fields.py`). Jeśli
+ktoś z tych progów zawiedzie, CAŁY wynik oparty na cięciwie jest odrzucany na rzecz
+`_farthest_point_fallback()` (już istniejący fallback dla "brak używalnej cięciwy w ogóle") -
+gorszy wizualnie (bywa zygzakiem/samoprzecinającą się pętlą zamiast czystej linii), ale realnie
+pokrywa CAŁĄ strefę zamiast połowy, i to jego jedyne zadanie.
+
+**Efekt uboczny, pozytywny**: ten sam mechanizm, bez żadnej dodatkowej zmiany, naprawił NIEZALEŻNIE
+regresję na polu 320 opisaną wyżej (fallback wyłapuje dokładnie ten sam rodzaj nieefektywnej trasy).
+Zweryfikowane na całym korpusie `test_real_fields.py` (9 pól x 4 wielkości docelowe, 15 pkt/strefę):
+fallback uruchamia się rzadko (kilkanaście stref na >200 sprawdzonych), zero nowych regresji, dwie
+wcześniej znane, nie powiązane flagi na polu 127 @1ha (90 mikro-stref) zostają bez zmian.
 
 ## Kompromis: brak gwarancji wspólnego kierunku sąsiednich stref
 
