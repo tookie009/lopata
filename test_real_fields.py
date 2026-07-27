@@ -19,7 +19,9 @@ re-deriving reproduction steps from scratch each time.
 
 import math
 
+import numpy as np
 from pyproj import Transformer
+from shapely.geometry import shape
 
 import field_zones as fz
 
@@ -185,6 +187,40 @@ FIELDS = [
             "322894.416134821 417617.961418313, 322865.440519103 417673.922003122))"
         ),
     },
+    {
+        "field_id": 369,
+        "name": "Bełcz Wielki 288",
+        "wkt_2180": (
+            "POLYGON ((317734.037248305 421672.764327361, 317675.732645355 421650.069200154, "
+            "317646.952161015 421637.766808175, 317620.026028503 421623.629528131, "
+            "317640.30026766 421603.907338141, 317734.612258964 421446.799382376, "
+            "317755.048295998 421454.95722094, 317809.562423461 421462.208581606, "
+            "317881.413698832 421464.49387734, 317995.665294163 421450.143102633, "
+            "318130.319966961 421432.783736277, 318171.107409146 421426.126976953, "
+            "318241.417863191 421426.863811485, 318348.61965217 421435.753109713, "
+            "318389.43411876 421439.832980609, 318505.355106704 421446.653436433, "
+            "318543.866587376 421525.673873149, 318365.234978209 421658.443291507, "
+            "318223.489187282 421760.266230517, 318085.900362888 421859.033135546, "
+            "318054.561944289 421840.98739975, 317953.581732094 421783.426530764, "
+            "317913.163466091 421760.096621441, 317858.355520951 421728.466108583, "
+            "317815.934204398 421706.333292574, 317777.829874377 421690.639553031, "
+            "317734.037248305 421672.764327361))"
+        ),
+    },
+    {
+        "field_id": 383,
+        "name": "Luboszyce Małe 45",
+        "wkt_2180": (
+            "POLYGON ((323028.400660164 417758.43688748, 322872.002245551 417680.760213381, "
+            "322870.747278146 417676.718553806, 322902.576543379 417615.240489781, "
+            "322960.529017704 417503.409295592, 322963.964102726 417503.122354888, "
+            "323042.244512751 417570.541387062, 323043.555141903 417579.380904459, "
+            "323049.662144709 417586.59523041, 323066.438402949 417608.589252912, "
+            "323077.023516626 417639.135567488, 323078.874714558 417668.481787747, "
+            "323081.179396162 417708.318783357, 323083.748915011 417787.96070737, "
+            "323047.384797404 417768.634072354, 323028.400660164 417758.43688748))"
+        ),
+    },
 ]
 
 TARGET_SIZES_HA = [1.0, 2.0, 3.0, 4.0]
@@ -195,6 +231,49 @@ def _wkt_to_lonlat(wkt_2180: str) -> list[tuple[float, float]]:
     pairs = [tuple(map(float, p.strip().split())) for p in coords_str.split(",")]
     transformer = Transformer.from_crs("EPSG:2180", "EPSG:4326", always_xy=True)
     return [transformer.transform(x, y) for x, y in pairs]
+
+
+# A step-to-step ratio check was tried first and rejected: it false-positived on every field at
+# small target sizes because of the endpoint-extension pass's normal longer-than-average reach at
+# line ends. This diagonal-relative version only flags a step that's a large fraction of the WHOLE
+# zone's own size, which a genuine disconnected-cluster jump is and a normal endpoint reach isn't -
+# clean on the existing corpus except one legitimate borderline flag on field 127 "Tworzanice 60"
+# @2.0ha (a separately-known non-convex field).
+SAMPLE_POINT_MAX_STEP_FRACTION_OF_DIAGONAL = 0.5
+
+
+def _check_sample_point_continuity(result: dict) -> list[str]:
+    """Flags a zone whose sample_points contain a jump too large relative to that zone's own
+    bounding-box diagonal - see SAMPLE_POINT_MAX_STEP_FRACTION_OF_DIAGONAL's docstring for why
+    this is diagonal-relative rather than a plain step-to-step ratio."""
+    issues = []
+    for feature in result["features"]:
+        points = feature["properties"].get("sample_points")
+        if not points or len(points) < 2:
+            continue
+        lons = np.array([p[0] for p in points])
+        lats = np.array([p[1] for p in points])
+        lat0 = math.radians(float(np.mean(lats)))
+        m_per_deg_lat = 111320.0
+        m_per_deg_lon = 111320.0 * math.cos(lat0)
+        xs = lons * m_per_deg_lon
+        ys = lats * m_per_deg_lat
+
+        geom = shape(feature["geometry"])
+        minx, miny, maxx, maxy = geom.bounds
+        diagonal_m = math.hypot((maxx - minx) * m_per_deg_lon, (maxy - miny) * m_per_deg_lat)
+        if diagonal_m < 1e-6:
+            continue
+
+        steps = np.hypot(np.diff(xs), np.diff(ys))
+        max_step = float(np.max(steps))
+        if max_step > SAMPLE_POINT_MAX_STEP_FRACTION_OF_DIAGONAL * diagonal_m:
+            issues.append(
+                f"zone {feature['properties'].get('zone_id')} sample_points jump {max_step:.0f}m, "
+                f"{100 * max_step / diagonal_m:.0f}% of the zone's own {diagonal_m:.0f}m diagonal - "
+                "possible disconnected-cluster route"
+            )
+    return issues
 
 
 def run() -> bool:
@@ -222,6 +301,7 @@ def run() -> bool:
                 issues.append("degenerate near-zero-area zone")
             if result["n_zones"] > ideal_n_zones:
                 issues.append(f"more zones than ideal (ideal={ideal_n_zones})")
+            issues.extend(_check_sample_point_continuity(result))
 
             status = "OK" if not issues else "CHECK: " + "; ".join(issues)
             if issues:

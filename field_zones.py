@@ -104,6 +104,29 @@ BISECTING_CHORD_BISECTION_ITERATIONS = 20
 # of turn angle if NOTHING available satisfies the limit (same "err toward showing something"
 # policy as the rest of this function) rather than leaving a target slot without a point at all.
 SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES = 30.0
+# A candidate whose best achievable (t,s) distance from its target position exceeds this many
+# times the zone's own expected point-to-point spacing (chord_len / max_points) is rejected for
+# that target - see SAMPLE_POINT_MIN_ACCEPT_FRACTION just below for what happens next. Exists
+# because the greedy target-matching loop had no upper bound on this distance at all - confirmed
+# on a real field (369, "Bełcz Wielki 288"): a genuinely convex zone (ruling out a shape-based
+# explanation) had a real gap in nearby candidate density for part of its guide line, and the
+# unbounded search reached ~111m sideways (vs ~17m expected spacing) to fill two targets there,
+# producing an isolated jump amid otherwise tight, even spacing.
+SAMPLE_POINT_MAX_REACH_MULTIPLE = 3.0
+# If skipping over-reaching targets (see SAMPLE_POINT_MAX_REACH_MULTIPLE) leaves fewer than this
+# fraction of max_points actually placed, the straight guide-line chord is judged a poor fit for
+# THIS zone's real candidate distribution (not just one isolated gap, but scarcity spread widely
+# enough that skipping alone can't patch it) - the whole zone abandons the chord and falls back to
+# the same maximize-mutual-distance spread already used when there's no usable chord at all (see
+# guide_line is None below). A first version only skipped individual over-reaching targets with no
+# whole-zone escape hatch - verified on a real field (127, "Tworzanice 60") this could leave a zone
+# with a fragmented, blob-shaped handful of points (11 of 15, aspect ratio 2.5 vs 4-30 for every
+# other zone on that field) instead of either a clean line or a sensible spread - a real regression
+# reported directly against production, worse than the original isolated-jump bug it replaced.
+# Falling back to the whole-zone spread instead of patching a struggling chord avoids inventing a
+# new partial-recovery heuristic on top of an already-intricate function - reuses a mechanism this
+# file already relies on and has already proven out for the "no chord" case.
+SAMPLE_POINT_MIN_ACCEPT_FRACTION = 0.8
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -1622,16 +1645,43 @@ def _compute_zone_sample_points(
         except Exception as e:
             logger.warning("longest-bisecting-chord computation failed, falling back: %s", e)
 
+    def _farthest_point_fallback() -> list[list[float]]:
+        """Maximize-mutual-distance spread over every real candidate in the zone, ignoring the
+        guide line entirely - used both when there's no usable chord at all, and (see
+        SAMPLE_POINT_MIN_ACCEPT_FRACTION) when there is one but it's a poor fit for this zone's
+        actual candidate distribution."""
+        safe_idx_local = np.where(ndvi_safe)[0]
+        pool = points_m[safe_idx_local] if len(safe_idx_local) >= max_points else points_m
+        pool_lons = lons[safe_idx_local] if len(safe_idx_local) >= max_points else lons
+        pool_lats = lats[safe_idx_local] if len(safe_idx_local) >= max_points else lats
+        chosen = _farthest_point_sample(pool, max_points)
+
+        # _farthest_point_sample's own docstring is explicit that it returns indices in SELECTION
+        # order (each one picked as farthest from every point already chosen, not path order) -
+        # confirmed this was a real, pre-existing defect (not introduced by this fallback, just
+        # rarely exercised before it): connecting its raw output in that order produced routes
+        # with a path-length up to ~50x the straight-line start-to-end distance on some real zones
+        # once this fallback started triggering more often (see SAMPLE_POINT_MIN_ACCEPT_FRACTION).
+        # Re-ordering the CHOSEN points (not re-selecting them - the set stays whatever the
+        # farthest-point criterion picked) by their own principal axis traces roughly the same
+        # "long direction" a straight guide-line chord would, at negligible cost since there are
+        # only ever up to max_points of them.
+        if len(chosen) > 2:
+            chosen_pts = pool[chosen]
+            centered = chosen_pts - chosen_pts.mean(axis=0)
+            cov = np.cov(centered.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            major_axis = eigvecs[:, int(np.argmax(eigvals))]
+            proj = centered @ major_axis
+            chosen = [chosen[i] for i in np.argsort(proj)]
+
+        return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
+
     if guide_line is None or guide_line.length < 1e-6:
         # No usable chord (degenerate/near-zero-area zone, or every candidate direction failed) -
         # fall back to the old maximize-mutual-distance spread rather than collapsing every
         # target onto one point.
-        safe_idx = np.where(ndvi_safe)[0]
-        pool = points_m[safe_idx] if len(safe_idx) >= max_points else points_m
-        pool_lons = lons[safe_idx] if len(safe_idx) >= max_points else lons
-        pool_lats = lats[safe_idx] if len(safe_idx) >= max_points else lats
-        chosen = _farthest_point_sample(pool, max_points)
-        return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
+        return _farthest_point_fallback()
 
     # t = how far along the chord a candidate's nearest point on it is; s = how far off the
     # chord the candidate actually sits. Unlike the old PCA-axis version, no separate "sideways
@@ -1738,6 +1788,11 @@ def _compute_zone_sample_points(
     def _turn_ok_at_insertion(candidate_idx: int) -> bool:
         return _turn_violation_degrees(candidate_idx) <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES
 
+    # A target with no real candidate within this distance of its ideal (t_target, 0) position is
+    # skipped outright below rather than forced onto whatever's nearest however far that is - see
+    # SAMPLE_POINT_MAX_REACH_MULTIPLE's own docstring for the real bug this closes.
+    max_reach2 = (SAMPLE_POINT_MAX_REACH_MULTIPLE * (chord_len / max_points)) ** 2
+
     for t_target, s_target in targets:
         # Search BOTH pools before accepting a turn-violating pick - the previous version broke
         # out after the safe pool as soon as it had ANY available candidate, even if every one of
@@ -1748,6 +1803,7 @@ def _compute_zone_sample_points(
         # it was only ever consulted for its pass/fail verdict, never for "how bad is the least
         # bad option" when nothing in reach fully complies.
         best_pick = None
+        best_pick_dist2 = None
         best_violation = None
         best_dist2 = None
         picked_good = False
@@ -1763,6 +1819,7 @@ def _compute_zone_sample_points(
                 violation = _turn_violation_degrees(cand)
                 if violation <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES:
                     best_pick = cand
+                    best_pick_dist2 = cand_dist2
                     picked_good = True
                     break
                 if best_violation is None or violation < best_violation - 1e-9 or (
@@ -1771,12 +1828,26 @@ def _compute_zone_sample_points(
                     best_violation = violation
                     best_dist2 = cand_dist2
                     best_pick = cand
+                    best_pick_dist2 = cand_dist2
             if picked_good:
                 break
         if best_pick is None:
             continue
+        if best_pick_dist2 is not None and best_pick_dist2 > max_reach2:
+            # Nothing close enough for this target - skip it (see SAMPLE_POINT_MAX_REACH_MULTIPLE)
+            # rather than force a distant jump. SAMPLE_POINT_MIN_ACCEPT_FRACTION below catches the
+            # case where too many targets end up skipped this way.
+            continue
         used[best_pick] = True
         sorted_chosen.insert(_insertion_pos(best_pick), best_pick)
+
+    if len(sorted_chosen) < SAMPLE_POINT_MIN_ACCEPT_FRACTION * max_points:
+        # Too many targets skipped over-reaching candidates (see SAMPLE_POINT_MAX_REACH_MULTIPLE)
+        # for this to be a real gap the endpoint-extension pass below could reasonably patch up -
+        # the guide line just doesn't fit this zone's actual candidate distribution well enough.
+        # Abandon it entirely rather than return/extend a fragmented partial result - see
+        # SAMPLE_POINT_MIN_ACCEPT_FRACTION's own docstring for the real regression this avoids.
+        return _farthest_point_fallback()
 
     # Try to extend each end further out toward the chord's own t=0/t=chord_len ends by
     # REPLACING that end's point with a more extreme one - reaching the chord's full length is
