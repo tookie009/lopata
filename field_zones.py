@@ -13,6 +13,7 @@ from shapely.ops import transform as shp_transform
 from shapely.ops import linemerge, polygonize, unary_union
 from shapely.vectorized import contains as _shapely_contains
 
+from geometry_utils import points_in_polygon
 from ndvi import fetch_best_vegetation_ndvi_array
 
 logger = logging.getLogger(__name__)
@@ -72,19 +73,18 @@ MIN_PIXELS_FOR_PERCENTILE_FILTER = 8
 # boundary only if eroding by this much would leave nothing (a zone too small/narrow to have any
 # interior this far from every edge) - better a point close to the edge than none at all.
 SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M = 10.0
-# The sample-point line for a zone is (usually) the LONGEST chord that splits the zone's own
-# area roughly in half (see _bisecting_chord_candidates/_select_connected_chord) - not a
-# diagonal derived from a shared PCA axis, which was tried first and abandoned: a straight
-# corner-to-corner diagonal (with a sine, then a linear-ramp sideways wander - see git history
-# around commits e3e72dc..210eadf for that whole line of attempts) assumes a roughly
-# parallelogram-shaped zone. It breaks down completely for a triangular zone (no "opposite
-# corner" to aim for) and can strand several candidate points in a disconnected pocket for a
-# non-convex/bulging zone, since a single global straight line just doesn't describe those
-# shapes. The bisecting-chord approach adapts to whatever shape the zone actually has - each
-# zone's own candidate chords are independent of its neighbors', but the zone-visiting tour
-# (see compute_field_zones) both orders zones and, per zone, picks whichever of its own
-# candidate chords connects best to the previous zone's own end point (SAMPLE_POINT_CONTINUITY_
-# DISTANCE_WEIGHT), not just the longest one - see _select_connected_chord.
+# The sample-point line for a zone is the LONGEST chord that splits the zone's own area
+# roughly in half (see _longest_bisecting_chord) - not a diagonal derived from a shared PCA
+# axis, which was tried first and abandoned: a straight corner-to-corner diagonal (with a
+# sine, then a linear-ramp sideways wander - see git history around commits e3e72dc..210eadf
+# for that whole line of attempts) assumes a roughly parallelogram-shaped zone. It breaks down
+# completely for a triangular zone (no "opposite corner" to aim for) and can strand several
+# candidate points in a disconnected pocket for a non-convex/bulging zone, since a single
+# global straight line just doesn't describe those shapes. The bisecting-chord approach adapts
+# to whatever shape the zone actually has, at the cost of no longer guaranteeing neighboring
+# zones' lines run in exactly the same direction (each zone's chord is independent) - the
+# zone-visiting tour (see compute_field_zones) still does its best to connect them end-to-end
+# regardless.
 #
 # num_angle_samples: how many candidate line directions (0-180 degrees) to try; the direction
 # whose area-bisecting chord is longest wins. bisection_iterations: how many binary-search
@@ -92,21 +92,6 @@ SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M = 10.0
 # precision far finer than a single NDVI pixel, no need for more.
 BISECTING_CHORD_ANGLE_SAMPLES = 18
 BISECTING_CHORD_BISECTION_ITERATIONS = 20
-# Weighs how much a candidate area-bisecting chord's CONNECTION QUALITY (how close its nearer
-# endpoint sits to the previous zone's own last sample point, in the zone-visiting tour - see
-# _select_connected_chord) can outweigh its raw LENGTH when picking which chord a zone actually
-# uses for its sample-point line. Both terms are normalized against that zone's own longest
-# candidate chord before this weight is applied (length_ratio in [0,1]; distance_ratio typically
-# the same order of magnitude), so this is a genuinely relative knob: 0.0 always picks the longest
-# chord regardless of connection (the pre-continuity behavior); larger values increasingly favor a
-# shorter chord that connects better. Requested directly after zones' lines kept visibly
-# disconnecting from each other on the map even though the zone-visiting tour already reorders
-# zones and flips each one's own line forward/reversed to connect as well as it can - that tour
-# could only choose AMONG a zone's two ends, never which chord (of the many candidate angles
-# _bisecting_chord_candidates evaluates) got walked in the first place. A hard "discard anything
-# under 70% of the longest, else fall back to the longest" version was considered and rejected in
-# favor of this smooth blend - see _select_connected_chord's own docstring for why.
-SAMPLE_POINT_CONTINUITY_DISTANCE_WEIGHT = 0.6
 # Maximum allowed change in walking direction (degrees) between three consecutive sample points -
 # 0 means "must continue perfectly straight", 180 means "no limit at all" (a full U-turn is
 # allowed). Enforced during candidate selection in _compute_zone_sample_points: each point is
@@ -119,28 +104,6 @@ SAMPLE_POINT_CONTINUITY_DISTANCE_WEIGHT = 0.6
 # of turn angle if NOTHING available satisfies the limit (same "err toward showing something"
 # policy as the rest of this function) rather than leaving a target slot without a point at all.
 SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES = 30.0
-# A candidate whose best achievable (t,s) distance from its target position exceeds this many
-# times the zone's own expected point-to-point spacing (chord_len / max_points) is rejected - that
-# target is simply skipped (fewer points for this zone) rather than forced onto an outlier
-# candidate. The greedy target-matching loop below had no upper bound on this distance at all -
-# confirmed on a real field (369, "Bełcz Wielki 288"): a genuinely convex zone (ruling out a
-# shape-based explanation) had a real gap in nearby candidate density for part of its guide line,
-# and the unbounded search reached ~111m sideways (vs. ~17m expected spacing) to fill two targets
-# there, producing an isolated jump amid otherwise tight, even spacing - visible on the map as the
-# route abandoning one cluster and jumping to a stranded one. Same "accept fewer points over a bad
-# placement" policy the endpoint-extension pass below already uses, just not previously applied
-# to this main loop.
-#
-# 3.0 was the first value tried and was too strict: verified on a real field (127, "Tworzanice
-# 60") it could reject several CONSECUTIVE targets in a merely-moderately-sparse stretch (not a
-# real gap, just fewer nearby candidates than usual), leaving a fragmented, blob-shaped leftover
-# instead of one line - a real, if narrower, regression traded for fixing the original jump.
-# Verified directly against the exact reported bug's own (t,s) values that 4.0-5.0 is the safe
-# window: it accepts those moderate-reach candidates (closing the fragmentation gap) while still
-# rejecting both of the original ~111m jumps (their distance is still far outside this reach even
-# at 5.0x); at 6.0x one of the two original jumps starts being accepted again. 5.0 picked for a
-# comfortable margin within that window, not the tightest value that still (barely) works.
-SAMPLE_POINT_MAX_REACH_MULTIPLE = 5.0
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -229,16 +192,6 @@ def _split_dust_parts(geom, dust_area_m2: float):
     return kept, dropped
 
 
-def _shared_boundary_length(a, b) -> float:
-    """0 for two shapes that don't touch at all, > 0 for any real shared boundary run (however
-    small) - see _best_touching_neighbor, which is built around this same distinction."""
-    try:
-        inter = a.boundary.intersection(b.boundary)
-    except Exception:
-        return 0.0
-    return inter.length if hasattr(inter, "length") else 0.0
-
-
 def _best_touching_neighbor(piece, geoms: list) -> int:
     """Index into `geoms` of whichever geometry shares the longest boundary run with `piece` -
     not just whichever is nearest by point-set distance (used previously by both
@@ -253,19 +206,15 @@ def _best_touching_neighbor(piece, geoms: list) -> int:
 
     Falls back to nearest-by-distance only if `piece` doesn't share any boundary length with
     anything at all (e.g. a piece that's genuinely floating apart from every candidate) - rare in
-    practice, but a length of 0 for every candidate would otherwise pick arbitrarily among ties.
+    practice, but a length of 0 for every candidate would otherwise pick arbitrarily among ties."""
+    def shared_length(g):
+        try:
+            inter = piece.boundary.intersection(g.boundary)
+        except Exception:
+            return 0.0
+        return inter.length if hasattr(inter, "length") else 0.0
 
-    IMPORTANT: `geoms` should already be restricted to genuine adjacency by the caller whenever it
-    was itself filtered down from a larger candidate set for some OTHER reason (e.g. "has budget
-    room") - see _fill_field_edge_gaps and compute_field_zones's undersized-zone merge loop, both
-    of which call _shared_boundary_length directly first for exactly this reason. Passing this
-    function an already-filtered `geoms` list silently reintroduces the "nearest by distance"
-    problem this function exists to avoid: if the filter happens to exclude every real neighbor,
-    the fallback below picks whichever *filtered* candidate is nearest, however far away that
-    still is - verified on a real field (id 127, "Tworzanice 60", most zones already at the ~4ha
-    cap): a budget-filtered candidate list excluded every real neighbor, and this fallback
-    attached an unrelated zone's leftover piece to a zone up to 900m away."""
-    lengths = [_shared_boundary_length(piece, g) for g in geoms]
+    lengths = [shared_length(g) for g in geoms]
     best_i = max(range(len(geoms)), key=lambda i: lengths[i])
     if lengths[best_i] > 0:
         return best_i
@@ -774,35 +723,21 @@ def _fill_field_edge_gaps(
         else:
             under_budget = list(range(len(candidate_geoms)))
 
-        # Restricted further to candidates that actually TOUCH the piece - an under-budget zone
-        # that doesn't border it at all is worse than an over-budget one that does (see
-        # _best_touching_neighbor's own docstring for why: its nearest-by-distance fallback,
-        # applied to only this budget-filtered pool, would otherwise attach the piece to whatever
-        # under-budget zone is merely closest, however far away that still is, once every real
-        # neighbor happens to already be at/over budget - verified on a real field where almost
-        # every zone sits at the ~4ha cap, producing a piece reattached up to 900m from where it
-        # actually came from).
-        under_budget_touching = [
-            local_i for local_i in under_budget
-            if _shared_boundary_length(piece, candidate_geoms[local_i]) > 0
-        ]
-
         # _best_touching_neighbor, not just whichever zone is nearest - real gap pieces reclaimed
         # here can be sizeable (verified experimentally up to several hundred m^2, not just
         # floating-point noise), and "nearest by distance" ties at 0 for any touching zone whether
         # it shares a real edge or only grazes the piece at a single point, so it can just as
         # easily pick the latter - leaving the piece merged in name only, as its own barely-
         # attached sliver (the exact "boundary looks like several lines" artifact being fixed).
-        if under_budget_touching:
-            pool = [candidate_geoms[local_i] for local_i in under_budget_touching]
+        if under_budget:
+            pool = [candidate_geoms[local_i] for local_i in under_budget]
             best_of_pool = _best_touching_neighbor(piece, pool)
-            best_local_i = under_budget_touching[best_of_pool]
+            best_local_i = under_budget[best_of_pool]
         else:
             # Every touching zone is already at/over budget - has to go somewhere, so fall back
-            # to the normal rule (pick whichever zone actually touches, regardless of budget)
-            # rather than leaving a hole; MAX_SUBFIELD_AREA_HA is enforced as a practical
-            # operational limit, not a mathematical guarantee that can always hold (a gap piece
-            # with no under-budget touching neighbor at all is the rare exception).
+            # to the normal rule rather than leaving a hole; MAX_SUBFIELD_AREA_HA is enforced as
+            # a practical operational limit, not a mathematical guarantee that can always hold
+            # (a gap piece with no under-budget neighbor at all is the rare exception).
             best_local_i = _best_touching_neighbor(piece, candidate_geoms)
 
         nearest_i = present_indices[best_local_i]
@@ -1497,48 +1432,45 @@ def _longest_linestring_component(geom) -> LineString | None:
     return max(lines, key=lambda g: g.length)
 
 
-def _bisecting_chord_candidates(
+def _longest_bisecting_chord(
     polygon: Polygon,
     num_angle_samples: int = BISECTING_CHORD_ANGLE_SAMPLES,
     bisection_iterations: int = BISECTING_CHORD_BISECTION_ITERATIONS,
-) -> list[LineString]:
-    """Finds, for each of num_angle_samples candidate directions (0 to 180 degrees, a line and
-    its 180-degree-rotated self are the same line), the chord along that direction that splits
-    polygon's own area into two (roughly) equal halves - see SAMPLE_POINT_ZIGZAG_AMPLITUDE_
-    FRACTION's old docstring (now replaced by this) for why a PCA/diagonal-based line was
-    abandoned instead: it assumes a roughly parallelogram shape and breaks down for a triangle
-    (no "opposite corner") or a non-convex/bulging zone.
+) -> LineString | None:
+    """Finds, among all lines that split polygon's own area into two (roughly) equal halves, the
+    LONGEST one - see SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION's old docstring (now replaced by
+    this) for why a PCA/diagonal-based line was abandoned: it assumes a roughly parallelogram
+    shape and breaks down for a triangle (no "opposite corner") or a non-convex/bulging zone.
 
-    Rotates the polygon so each candidate direction becomes horizontal, then binary-searches the
-    horizontal cut position whose "area below the cut" equals exactly half the polygon's total
-    area (monotonic in cut position, so binary search is exact up to floating point/GEOS
-    precision). The chord at that position (the polygon's own intersection with the horizontal
-    line, rotated back to the original orientation) is that angle's own candidate.
-
-    Returns every angle's candidate (not just the longest) so the caller can pick among them -
-    see _select_connected_chord, which picks the longest one when there's nothing to connect to,
-    or trades some length for a better connection to a previous zone's end point otherwise.
-    Requested directly after a real triangular zone: a corner-to-corner "diagonal" made no sense
-    for it (a triangle only has 3 corners), while a long line roughly bisecting its area is a
-    well-defined, sensible substitute a person would draw by hand too.
+    For each of num_angle_samples candidate directions (0 to 180 degrees, a line and its
+    180-degree-rotated self are the same line), rotates the polygon so that direction becomes
+    horizontal, then binary-searches the horizontal cut position whose "area below the cut"
+    equals exactly half the polygon's total area (monotonic in cut position, so binary search is
+    exact up to floating point/GEOS precision). The chord at that position (the polygon's own
+    intersection with the horizontal line, rotated back to the original orientation) is a
+    candidate for "the" bisecting line at this angle; whichever angle's chord is longest overall
+    wins. Requested directly after a real triangular zone: a corner-to-corner "diagonal" made no
+    sense for it (a triangle only has 3 corners), while a long line roughly bisecting its area is
+    a well-defined, sensible substitute a person would draw by hand too.
 
     Uses _safe_intersection (not raw .intersection) for both the area-clipping and the final
     chord extraction, since this runs once per zone per real request and a GEOS topology
     exception here shouldn't fail the whole zone-division response - same robustness policy as
     every other geometry operation in this file.
 
-    Returns an empty list if polygon is empty/degenerate, or every candidate direction failed to
-    produce any chord at all (caller falls back to _farthest_point_sample - see
+    Returns None if polygon is empty/degenerate, or every candidate direction failed to produce
+    any chord at all (caller falls back to _farthest_point_sample - see
     _compute_zone_sample_points)."""
     if polygon is None or polygon.is_empty or polygon.area <= 0:
-        return []
+        return None
 
     minx, miny, maxx, maxy = polygon.bounds
     pad = max(maxx - minx, maxy - miny, 1.0) * 2.0
     total_area = polygon.area
     half_area = total_area / 2.0
 
-    chords: list[LineString] = []
+    best_chord: LineString | None = None
+    best_length = -1.0
 
     for i in range(num_angle_samples):
         angle_deg = 180.0 * i / num_angle_samples
@@ -1560,58 +1492,10 @@ def _bisecting_chord_candidates(
 
         cut_line = LineString([(rminx - pad, cut_y), (rmaxx + pad, cut_y)])
         chord = _longest_linestring_component(_safe_intersection(rotated, cut_line))
-        if chord is None:
+        if chord is None or chord.length <= best_length:
             continue
-        chords.append(_shp_rotate(chord, angle_deg, origin=(0, 0), use_radians=False))
-
-    return chords
-
-
-def _select_connected_chord(polygon: Polygon, connect_to: Point | None) -> LineString | None:
-    """Picks which of polygon's own area-bisecting chords (see _bisecting_chord_candidates) a
-    zone actually uses as its sample-point guide line.
-
-    With connect_to=None (single_zone_override, or the first zone visited in compute_field_zones'
-    tour, since nothing precedes it) just takes the longest candidate - a longer transect covers
-    more of the zone's own area, which is all that matters with no adjacent zone to connect to.
-
-    With connect_to set (every zone after the first, in the tour's visiting order) scores each
-    candidate as length_ratio - SAMPLE_POINT_CONTINUITY_DISTANCE_WEIGHT * distance_ratio, where
-    length_ratio is the candidate's own length over the longest candidate's, and distance_ratio
-    is the distance from connect_to to the candidate's NEARER endpoint, over that same longest
-    length (so both terms live on a comparable, zone-size-relative scale). The winning chord is
-    returned reversed if needed so its near endpoint comes first, so the sample points generated
-    from it (see _compute_zone_sample_points) start near connect_to instead of running away from
-    it.
-
-    A hard length-floor-then-fallback version ("discard any candidate under some fraction of the
-    longest, then take whichever survivor connects best, else just fall back to the longest") was
-    considered and rejected: a candidate at 69% of the max length with a great connection would
-    lose outright to one at 71% with a mediocre connection, and behavior would jump abruptly right
-    at that cutoff. This blended score degrades smoothly instead.
-
-    Returns None if polygon has no candidate chords at all (see _bisecting_chord_candidates)."""
-    candidates = _bisecting_chord_candidates(polygon)
-    if not candidates:
-        return None
-    if connect_to is None:
-        return max(candidates, key=lambda c: c.length)
-
-    max_length = max(c.length for c in candidates)
-    if max_length <= 0:
-        return None
-
-    best_score: float | None = None
-    best_chord: LineString | None = None
-    for chord in candidates:
-        start, end = Point(chord.coords[0]), Point(chord.coords[-1])
-        d_start, d_end = connect_to.distance(start), connect_to.distance(end)
-        oriented = chord if d_start <= d_end else LineString(list(chord.coords)[::-1])
-        length_ratio = chord.length / max_length
-        distance_ratio = min(d_start, d_end) / max_length
-        score = length_ratio - SAMPLE_POINT_CONTINUITY_DISTANCE_WEIGHT * distance_ratio
-        if best_score is None or score > best_score:
-            best_score, best_chord = score, oriented
+        best_length = chord.length
+        best_chord = _shp_rotate(chord, angle_deg, origin=(0, 0), use_radians=False)
 
     return best_chord
 
@@ -1624,26 +1508,21 @@ def _compute_zone_sample_points(
     mask: np.ndarray,
     geom,
     max_points: int,
-    connect_to: Point | None = None,
 ) -> list[list[float]]:
-    """Transect walking a line that bisects the zone's own area roughly in half (see
-    _bisecting_chord_candidates/_select_connected_chord) - not a corner-to-corner diagonal
-    derived from a shared PCA axis, which was tried first and abandoned: it assumes a roughly
-    parallelogram-shaped zone, which breaks down completely for a triangular zone (no "opposite
-    corner" to aim for) and can strand several candidates in a disconnected pocket for a
-    non-convex/bulging zone (a single straight line just can't describe those shapes). The
-    frontend already draws a route connecting sample_points in the order returned here, so that
-    order matters: walking it in sequence traces one mostly-continuous path instead of
-    criss-crossing the zone unpredictably.
+    """Transect walking the LONGEST line that bisects the zone's own area roughly in half (see
+    _longest_bisecting_chord) - not a corner-to-corner diagonal derived from a shared PCA axis,
+    which was tried first and abandoned: it assumes a roughly parallelogram-shaped zone, which
+    breaks down completely for a triangular zone (no "opposite corner" to aim for) and can strand
+    several candidates in a disconnected pocket for a non-convex/bulging zone (a single straight
+    line just can't describe those shapes). The frontend already draws a route connecting
+    sample_points in the order returned here, so that order matters: walking it in sequence
+    traces one mostly-continuous path instead of criss-crossing the zone unpredictably.
 
-    Each zone computes its OWN candidate bisecting chords independently (unlike the old
-    shared-PCA-axis approach, which forced every zone's line to run in the same direction as its
-    neighbors). connect_to (UTM meters, same CRS as transformer's target) is the previous zone's
-    own last sample point in the zone-visiting tour (see compute_field_zones) - when set,
-    _select_connected_chord can trade some chord length for one that starts closer to it, instead
-    of always taking the longest candidate regardless of where the previous zone left off. None
-    for the first zone visited (nothing precedes it) or for single_zone_override (only one zone,
-    nothing to connect to).
+    Each zone computes its OWN bisecting chord independently (unlike the old shared-PCA-axis
+    approach, which forced every zone's line to run in the same direction as its neighbors) -
+    the tradeoff is that neighboring zones' lines are no longer guaranteed to point the same way,
+    but the zone-visiting tour (see compute_field_zones) still picks whichever traversal
+    direction connects best to the previous zone's end point, so it does its best regardless.
 
     NDVI-extreme avoidance (see SAMPLE_POINT_WORST_PERCENTILE's module docstring for why, and
     why it's one-sided - only the worst pixels are avoided, never the best) is a per-slice
@@ -1716,15 +1595,14 @@ def _compute_zone_sample_points(
     if len(points_m) < 2:
         return [[float(lons[0]), float(lats[0])]]
 
-    # The zone's own area-bisecting chord (see _bisecting_chord_candidates/_select_connected_
-    # chord's docstrings for why this replaced a PCA/diagonal-based axis, and how connect_to
-    # factors in) - computed from geom (not just the candidate points_m above) so its reach
-    # reflects the zone's true shape, independent of which pixels happened to survive the
-    # boundary-erosion/NDVI filtering above. Same UTM reprojection pattern as containment_geom's
-    # own erosion just above, kept separate since this needs the UNERODED zone shape (the chord
-    # should reach close to the zone's real extent; erosion is only meant to keep individual
-    # candidate POINTS off the very edge, not shrink the chord itself, which candidates are then
-    # matched against).
+    # The zone's own longest area-bisecting chord (see _longest_bisecting_chord's docstring for
+    # why this replaced a PCA/diagonal-based axis) - computed from geom (not just the candidate
+    # points_m above) so its reach reflects the zone's true shape, independent of which pixels
+    # happened to survive the boundary-erosion/NDVI filtering above. Same UTM reprojection
+    # pattern as containment_geom's own erosion just above, kept separate since this needs the
+    # UNERODED zone shape (the chord should reach close to the zone's real extent; erosion is
+    # only meant to keep individual candidate POINTS off the very edge, not shrink the chord
+    # itself, which candidates are then matched against).
     guide_line: LineString | None = None
     if geom is not None and not geom.is_empty:
         try:
@@ -1732,17 +1610,17 @@ def _compute_zone_sample_points(
             # geom can be valid in lon/lat yet come out self-intersecting once reprojected to
             # UTM (floating-point precision at a near-touching vertex - same bug class as
             # _remove_self_touching_spikes, just surfacing after reprojection instead of before
-            # it). _bisecting_chord_candidates' rotate/intersect calls don't raise on an invalid
+            # it). _longest_bisecting_chord's rotate/intersect calls don't raise on an invalid
             # polygon - GEOS just silently returns a wrong (sometimes wildly too long, partially
             # outside the polygon) result instead - confirmed on a real ~3.85ha zone: an invalid
             # UTM polygon produced a 688m "chord" for a zone whose own bounding-box diagonal was
             # only ~310m. _safe_buffer0 (the standard buffer(0) renoding trick, already used
             # elsewhere in this file for the same bug class) fixes validity here with a
-            # negligible area change, and _bisecting_chord_candidates then returns sane results.
+            # negligible area change, and _longest_bisecting_chord then returns a sane result.
             utm_zone_geom = _safe_buffer0(utm_zone_geom)
-            guide_line = _select_connected_chord(utm_zone_geom, connect_to)
+            guide_line = _longest_bisecting_chord(utm_zone_geom)
         except Exception as e:
-            logger.warning("bisecting-chord computation failed, falling back: %s", e)
+            logger.warning("longest-bisecting-chord computation failed, falling back: %s", e)
 
     if guide_line is None or guide_line.length < 1e-6:
         # No usable chord (degenerate/near-zero-area zone, or every candidate direction failed) -
@@ -1860,12 +1738,6 @@ def _compute_zone_sample_points(
     def _turn_ok_at_insertion(candidate_idx: int) -> bool:
         return _turn_violation_degrees(candidate_idx) <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES
 
-    # A target with no real candidate within this distance of its ideal (t_target, 0) position is
-    # skipped outright (see the reach-cap check below) rather than forced onto whatever's nearest
-    # however far that is - see SAMPLE_POINT_MAX_REACH_MULTIPLE's own docstring for the real bug
-    # this closes.
-    max_reach2 = (SAMPLE_POINT_MAX_REACH_MULTIPLE * (chord_len / max_points)) ** 2
-
     for t_target, s_target in targets:
         # Search BOTH pools before accepting a turn-violating pick - the previous version broke
         # out after the safe pool as soon as it had ANY available candidate, even if every one of
@@ -1876,7 +1748,6 @@ def _compute_zone_sample_points(
         # it was only ever consulted for its pass/fail verdict, never for "how bad is the least
         # bad option" when nothing in reach fully complies.
         best_pick = None
-        best_pick_dist2 = None
         best_violation = None
         best_dist2 = None
         picked_good = False
@@ -1892,7 +1763,6 @@ def _compute_zone_sample_points(
                 violation = _turn_violation_degrees(cand)
                 if violation <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES:
                     best_pick = cand
-                    best_pick_dist2 = cand_dist2
                     picked_good = True
                     break
                 if best_violation is None or violation < best_violation - 1e-9 or (
@@ -1901,14 +1771,9 @@ def _compute_zone_sample_points(
                     best_violation = violation
                     best_dist2 = cand_dist2
                     best_pick = cand
-                    best_pick_dist2 = cand_dist2
             if picked_good:
                 break
         if best_pick is None:
-            continue
-        if best_pick_dist2 is not None and best_pick_dist2 > max_reach2:
-            # Nothing close enough for this target - skip it (fewer points for this zone) rather
-            # than force a distant jump. See SAMPLE_POINT_MAX_REACH_MULTIPLE.
             continue
         used[best_pick] = True
         sorted_chosen.insert(_insertion_pos(best_pick), best_pick)
@@ -1991,7 +1856,6 @@ def compute_field_zones(
     field_id: int | None = None,
     zone_polygon_lonlat: list[tuple[float, float]] | None = None,
     single_zone_override: bool = False,
-    exclusion_polygons_lonlat: list[list[tuple[float, float]]] | None = None,
 ) -> dict:
     """Builds zones by seeded region growing (see _balanced_contiguous_zones) - each zone is
     grown outward from a seed pixel to an explicit, near-equal pixel-count share of the field, so
@@ -2030,12 +1894,6 @@ def compute_field_zones(
     heavily tuned. Still gets real NDVI-aware sample_points (via _compute_zone_sample_points),
     same as every normally-sized zone - the whole point of doing this in lopata rather than
     letting the frontend fall back to blind geometric point placement for an oversized zone.
-
-    exclusion_polygons_lonlat: optional list of polygons (pond/building/power line...) to keep
-    out of sampling entirely - each subtracted from zone_polygon as a hole before anything else
-    runs, so field_area_ha, n_zones, valid-pixel masking and every returned zone/sample_point are
-    already scoped to the field/subfield MINUS these areas. None/empty means "no exclusions"
-    (today's only behavior, unchanged).
     """
     field_polygon = Polygon(polygon_lonlat)
     if not field_polygon.is_valid or field_polygon.area == 0:
@@ -2049,20 +1907,6 @@ def compute_field_zones(
             )
     else:
         zone_polygon = field_polygon
-
-    if exclusion_polygons_lonlat:
-        exclusion_union = _safe_union([Polygon(ring) for ring in exclusion_polygons_lonlat])
-        zone_polygon = _polygonal_only(_safe_difference(zone_polygon, exclusion_union))
-        if not zone_polygon.is_valid:
-            # Same known failure mode noted throughout this file (e.g. _compute_zone_sample_points'
-            # UTM-reprojection case) - a fresh hole/notch from the subtraction can renode into a
-            # minor self-intersection; buffer(0) is the standard GEOS fix.
-            zone_polygon = _safe_buffer0(zone_polygon)
-        if not zone_polygon.is_valid or zone_polygon.area == 0:
-            raise ValueError(
-                "Po odjeciu wylaczonych obszarow wielokat strefy jest niepoprawny lub ma zerowa powierzchnie "
-                "(wylaczenia prawdopodobnie pokrywaja cala strefe)"
-            )
 
     # Raster-fetch extent (bbox/UTM origin) always comes from the full polygon_lonlat, even when
     # zone_polygon is smaller - this is what lets repeated calls for different sub-regions of the
@@ -2177,11 +2021,10 @@ def compute_field_zones(
     lat_centers = (lat_edges[:-1] + lat_edges[1:]) / 2
     grid_lon, grid_lat = np.meshgrid(lon_centers, lat_centers)
 
-    # _shapely_contains (not the points_in_polygon ray-cast this replaced) is hole-aware - it
-    # delegates to real GEOS containment on the full geometry, so a zone_polygon with a hole
-    # (a field exclusion subtracted above) correctly excludes those pixels from the very first
-    # mask built, rather than only in the later per-zone masks that already used it.
-    inside = _shapely_contains(zone_polygon, grid_lon, grid_lat)
+    poly_xy = np.asarray(zone_polygon.exterior.coords)
+    inside = points_in_polygon(
+        grid_lon.ravel(), grid_lat.ravel(), poly_xy[:, 0], poly_xy[:, 1]
+    ).reshape(grid_lon.shape)
 
     valid = inside & (data_mask > 0)
     if not np.any(valid):
@@ -2409,14 +2252,10 @@ def compute_field_zones(
             cleaned_geoms.append(_from_utm(kept_utm))
         zone_geoms = cleaned_geoms
 
-    def _select_sample_points(
-        mask: np.ndarray, geom, max_points: int, connect_to: Point | None = None
-    ) -> list[list[float]]:
+    def _select_sample_points(mask: np.ndarray, geom, max_points: int) -> list[list[float]]:
         """Thin wrapper binding _compute_zone_sample_points to this call's own ndvi/grid_lon/
         grid_lat/transformer - see that function's docstring for the actual selection logic."""
-        return _compute_zone_sample_points(
-            ndvi, grid_lon, grid_lat, transformer, mask, geom, max_points, connect_to=connect_to
-        )
+        return _compute_zone_sample_points(ndvi, grid_lon, grid_lat, transformer, mask, geom, max_points)
 
     def _zone_entry(mask: np.ndarray, geom) -> dict | None:
         if geom is None:
@@ -2424,6 +2263,7 @@ def compute_field_zones(
         area_ha = _area_ha(geom, transformer)
         if area_ha < 1e-4:
             return None
+        sample_points = _select_sample_points(mask, geom, max_sample_points_per_zone)
         return {
             # Reported from the raw (unsmoothed) NDVI, not the blurred values clustering
             # actually ran on - stats should reflect what's really there, not the smoothing.
@@ -2432,13 +2272,9 @@ def compute_field_zones(
             "ndvi_max": round(float(ndvi[mask].max()), 4),
             "area_ha": round(area_ha, 4),
             "geometry": mapping(geom),
-            # sample_points isn't computed yet here - it depends on which chord connects best to
-            # the PREVIOUS zone visited in the zone-visiting tour below, which isn't known until
-            # that tour actually reaches this zone. mask/geom are kept (private, stripped from
-            # the final response - see the tour and the features list below) so the tour can call
-            # _select_sample_points itself once it knows what to connect to.
-            "_mask": mask,
-            "_geom": geom,
+            # May still get reversed (start<->end) by the zone-visiting tour below, to connect
+            # better with the previous zone's own end point - see that tour's own comment.
+            "sample_points": sample_points,
         }
 
     # Final hard-cap enforcement. Everything above (pixel-level _split_oversized_zones, then
@@ -2648,21 +2484,6 @@ def compute_field_zones(
         (mask, geom) for (mask, _orig_geom), geom in zip(final_entries, resimplified)
     ]
 
-    # Same reasoning as the first simplify pass's own re-clip earlier in this function (search
-    # "re-clipping here guarantees the final output still never exceeds it"): Douglas-Peucker has
-    # no "stay inside zone_polygon" constraint, so this second/final resimplification pass can
-    # just as easily bulge a zone's boundary past zone_polygon's edge as the first pass could past
-    # the field's own outer edge - including INTO a hole (a field exclusion subtracted from
-    # zone_polygon at the top of this function). Nothing between here and the response ever
-    # re-clips again, so this is the actual last chance to enforce "no returned zone exceeds
-    # zone_polygon" - verified experimentally: without this, a zone could still carry a few
-    # hundred m^2 of overlap into an exclusion purely from this resimplify pass, even though every
-    # earlier stage (raw mask intersection, first simplify's own re-clip) already excluded it.
-    final_entries = [
-        (mask, _polygonal_only(_safe_intersection(geom, zone_polygon)) if geom is not None and not geom.is_empty else geom)
-        for mask, geom in final_entries
-    ]
-
     # Simplification has no "stay inside the original shape" constraint (same reasoning as the
     # zone_polygon re-clip earlier in this function) - it can bulge a zone's boundary slightly
     # outward at a concave point, pushing it a little over target_max_ha (verified: this exact
@@ -2851,26 +2672,11 @@ def compute_field_zones(
         smallest_area_ha = areas_ha[smallest_i]
         others_idx = [i for i in range(len(utm_geoms)) if i != smallest_i]
         with_room_idx = [i for i in others_idx if areas_ha[i] + smallest_area_ha <= target_max_ha]
-        # Further restricted to candidates that actually TOUCH this zone - "has room" alone isn't
-        # enough (see _best_touching_neighbor's own docstring): when every REAL neighbor is
-        # already at/over the cap (common on a field where most zones sit right at target_max_ha,
-        # e.g. field 127 "Tworzanice 60"), with_room_idx can still be non-empty by including
-        # zones that don't border this one at all, and _best_touching_neighbor's nearest-by-
-        # distance fallback would then merge this zone's real geometry into something hundreds of
-        # meters away - producing exactly the "stray disconnected extra polygon" a user reported.
-        # Unlike _fill_field_edge_gaps, there's no "fall back to touching-but-over-budget" step
-        # here on purpose - this is the LAST merge in the pipeline (see this loop's own docstring),
-        # so forcing an over-cap merge here would be an unconditional, unrecoverable cap
-        # violation; leaving the zone unmergeable (its already-documented fallback) is preferable.
-        touching_with_room_idx = [
-            i for i in with_room_idx
-            if _shared_boundary_length(utm_geoms[smallest_i], utm_geoms[i]) > 0
-        ]
-        if not touching_with_room_idx:
+        if not with_room_idx:
             unmergeable_mask_ids.add(id(final_entries[smallest_i][0]))
             continue
-        best_local_i = _best_touching_neighbor(utm_geoms[smallest_i], [utm_geoms[i] for i in touching_with_room_idx])
-        target_i = touching_with_room_idx[best_local_i]
+        best_local_i = _best_touching_neighbor(utm_geoms[smallest_i], [utm_geoms[i] for i in with_room_idx])
+        target_i = with_room_idx[best_local_i]
 
         smallest_mask, smallest_geom = final_entries[smallest_i]
         target_mask, _target_geom = final_entries[target_i]
@@ -2880,39 +2686,6 @@ def compute_field_zones(
         final_entries[target_i] = (merged_mask, merged_geom)
         del final_entries[smallest_i]
 
-    # Re-enforce the hard cap one more time here - now required because the touching-only
-    # restriction _fill_field_edge_gaps and this merge loop both apply above (see
-    # _shared_boundary_length's call sites) can leave a zone slightly over target_max_ha when
-    # every genuinely touching neighbor is already full: forcing a gap piece onto a real neighbor
-    # regardless of budget is the intentional, documented trade-off in _fill_field_edge_gaps's own
-    # "else" branch (prefer a small, rare cap overage over reattaching a piece to some unrelated
-    # zone hundreds of meters away, which is what the touching restriction exists to prevent) - but
-    # the user's own priority (see MAX_SUBFIELD_AREA_HA's docstring) ranks the cap above
-    # everything else this file balances, so that overage still needs closing here rather than
-    # reaching the response. Same re-rasterize-and-split recipe as every other hard-cap
-    # enforcement pass in this function (e.g. the "capped_final" pass above).
-    capped_after_merge: list[tuple[np.ndarray, object]] = []
-    for mask, geom in final_entries:
-        if geom is None or geom.is_empty or _area_ha(geom, transformer) <= target_max_ha:
-            capped_after_merge.append((mask, geom))
-            continue
-        zone_mask = valid & _shapely_contains(geom, grid_lon, grid_lat)
-        if not zone_mask.any():
-            capped_after_merge.append((mask, geom))
-            continue
-        for sub_mask in _enforce_4_connectivity(_split_until_within_budget(zone_mask, smoothed_ndvi, max_pixels)):
-            if not sub_mask.any():
-                continue
-            sub_geom = _raw_zone_geometry(sub_mask)
-            if sub_geom is None:
-                continue
-            sub_geom_utm, _dropped = _split_dust_parts(
-                shp_transform(transformer.transform, sub_geom), final_dust_area_m2
-            )
-            sub_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), sub_geom_utm)
-            capped_after_merge.append((sub_mask, sub_geom))
-    final_entries = capped_after_merge
-
     # Last cleanup before entries turn into response features - see _remove_self_touching_spikes's
     # own docstring for the exact bug (a ring detouring out and back to within centimeters of an
     # earlier vertex, rendering as a thin line floating away from the zone). Runs after every
@@ -2921,17 +2694,6 @@ def compute_field_zones(
     zones = []
     for mask, geom in final_entries:
         geom = _remove_self_touching_spikes(geom, transformer)
-        # mask can be stale relative to geom by this point - the gap-fill/overlap-dedup/dust-strip
-        # sweep above (and _remove_self_touching_spikes just above) mutate geom repeatedly without
-        # ever updating its paired mask, so sample-point selection just below (which reads pixels
-        # via mask) can end up choosing points scattered across a much bigger area than the zone's
-        # actual final geometry. Verified on a real field (127, "Tworzanice 60"): a zone collapsed
-        # to 0.02ha by this sweep still carried its original ~4ha mask, producing 15 sample points
-        # spread over ~120m, none of them anywhere near the tiny final polygon. Rebuilding mask
-        # from geom here - the same _shapely_contains-based recipe already used above when merging
-        # two zones - keeps them in sync regardless of which upstream step last reshaped geom.
-        if geom is not None and not geom.is_empty:
-            mask = valid & _shapely_contains(geom, grid_lon, grid_lat)
         entry = _zone_entry(mask, geom)
         if entry is not None:
             zones.append(entry)
@@ -2945,72 +2707,59 @@ def compute_field_zones(
         z["zone_id"] = zone_id
 
     # Reorders the zones themselves into a spatial visiting sequence (greedy nearest-neighbor
-    # tour) and, per zone, picks WHICH of its own candidate bisecting chords to actually use as
-    # its sample-point guide line (see _select_connected_chord/SAMPLE_POINT_CONTINUITY_DISTANCE_
-    # WEIGHT), so that walking every zone's points in the order returned here traces lines that
-    # connect end-to-start across several neighboring zones, not just within one zone in
-    # isolation - requested directly with a hand-drawn reference showing several zones' lines
-    # meeting at their shared corners, forming one zigzagging path across a whole cluster rather
-    # than an isolated line per zone reached in arbitrary order.
+    # tour) and chooses, for each zone, whether to walk its own chord forward or reversed, so
+    # that walking every zone's points in the order returned here traces lines that connect
+    # end-to-start across several neighboring zones, not just within one zone in isolation -
+    # requested directly with a hand-drawn reference showing several zones' lines meeting at
+    # their shared corners, forming one zigzagging path across a whole cluster rather than an
+    # isolated line per zone reached in arbitrary order.
     #
-    # sample_points are computed HERE, not in _zone_entry above, precisely because which chord a
-    # zone should use depends on where the PREVIOUS zone visited left off - something only this
-    # tour, walking zones in visiting order, actually knows. An EARLIER version computed every
-    # zone's sample_points independently up front (always the single longest chord) and only
-    # this tour's own choice of forward-vs-reversed connected them after the fact - that could
-    # still leave visibly disconnected lines whenever the longest chord's own two ends both sat
-    # far from the previous zone's end, since reversing a bad-fit chord doesn't make it fit.
+    # An EARLIER version kept zones in their ndvi_mean-sorted array order (the "sorted ascending
+    # by mean NDVI" contract just above) and only chose orientation via a fixed-order DP - but
+    # ndvi rank is rarely a spatial sweep, so consecutive zones in that order were frequently on
+    # opposite sides of the field, leaving the DP little genuinely-adjacent structure to exploit.
+    # zone_id VALUES still reflect ndvi rank (assigned above, before this reordering, and carried
+    # per-feature regardless of array position) - nothing reads array position as an implicit
+    # ndvi ranking (checked: the frontend only ever reads the zone_id/ndvi_mean fields directly),
+    # so reordering the array itself for routing purposes doesn't break that contract, only
+    # decouples "which zone_id a feature has" from "where it sits in the features list".
     #
-    # An EVEN EARLIER version kept zones in their ndvi_mean-sorted array order (the "sorted
-    # ascending by mean NDVI" contract just above) and only chose orientation via a fixed-order
-    # DP - but ndvi rank is rarely a spatial sweep, so consecutive zones in that order were
-    # frequently on opposite sides of the field, leaving the DP little genuinely-adjacent
-    # structure to exploit. zone_id VALUES still reflect ndvi rank (assigned above, before this
-    # reordering, and carried per-feature regardless of array position) - nothing reads array
-    # position as an implicit ndvi ranking (checked: the frontend only ever reads the zone_id/
-    # ndvi_mean fields directly), so reordering the array itself for routing purposes doesn't
-    # break that contract, only decouples "which zone_id a feature has" from "where it sits in
-    # the features list".
-    #
-    # Greedy nearest-neighbor (not a full TSP solve): starting from zone 0, repeatedly visits
-    # whichever remaining zone has geometry closest to the current zone's own end point - a
-    # well-known, cheap heuristic, good enough for the "best-effort, not a route optimizer" bar
-    # already set for this feature (still true here: not a hard requirement, and this can't find
-    # a perfect tour, just a reasonable one, especially as zone count grows). Zone-to-zone
-    # distance for choosing visiting ORDER uses each candidate zone's whole geometry (cheap - no
-    # chord computation needed just to compare candidates), not its final sample_points, since
-    # those aren't chosen until the zone is actually selected as next; the chord chosen for that
-    # zone right afterward is what actually optimizes the connection, via connect_to.
+    # Greedy nearest-neighbor (not a full TSP solve): starting from zone 0 (forward), repeatedly
+    # visits whichever remaining zone/direction combination has a start point closest to the
+    # current zone's own end - a well-known, cheap heuristic, good enough for the "best-effort,
+    # not a route optimizer" bar already set for this feature (still true here: not a hard
+    # requirement, and this can't find a perfect tour, just a reasonable one, especially as zone
+    # count grows).
     n_zones = len(zones)
-    if n_zones == 1:
-        z = zones[0]
-        z["sample_points"] = _select_sample_points(z["_mask"], z["_geom"], max_sample_points_per_zone)
-    elif n_zones >= 2:
-        first = zones[0]
-        first["sample_points"] = _select_sample_points(first["_mask"], first["_geom"], max_sample_points_per_zone)
+    if n_zones >= 2:
+
+        def _dist2(a, b) -> float:
+            return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
         order = [0]
+        chosen_points = [zones[0]["sample_points"]]
         remaining = set(range(1, n_zones))
-        cur_end = first["sample_points"][-1] if first["sample_points"] else None
-
         while remaining:
-            best_idx, best_dist = None, None
+            cur_points = chosen_points[-1]
+            cur_end = cur_points[-1] if cur_points else None
+            best_idx, best_points, best_cost = None, None, None
             for idx in remaining:
-                geom = zones[idx]["_geom"]
-                dist = 0.0 if cur_end is None or geom is None else geom.distance(Point(cur_end))
-                if best_dist is None or dist < best_dist:
-                    best_idx, best_dist = idx, dist
-
-            z = zones[best_idx]
-            connect_to_utm = None if cur_end is None else Point(transformer.transform(cur_end[0], cur_end[1]))
-            z["sample_points"] = _select_sample_points(
-                z["_mask"], z["_geom"], max_sample_points_per_zone, connect_to=connect_to_utm
-            )
+                candidates = zones[idx]["sample_points"]
+                for candidate_points in (candidates, list(reversed(candidates))):
+                    entry_point = candidate_points[0] if candidate_points else None
+                    cost = 0.0 if cur_end is None or entry_point is None else _dist2(cur_end, entry_point)
+                    if best_cost is None or cost < best_cost:
+                        best_cost, best_idx, best_points = cost, idx, candidate_points
             order.append(best_idx)
+            chosen_points.append(best_points)
             remaining.discard(best_idx)
-            if z["sample_points"]:
-                cur_end = z["sample_points"][-1]
 
-        zones = [zones[idx] for idx in order]
+        reordered_zones = []
+        for idx, points in zip(order, chosen_points):
+            z = zones[idx]
+            z["sample_points"] = points
+            reordered_zones.append(z)
+        zones = reordered_zones
 
     return {
         "type": "FeatureCollection",

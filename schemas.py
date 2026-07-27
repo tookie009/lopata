@@ -101,16 +101,6 @@ class FieldZonesRequest(BaseModel):
             "walidacja ponizej i docstring single_zone_override w field_zones.compute_field_zones."
         ),
     )
-    exclusion_polygons: list[list[tuple[float, float]]] | None = Field(
-        None,
-        description=(
-            "Opcjonalna lista wielokatow (kazdy jako pojedynczy pierscien [lon, lat], WGS84) "
-            "wylaczonych z probkowania w obrebie tego pola (staw/budynek/linia energetyczna...) - "
-            "odejmowane od zone_polygon (lub od calego polygon, gdy zone_polygon nie podano) PRZED "
-            "budowa stref, wiec zadna strefa ani sample_point nie powstanie w ich obrebie. Patrz "
-            "compute_field_zones's docstring."
-        ),
-    )
 
     @field_validator("polygon")
     @classmethod
@@ -123,17 +113,6 @@ class FieldZonesRequest(BaseModel):
         cls, value: list[tuple[float, float]] | None
     ) -> list[tuple[float, float]] | None:
         return _validate_lonlat_polygon(value) if value is not None else None
-
-    @field_validator("exclusion_polygons")
-    @classmethod
-    def _validate_exclusion_polygons(
-        cls, value: list[list[tuple[float, float]]] | None
-    ) -> list[list[tuple[float, float]]] | None:
-        if value is None:
-            return None
-        for polygon in value:
-            _validate_lonlat_polygon(polygon)
-        return value
 
     @model_validator(mode="after")
     def _validate_single_zone_override(self) -> "FieldZonesRequest":

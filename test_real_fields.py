@@ -12,13 +12,6 @@ lon/lat, calls compute_field_zones at 1.0/2.0/3.0/4.0ha for each field, and repo
 would look wrong on the map: a zone over its target_max_ha cap, a zone under 1 pixel's worth of
 area (a degenerate sliver), or more zones than the ideal ceil(field_area/target).
 
-A field entry may optionally carry an "exclusions" key - a list of WKT rings (same EPSG:2180
-convention as wkt_2180) excluded from sampling within that field (pond/building/power line...).
-When present, every returned zone and sample_point is additionally checked against the union of
-those exclusions (see _check_exclusions below) - reprojected via the same _wkt_to_lonlat helper
-and passed to compute_field_zones as exclusion_polygons_lonlat. Omit the key entirely (the
-default for every existing entry) for "no exclusions" - unchanged behavior.
-
 Run this after any change to field_zones.py, before pushing - it's the fastest way to catch a
 regression against every real field already known to have exposed a bug this session, instead of
 re-deriving reproduction steps from scratch each time.
@@ -26,11 +19,7 @@ re-deriving reproduction steps from scratch each time.
 
 import math
 
-import numpy as np
 from pyproj import Transformer
-from shapely.geometry import Polygon, shape
-from shapely.ops import unary_union
-from shapely.vectorized import contains as _shapely_contains
 
 import field_zones as fz
 
@@ -196,26 +185,6 @@ FIELDS = [
             "322894.416134821 417617.961418313, 322865.440519103 417673.922003122))"
         ),
     },
-    {
-        "field_id": 369,
-        "name": "Bełcz Wielki 288",
-        "wkt_2180": (
-            "POLYGON ((317734.037248305 421672.764327361, 317675.732645355 421650.069200154, "
-            "317646.952161015 421637.766808175, 317620.026028503 421623.629528131, "
-            "317640.30026766 421603.907338141, 317734.612258964 421446.799382376, "
-            "317755.048295998 421454.95722094, 317809.562423461 421462.208581606, "
-            "317881.413698832 421464.49387734, 317995.665294163 421450.143102633, "
-            "318130.319966961 421432.783736277, 318171.107409146 421426.126976953, "
-            "318241.417863191 421426.863811485, 318348.61965217 421435.753109713, "
-            "318389.43411876 421439.832980609, 318505.355106704 421446.653436433, "
-            "318543.866587376 421525.673873149, 318365.234978209 421658.443291507, "
-            "318223.489187282 421760.266230517, 318085.900362888 421859.033135546, "
-            "318054.561944289 421840.98739975, 317953.581732094 421783.426530764, "
-            "317913.163466091 421760.096621441, 317858.355520951 421728.466108583, "
-            "317815.934204398 421706.333292574, 317777.829874377 421690.639553031, "
-            "317734.037248305 421672.764327361))"
-        ),
-    },
 ]
 
 TARGET_SIZES_HA = [1.0, 2.0, 3.0, 4.0]
@@ -228,85 +197,16 @@ def _wkt_to_lonlat(wkt_2180: str) -> list[tuple[float, float]]:
     return [transformer.transform(x, y) for x, y in pairs]
 
 
-SAMPLE_POINT_MAX_STEP_FRACTION_OF_DIAGONAL = 0.5
-
-
-def _check_sample_point_continuity(result: dict) -> list[str]:
-    """Flags a zone whose ordered sample_points contain a consecutive-step distance that's large
-    relative to the ZONE'S OWN SIZE (bounding-box diagonal, in meters) - the signature of a route
-    jumping between two disconnected clusters instead of tracing one coherent line (reported live
-    on field 369 "Bełcz Wielki 288": a ~3.9ha zone's route jumped ~100-1800m to an
-    abandoned-then-resumed cluster, comparable to or exceeding the zone's own extent).
-
-    Deliberately NOT a step-to-step ratio (max/median): tried first and rejected - at small
-    target_plot_size_ha, median spacing is naturally tiny (~10-15m, close to pixel resolution),
-    so the ordinary endpoint-extension pass in _compute_zone_sample_points (which replaces each
-    end with the most extreme still-unused candidate, reaching a few extra tens of meters to the
-    chord's true tip) trips a ratio-based check on nearly every zone in the existing corpus with
-    no real bug present - confirmed experimentally, false positives on 6 of the 6 already-known
-    fields. Comparing against the zone's own diagonal instead stays meaningful across every zone
-    size/target combination and doesn't confuse a normal tip-reaching step with an actual
-    disconnected-cluster jump.
-
-    Needs >= 4 points (>= 3 steps) to have anything meaningful to check."""
-    issues = []
-    for feature in result["features"]:
-        points = feature["properties"].get("sample_points") or []
-        if len(points) < 4:
-            continue
-        transformer = fz._to_utm_transformer(points[0][0], points[0][1])
-        xs, ys = transformer.transform([p[0] for p in points], [p[1] for p in points])
-        pts_m = np.column_stack([xs, ys])
-        steps = np.hypot(*(pts_m[1:] - pts_m[:-1]).T)
-        max_step = steps.max()
-
-        minx, miny, maxx, maxy = shape(feature["geometry"]).bounds
-        (cx0, cx1), (cy0, cy1) = transformer.transform([minx, maxx], [miny, maxy])
-        diagonal_m = math.hypot(cx1 - cx0, cy1 - cy0)
-        if diagonal_m <= 1e-6:
-            continue
-
-        if max_step > SAMPLE_POINT_MAX_STEP_FRACTION_OF_DIAGONAL * diagonal_m:
-            issues.append(
-                f"zone {feature['properties'].get('zone_id')} sample_points jump {max_step:.0f}m, "
-                f"{100 * max_step / diagonal_m:.0f}% of the zone's own {diagonal_m:.0f}m diagonal "
-                "- possible disconnected-cluster route"
-            )
-    return issues
-
-
-def _check_exclusions(result: dict, exclusion_union) -> list[str]:
-    """Checks every returned zone geometry and sample_point against the union of a field's
-    exclusion polygons (both already in lon/lat, matching result's own CRS) - returns a list of
-    issue strings, empty if clean."""
-    issues = []
-    for feature in result["features"]:
-        zone_geom = shape(feature["geometry"])
-        overlap = zone_geom.intersection(exclusion_union).area
-        if overlap > 1e-10:
-            issues.append(f"zone {feature['properties'].get('zone_id')} overlaps an exclusion ({overlap:.2e} deg^2)")
-        for lon, lat in feature["properties"].get("sample_points") or []:
-            if _shapely_contains(exclusion_union, np.array([lon]), np.array([lat]))[0]:
-                issues.append(f"sample_point ({lon}, {lat}) falls inside an exclusion")
-    return issues
-
-
 def run() -> bool:
     """Returns True if every field/target combination looks clean, False if anything worth a
     second look was found - printed either way."""
     all_ok = True
     for field in FIELDS:
         polygon = _wkt_to_lonlat(field["wkt_2180"])
-        exclusion_wkts = field.get("exclusions") or []
-        exclusion_polygons = [_wkt_to_lonlat(wkt) for wkt in exclusion_wkts]
-        exclusion_union = unary_union([Polygon(ring) for ring in exclusion_polygons]) if exclusion_polygons else None
         print(f"=== field {field['field_id']} \"{field['name']}\" ===")
         for target_ha in TARGET_SIZES_HA:
             result = fz.compute_field_zones(
-                polygon_lonlat=polygon,
-                target_plot_size_ha=target_ha,
-                field_id=field["field_id"],
-                exclusion_polygons_lonlat=exclusion_polygons or None,
+                polygon_lonlat=polygon, target_plot_size_ha=target_ha, field_id=field["field_id"]
             )
             areas = sorted(f["properties"]["area_ha"] for f in result["features"])
             types = [f["geometry"]["type"] for f in result["features"]]
@@ -322,9 +222,6 @@ def run() -> bool:
                 issues.append("degenerate near-zero-area zone")
             if result["n_zones"] > ideal_n_zones:
                 issues.append(f"more zones than ideal (ideal={ideal_n_zones})")
-            issues.extend(_check_sample_point_continuity(result))
-            if exclusion_union is not None:
-                issues.extend(_check_exclusions(result, exclusion_union))
 
             status = "OK" if not issues else "CHECK: " + "; ".join(issues)
             if issues:
