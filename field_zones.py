@@ -105,28 +105,28 @@ BISECTING_CHORD_BISECTION_ITERATIONS = 20
 # policy as the rest of this function) rather than leaving a target slot without a point at all.
 SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES = 30.0
 # A candidate whose best achievable (t,s) distance from its target position exceeds this many
-# times the zone's own expected point-to-point spacing (chord_len / max_points) is rejected for
-# that target - see SAMPLE_POINT_MIN_ACCEPT_FRACTION just below for what happens next. Exists
-# because the greedy target-matching loop had no upper bound on this distance at all - confirmed
-# on a real field (369, "Bełcz Wielki 288"): a genuinely convex zone (ruling out a shape-based
-# explanation) had a real gap in nearby candidate density for part of its guide line, and the
-# unbounded search reached ~111m sideways (vs ~17m expected spacing) to fill two targets there,
-# producing an isolated jump amid otherwise tight, even spacing.
+# times the zone's own expected point-to-point spacing (chord_len / max_points) is preferred
+# against for that target on the FIRST pass - see the backfill pass in _compute_zone_sample_points
+# for what happens to a target skipped this way. Exists because the greedy target-matching loop
+# had no upper bound on this distance at all - confirmed on a real field (369, "Bełcz Wielki 288"):
+# a genuinely convex zone (ruling out a shape-based explanation) had a real gap in nearby candidate
+# density for part of its guide line, and the unbounded search reached ~111m sideways (vs ~17m
+# expected spacing) to fill two targets there, producing an isolated jump amid otherwise tight,
+# even spacing.
+#
+# krecik (the frontend) requires the backend to actually deliver max_points candidates for a zone
+# - it discards the WHOLE set and substitutes a purely geometric, NDVI-blind grid the moment even
+# one is short (see point.service.ts's ndviAwarePoints). So this cap is deliberately a two-pass
+# preference, not a hard rejection: pass 1 skips over-reaching targets to keep the common case
+# tight and jump-free; a backfill pass then fills any still-empty slots from whatever real
+# candidates remain, WITHOUT this cap, so the zone still ends up with exactly max_points whenever
+# it physically has that many candidate pixels at all. Only the handful of targets pass 1 couldn't
+# fill cleanly ever pay the "reach further" cost - most of the zone stays on the clean, capped
+# line. A first version made the cap a hard skip with no backfill (SAMPLE_POINT_MIN_ACCEPT_FRACTION,
+# now removed) - it fixed the isolated-jump bug but then regularly under-filled zones, which
+# krecik's all-or-nothing frontend check turned into full random-grid replacements on production
+# more often than the original bug ever did.
 SAMPLE_POINT_MAX_REACH_MULTIPLE = 3.0
-# If skipping over-reaching targets (see SAMPLE_POINT_MAX_REACH_MULTIPLE) leaves fewer than this
-# fraction of max_points actually placed, the straight guide-line chord is judged a poor fit for
-# THIS zone's real candidate distribution (not just one isolated gap, but scarcity spread widely
-# enough that skipping alone can't patch it) - the whole zone abandons the chord and falls back to
-# the same maximize-mutual-distance spread already used when there's no usable chord at all (see
-# guide_line is None below). A first version only skipped individual over-reaching targets with no
-# whole-zone escape hatch - verified on a real field (127, "Tworzanice 60") this could leave a zone
-# with a fragmented, blob-shaped handful of points (11 of 15, aspect ratio 2.5 vs 4-30 for every
-# other zone on that field) instead of either a clean line or a sensible spread - a real regression
-# reported directly against production, worse than the original isolated-jump bug it replaced.
-# Falling back to the whole-zone spread instead of patching a struggling chord avoids inventing a
-# new partial-recovery heuristic on top of an already-intricate function - reuses a mechanism this
-# file already relies on and has already proven out for the "no chord" case.
-SAMPLE_POINT_MIN_ACCEPT_FRACTION = 0.8
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
@@ -431,6 +431,20 @@ def _remove_self_touching_spikes(geom, transformer: Transformer):
         new_poly = Polygon(cleaned_lonlat, list(poly.interiors))
         if not new_poly.is_valid:
             new_poly = _safe_buffer0(new_poly)
+        # A real spike is ~zero-width by definition (the whole point of splicing it out), so a
+        # legitimate removal barely changes the ring's enclosed area. Verified on a real subfield-
+        # scoped request (a manually-drawn "dzialka" subfield with a long, near-collinear raster-
+        # staircase edge - many vertex pairs only sub-mm apart in UTM meters, exactly what this
+        # function looks for): the splice-out loop kept finding another "detour" to cut on each
+        # pass and collapsed the entire ring down to a degenerate, ~zero-area polygon that still
+        # reported is_valid=True - silently discarding the whole zone (reached the response as an
+        # empty FeatureCollection) instead of removing a real spike. Falling back to the original,
+        # uncleaned polygon whenever the result loses more than a token amount of area keeps this
+        # function's actual job (a cosmetic fix for a rendering artifact) from ever being able to
+        # destroy real, reportable field area - the same "give up gracefully" direction every other
+        # risky geometry op in this file already takes (_safe_buffer0/_safe_union/_safe_intersection).
+        if poly.area > 0 and new_poly.area < 0.9 * poly.area:
+            return poly
         return new_poly
 
     if geom.geom_type == "Polygon":
@@ -1647,9 +1661,10 @@ def _compute_zone_sample_points(
 
     def _farthest_point_fallback() -> list[list[float]]:
         """Maximize-mutual-distance spread over every real candidate in the zone, ignoring the
-        guide line entirely - used both when there's no usable chord at all, and (see
-        SAMPLE_POINT_MIN_ACCEPT_FRACTION) when there is one but it's a poor fit for this zone's
-        actual candidate distribution."""
+        guide line entirely - used only when there's no usable chord at all (degenerate/near-zero
+        -area zone, or every candidate direction failed). A poor-fitting chord no longer routes
+        here: the reach-capped pass plus its uncapped backfill (see SAMPLE_POINT_MAX_REACH_MULTIPLE)
+        now fill max_points directly off the chord instead of abandoning it wholesale."""
         safe_idx_local = np.where(ndvi_safe)[0]
         pool = points_m[safe_idx_local] if len(safe_idx_local) >= max_points else points_m
         pool_lons = lons[safe_idx_local] if len(safe_idx_local) >= max_points else lons
@@ -1814,19 +1829,20 @@ def _compute_zone_sample_points(
         return _turn_violation_degrees(candidate_idx) <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES
 
     # A target with no real candidate within this distance of its ideal (t_target, 0) position is
-    # skipped outright below rather than forced onto whatever's nearest however far that is - see
-    # SAMPLE_POINT_MAX_REACH_MULTIPLE's own docstring for the real bug this closes.
+    # preferred against on the first pass below - see SAMPLE_POINT_MAX_REACH_MULTIPLE's own
+    # docstring for the real bug this closes and why a second, uncapped backfill pass follows it.
     max_reach2 = (SAMPLE_POINT_MAX_REACH_MULTIPLE * (chord_len / max_points)) ** 2
 
-    for t_target, s_target in targets:
-        # Search BOTH pools before accepting a turn-violating pick - the previous version broke
-        # out after the safe pool as soon as it had ANY available candidate, even if every one of
-        # them violated the turn-angle limit and it fell back to nearest-to-target regardless of
-        # angle, without ever trying the unsafe pool (which might have held a compliant one).
-        # Confirmed on a real field/zone: this was the actual source of several 148-168 degree
-        # turns that the insertion-aware check above was supposed to prevent but didn't, because
-        # it was only ever consulted for its pass/fail verdict, never for "how bad is the least
-        # bad option" when nothing in reach fully complies.
+    def _best_candidate(t_target: float, s_target: float, max_dist2: float | None) -> int | None:
+        """Search BOTH pools before accepting a turn-violating pick - a previous version broke
+        out after the safe pool as soon as it had ANY available candidate, even if every one of
+        them violated the turn-angle limit and it fell back to nearest-to-target regardless of
+        angle, without ever trying the unsafe pool (which might have held a compliant one).
+        Confirmed on a real field/zone: this was the actual source of several 148-168 degree
+        turns that the insertion-aware check above was supposed to prevent but didn't, because
+        it was only ever consulted for its pass/fail verdict, never for "how bad is the least
+        bad option" when nothing in reach fully complies. `max_dist2=None` disables the reach
+        cap entirely - used by the backfill pass below."""
         best_pick = None
         best_pick_dist2 = None
         best_violation = None
@@ -1857,22 +1873,34 @@ def _compute_zone_sample_points(
             if picked_good:
                 break
         if best_pick is None:
-            continue
-        if best_pick_dist2 is not None and best_pick_dist2 > max_reach2:
-            # Nothing close enough for this target - skip it (see SAMPLE_POINT_MAX_REACH_MULTIPLE)
-            # rather than force a distant jump. SAMPLE_POINT_MIN_ACCEPT_FRACTION below catches the
-            # case where too many targets end up skipped this way.
-            continue
-        used[best_pick] = True
-        sorted_chosen.insert(_insertion_pos(best_pick), best_pick)
+            return None
+        if max_dist2 is not None and best_pick_dist2 is not None and best_pick_dist2 > max_dist2:
+            return None
+        return best_pick
 
-    if len(sorted_chosen) < SAMPLE_POINT_MIN_ACCEPT_FRACTION * max_points:
-        # Too many targets skipped over-reaching candidates (see SAMPLE_POINT_MAX_REACH_MULTIPLE)
-        # for this to be a real gap the endpoint-extension pass below could reasonably patch up -
-        # the guide line just doesn't fit this zone's actual candidate distribution well enough.
-        # Abandon it entirely rather than return/extend a fragmented partial result - see
-        # SAMPLE_POINT_MIN_ACCEPT_FRACTION's own docstring for the real regression this avoids.
-        return _farthest_point_fallback()
+    skipped_targets: list[tuple[float, float]] = []
+    for t_target, s_target in targets:
+        pick = _best_candidate(t_target, s_target, max_reach2)
+        if pick is None:
+            skipped_targets.append((t_target, s_target))
+            continue
+        used[pick] = True
+        sorted_chosen.insert(_insertion_pos(pick), pick)
+
+    # Backfill: krecik requires max_points candidates from this endpoint or it discards the whole
+    # set for its own NDVI-blind geometric grid (see SAMPLE_POINT_MAX_REACH_MULTIPLE's docstring),
+    # so under-filling is not an acceptable outcome here. Retry each target the first pass skipped,
+    # this time with no reach cap - still preferring a turn-compliant, nearest-available real
+    # candidate, just no longer rejecting it for being far. Only the targets that genuinely had
+    # nothing close pay this cost; the rest of the zone already got its clean, capped placement.
+    for t_target, s_target in skipped_targets:
+        if len(sorted_chosen) >= max_points:
+            break
+        pick = _best_candidate(t_target, s_target, None)
+        if pick is None:
+            continue
+        used[pick] = True
+        sorted_chosen.insert(_insertion_pos(pick), pick)
 
     # Try to extend each end further out toward the chord's own t=0/t=chord_len ends by
     # REPLACING that end's point with a more extreme one - reaching the chord's full length is
@@ -2092,7 +2120,21 @@ def compute_field_zones(
     # field, target=1.0ha: n_zones now starts at 16 instead of clamping to 12 and relying on the
     # reactive over-cap/bisection-retry safety valve to claw its way back up afterward).
     max_zones_for_request = max(MAX_ZONES, math.ceil(field_area_ha / target_max_ha))
-    n_zones = max(MIN_ZONES, min(max_zones_for_request, n_zones))
+    # MIN_ZONES is a floor for when the area being divided genuinely needs splitting - it must
+    # NOT apply when field_area_ha already fits within target_plot_size_ha on its own (the ceil()
+    # above already came out to 1 in exactly that case, since ceil(x) <= 1 iff x <= 1). Forcing a
+    # split there produces zones that are all undersized relative to what was actually asked for -
+    # not a real division, just noise. Reported directly: a manually pre-drawn subfield (zone_
+    # polygon, e.g. 1.96ha) already under the default 4ha target still came back split into 2
+    # zones, because single_zone_override - the only OTHER way to get n_zones=1 - is deliberately
+    # unavailable for a subfield-scoped request (see that field's own docstring/schemas.py's
+    # validator: it's reserved for "the whole registered field", not a manually-drawn piece of
+    # it). This mirrors what the frontend's own equal-area sibling already does unconditionally -
+    # FieldDivisionService.divideFieldByHectares returns a single, unsplit part whenever
+    # targetAreaHa >= fieldAreaHa, no override flag needed - so field-zones should behave the same
+    # way for both the whole-field and the subfield-scoped case.
+    effective_min_zones = 1 if field_area_ha <= target_plot_size_ha else MIN_ZONES
+    n_zones = max(effective_min_zones, min(max_zones_for_request, n_zones))
 
     # Size the analysis raster from the requested ground resolution, capped for
     # request-size/performance reasons (Sentinel Hub payload + local processing time).
@@ -2177,7 +2219,10 @@ def compute_field_zones(
 
     valid_values = smoothed_ndvi[valid]
     actual_n_zones = min(n_zones, len(np.unique(valid_values)))
-    actual_n_zones = max(MIN_ZONES, actual_n_zones)
+    # Same effective_min_zones as above, not a flat MIN_ZONES - otherwise this would silently
+    # re-force the split n_zones just correctly avoided back up to 2 whenever the area fits
+    # within target_plot_size_ha on its own.
+    actual_n_zones = max(effective_min_zones, actual_n_zones)
 
     # Computed here (rather than only after construction, as before) so "contiguous" can cap
     # each zone's own growth target against it from the start - see max_pixels's docstring on
