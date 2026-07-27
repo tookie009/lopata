@@ -68,6 +68,50 @@ przypadek (trójkąt) i typowe łagodne wybrzuszenia działają poprawnie - ale 
 zgłoszono strefę w kształcie podkowy/klamry z realnie odizolowanymi punktami, to jest
 źródło, nie kolejny nowy bug.
 
+## Znaleziony i naprawiony bug: self-intersection po reprojekcji do UTM
+
+Realny przykład (pole "Tworzanice 60", 101.89 ha, 26 podpól): jedno konkretne podpole
+miało linię punktów skupioną w wąskim, prawie płaskim pasie zamiast przechodzić przez cały
+kształt. Przyczyna, potwierdzona bezpośrednio na dokładnej geometrii tego podpola: wielokąt
+strefy był **poprawny (valid) w lon/lat**, ale po reprojekcji do UTM
+(`shp_transform(transformer.transform, geom)`) stawał się **self-intersecting (invalid)** -
+różnica precyzji zmiennoprzecinkowej przy reprojekcji w okolicy prawie-stykającego się
+wierzchołka (ta sama klasa problemu co `_remove_self_touching_spikes`, tylko ujawniająca
+się PO reprojekcji, nie przed nią - istniejące usuwanie kolców w lon/lat tego nie łapie).
+
+`_longest_bisecting_chord`'s `Polygon.intersection()` (przez `_safe_intersection`) na takim
+invalid wielokącie **nie rzuca wyjątku** - GEOS po cichu zwraca błędny wynik zamiast
+podnieść `GEOSException`, więc istniejąca obsługa wyjątków w ogóle się nie uruchamia.
+Potwierdzone bezpośrednio: dla tej geometrii funkcja zwracała linię **688.7 m** przy
+przekątnej bounding-boxa strefy ok. 310 m - linia sięgała kawałek poza prawdziwy wielokąt,
+przez co większość celów wzdłuż niej nie miała w pobliżu żadnych prawdziwych kandydatów
+NDVI, a zachłanne dopasowanie ściągnęło punkty w jedno miejsce.
+
+Naprawione (w `_compute_zone_sample_points`, tuż przed wywołaniem
+`_longest_bisecting_chord`): `utm_zone_geom = _safe_buffer0(utm_zone_geom)` - już istniejący
+w tym pliku helper (`geom.buffer(0)`, standardowy trik "renoding" na drobne
+self-intersections, z fallbackiem na precyzyjny grid) naprawia validność z pomijalną zmianą
+pola (`4.6e-9 m²` na tym przykładzie), po czym `_longest_bisecting_chord` zwraca sensowną
+linię (286.6 m, w całości wewnątrz wielokąta). **Zawsze reprojektuj geometrię strefy do UTM
+przez `_safe_buffer0` przed jakąkolwiek operacją geometryczną, która zakłada poprawność
+wielokąta (rotate/intersection) - walidność w lon/lat NIE gwarantuje walidności po
+reprojekcji.**
+
+## Otwarty pomysł (jeszcze niezaimplementowany): ciągłość między strefami
+
+Użytkownik zaproponował: przy wyznaczaniu linii dla nowego podpola faworyzować taką, która
+zaczyna się jak najbliżej miejsca zakończenia linii w poprzednim podpolu (w trasie
+odwiedzania stref), dopóki jej długość nie spadnie poniżej konfigurowalnego progu (np. 70%)
+maksymalnej możliwej długości linii dzielącej to podpole na pół. Celowo NIE
+zaimplementowane od razu przy naprawie powyższego buga - ten jeden zepsuty chord (688m,
+częściowo poza wielokątem) prawdopodobnie tłumaczył większość odczuwalnej utraty
+ciągłości/zygzakowatości trasy na całym polu, więc warto najpierw sprawdzić na realnym
+zrzucie ekranu, czy powyższa naprawa już wystarcza, zanim inwestować w tę cięższą
+heurystykę. Jeśli tak - zostaje jako gotowy, przemyślany pomysł do wdrożenia w
+`_longest_bisecting_chord`/trasie odwiedzania stref w `compute_field_zones` (np. próbować
+kilku kątów blisko optymalnego i wybierać ten, którego chord zaczyna się najbliżej
+poprzedniego końca, akceptując skrót do progu procentowego maksymalnej długości).
+
 ## Historia (dlaczego nie przekątna + wspólna oś PCA)
 
 Wcześniejsza wersja (commity `e3e72dc`..`210eadf`) liczyła jedną wspólną oś PCA dla całego

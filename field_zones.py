@@ -1607,6 +1607,17 @@ def _compute_zone_sample_points(
     if geom is not None and not geom.is_empty:
         try:
             utm_zone_geom = shp_transform(transformer.transform, geom)
+            # geom can be valid in lon/lat yet come out self-intersecting once reprojected to
+            # UTM (floating-point precision at a near-touching vertex - same bug class as
+            # _remove_self_touching_spikes, just surfacing after reprojection instead of before
+            # it). _longest_bisecting_chord's rotate/intersect calls don't raise on an invalid
+            # polygon - GEOS just silently returns a wrong (sometimes wildly too long, partially
+            # outside the polygon) result instead - confirmed on a real ~3.85ha zone: an invalid
+            # UTM polygon produced a 688m "chord" for a zone whose own bounding-box diagonal was
+            # only ~310m. _safe_buffer0 (the standard buffer(0) renoding trick, already used
+            # elsewhere in this file for the same bug class) fixes validity here with a
+            # negligible area change, and _longest_bisecting_chord then returns a sane result.
+            utm_zone_geom = _safe_buffer0(utm_zone_geom)
             guide_line = _longest_bisecting_chord(utm_zone_geom)
         except Exception as e:
             logger.warning("longest-bisecting-chord computation failed, falling back: %s", e)
