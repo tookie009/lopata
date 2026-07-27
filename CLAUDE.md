@@ -41,6 +41,32 @@ osi PCA całego pola, jak we wcześniejszej wersji (patrz "Historia" niżej).
    `diagonal_sign`), więc zachłanna trasa nearest-neighbor między strefami wybiera tylko
    kierunek (do przodu / odwrócona), nie linię x kierunek.
 
+## Naprawiony bug: nieograniczone preferowanie "bezpiecznego" (nie-najgorszego-NDVI) kandydata
+
+`_best_candidate` woli kandydata spoza najgorszych `SAMPLE_POINT_WORST_PERCENTILE`% NDVI ("bezpiecznego")
+nad "niebezpiecznym" - ale wcześniej robiła to bezwarunkowo, niezależnie jak daleko trzeba było po
+niego sięgnąć, dopóki cała pula bezpiecznych kandydatów w strefie nie była wyczerpana. Realny
+przypadek (pole 369 "Bełcz Wielki 288" @4ha): spora, zwarta plama najgorszego NDVI leżała prawie
+dokładnie na osi `_longest_bisecting_chord` tej strefy. Zachłanne dopasowanie, unikając tej plamy,
+ciągnęło 10 kolejnych celów w bok, w stronę najbliższych bezpiecznych pikseli (które akurat leżały
+przy własnej granicy strefy) - każdy pojedynczy krok mieścił się w limicie skrętu
+`SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES`, ale skumulowany dryf dawał widoczną na mapie, "zbyt regularną"
+linię przyklejoną do brzegu strefy zamiast do przekątnej, z dużym skokiem z powrotem po minięciu plamy.
+
+Naprawione: nowa stała `SAFE_PREFERENCE_MAX_REACH_MULTIPLE = 2.5` ogranicza, o ile dalej bezpieczny
+kandydat może być od najbliższego niebezpiecznego, zanim przestaje być preferowany - powyżej tego
+progu zachłanny dobór po prostu akceptuje bliższego "niebezpiecznego" sąsiada zamiast objeżdżać
+plamę. `_best_candidate` liczy teraz NAJLEPSZEGO kandydata w OBU pulach (`_best_in_pool`), zamiast
+przerywać na pierwszym trafieniu w puli bezpiecznej.
+
+**Znany kompromis, świadomie zaakceptowany przez użytkownika**: to poprawia strefy z dużą plamą
+złego NDVI blisko cięciwy, ale na innym polu (320 "Borszyn Wielki 276/4" @2-4ha) wprowadza nowy,
+mniejszy zygzak w jednej strefie (flaga `_check_sample_point_path_efficiency`: trasa 1.5-1.58x
+dłuższa niż optymalna) - ten sam wzorzec "naprawa jednej strefy kosztem innej", który już wcześniej
+występował w tym pliku. Dwie inne próby (lokalna naprawa "wyskoków" post-hoc; zygzak zależny od
+lokalnej szerokości strefy dla stref "klepsydrowych") zostały przetestowane i odrzucone - patrz
+pamięć `ndvi_sample_point_reach_cap_investigation` (2026-07-27) po szczegóły obu ślepych zaułków.
+
 ## Kompromis: brak gwarancji wspólnego kierunku sąsiednich stref
 
 Wspólna oś PCA (usunięta) gwarantowała, że linie sąsiednich stref biegną w tym samym

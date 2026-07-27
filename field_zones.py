@@ -1833,8 +1833,48 @@ def _compute_zone_sample_points(
     # docstring for the real bug this closes and why a second, uncapped backfill pass follows it.
     max_reach2 = (SAMPLE_POINT_MAX_REACH_MULTIPLE * (chord_len / max_points)) ** 2
 
+    # A safe-pool (NDVI-not-worst-20%) candidate is only preferred over a closer unsafe one if
+    # it's not more than this many times farther away - see _best_candidate's docstring for the
+    # real bug this closes.
+    SAFE_PREFERENCE_MAX_REACH_MULTIPLE = 2.5
+
+    def _best_in_pool(pool, t_target: float, s_target: float):
+        """Best (turn-compliant if any, else least-violating) available candidate in one pool -
+        (idx, dist2), or (None, None) if the pool has nothing left to offer."""
+        available = pool[~used[pool]]
+        if len(available) == 0:
+            return None, None
+        dist2 = (t[available] - t_target) ** 2 + (s[available] - s_target) ** 2
+        order = np.argsort(dist2)
+        ranked = available[order]
+        ranked_dist2 = dist2[order]
+        best_pick, best_pick_dist2 = None, None
+        best_violation, best_dist2 = None, None
+        for cand, cand_dist2 in zip(ranked, ranked_dist2):
+            violation = _turn_violation_degrees(cand)
+            if violation <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES:
+                return cand, cand_dist2
+            if best_violation is None or violation < best_violation - 1e-9 or (
+                abs(violation - best_violation) <= 1e-9 and cand_dist2 < best_dist2
+            ):
+                best_violation, best_dist2 = violation, cand_dist2
+                best_pick, best_pick_dist2 = cand, cand_dist2
+        return best_pick, best_pick_dist2
+
     def _best_candidate(t_target: float, s_target: float, max_dist2: float | None) -> int | None:
-        """Search BOTH pools before accepting a turn-violating pick - a previous version broke
+        """Evaluates BOTH pools and bounds how much farther a safe pick is allowed to be than the
+        nearest unsafe one (SAFE_PREFERENCE_MAX_REACH_MULTIPLE), rather than unconditionally
+        preferring ANY safe candidate over a much closer unsafe one. A large contiguous
+        worst-NDVI patch sitting near the chord could otherwise pull a whole run of consecutive
+        targets sideways toward whichever safe pixels happened to be nearest (often the zone's
+        own boundary) - each individual step small enough to pass the turn-angle check alone, but
+        compounding into a real detour (confirmed on a real zone: field 369 "Belcz Wielki 288"
+        @4ha, 10 consecutive points hugging the zone's own boundary instead of its chord, before a
+        large jump back once the patch was behind them). Bounding the safe-preference reach keeps
+        the path close to the chord through a bad patch (accepting an occasional worst-20% pixel)
+        instead of detouring far around it.
+
+        Search BOTH pools before accepting a turn-violating pick - a previous version broke
         out after the safe pool as soon as it had ANY available candidate, even if every one of
         them violated the turn-angle limit and it fell back to nearest-to-target regardless of
         angle, without ever trying the unsafe pool (which might have held a compliant one).
@@ -1843,38 +1883,22 @@ def _compute_zone_sample_points(
         it was only ever consulted for its pass/fail verdict, never for "how bad is the least
         bad option" when nothing in reach fully complies. `max_dist2=None` disables the reach
         cap entirely - used by the backfill pass below."""
-        best_pick = None
-        best_pick_dist2 = None
-        best_violation = None
-        best_dist2 = None
-        picked_good = False
-        for pool in (safe_idx, unsafe_idx):
-            available = pool[~used[pool]]
-            if len(available) == 0:
-                continue
-            dist2 = (t[available] - t_target) ** 2 + (s[available] - s_target) ** 2
-            order = np.argsort(dist2)
-            ranked = available[order]
-            ranked_dist2 = dist2[order]
-            for cand, cand_dist2 in zip(ranked, ranked_dist2):
-                violation = _turn_violation_degrees(cand)
-                if violation <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES:
-                    best_pick = cand
-                    best_pick_dist2 = cand_dist2
-                    picked_good = True
-                    break
-                if best_violation is None or violation < best_violation - 1e-9 or (
-                    abs(violation - best_violation) <= 1e-9 and cand_dist2 < best_dist2
-                ):
-                    best_violation = violation
-                    best_dist2 = cand_dist2
-                    best_pick = cand
-                    best_pick_dist2 = cand_dist2
-            if picked_good:
-                break
-        if best_pick is None:
+        safe_pick, safe_dist2 = _best_in_pool(safe_idx, t_target, s_target)
+        unsafe_pick, unsafe_dist2 = _best_in_pool(unsafe_idx, t_target, s_target)
+
+        if safe_pick is not None and unsafe_pick is not None:
+            reach_limit = SAFE_PREFERENCE_MAX_REACH_MULTIPLE ** 2 * max(unsafe_dist2, 1e-9)
+            best_pick, best_pick_dist2 = (
+                (safe_pick, safe_dist2) if safe_dist2 <= reach_limit else (unsafe_pick, unsafe_dist2)
+            )
+        elif safe_pick is not None:
+            best_pick, best_pick_dist2 = safe_pick, safe_dist2
+        elif unsafe_pick is not None:
+            best_pick, best_pick_dist2 = unsafe_pick, unsafe_dist2
+        else:
             return None
-        if max_dist2 is not None and best_pick_dist2 is not None and best_pick_dist2 > max_dist2:
+
+        if max_dist2 is not None and best_pick_dist2 > max_dist2:
             return None
         return best_pick
 
