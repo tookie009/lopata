@@ -13,7 +13,6 @@ from shapely.ops import transform as shp_transform
 from shapely.ops import linemerge, polygonize, unary_union
 from shapely.vectorized import contains as _shapely_contains
 
-from geometry_utils import points_in_polygon
 from ndvi import fetch_best_vegetation_ndvi_array
 
 logger = logging.getLogger(__name__)
@@ -1856,6 +1855,7 @@ def compute_field_zones(
     field_id: int | None = None,
     zone_polygon_lonlat: list[tuple[float, float]] | None = None,
     single_zone_override: bool = False,
+    exclusion_polygons_lonlat: list[list[tuple[float, float]]] | None = None,
 ) -> dict:
     """Builds zones by seeded region growing (see _balanced_contiguous_zones) - each zone is
     grown outward from a seed pixel to an explicit, near-equal pixel-count share of the field, so
@@ -1894,6 +1894,12 @@ def compute_field_zones(
     heavily tuned. Still gets real NDVI-aware sample_points (via _compute_zone_sample_points),
     same as every normally-sized zone - the whole point of doing this in lopata rather than
     letting the frontend fall back to blind geometric point placement for an oversized zone.
+
+    exclusion_polygons_lonlat: optional list of polygons (pond/building/power line...) to keep
+    out of sampling entirely - each subtracted from zone_polygon as a hole before anything else
+    runs, so field_area_ha, n_zones, valid-pixel masking and every returned zone/sample_point are
+    already scoped to the field/subfield MINUS these areas. None/empty means "no exclusions"
+    (today's only behavior, unchanged).
     """
     field_polygon = Polygon(polygon_lonlat)
     if not field_polygon.is_valid or field_polygon.area == 0:
@@ -1907,6 +1913,20 @@ def compute_field_zones(
             )
     else:
         zone_polygon = field_polygon
+
+    if exclusion_polygons_lonlat:
+        exclusion_union = _safe_union([Polygon(ring) for ring in exclusion_polygons_lonlat])
+        zone_polygon = _polygonal_only(_safe_difference(zone_polygon, exclusion_union))
+        if not zone_polygon.is_valid:
+            # Same known failure mode noted throughout this file (e.g. _compute_zone_sample_points'
+            # UTM-reprojection case) - a fresh hole/notch from the subtraction can renode into a
+            # minor self-intersection; buffer(0) is the standard GEOS fix.
+            zone_polygon = _safe_buffer0(zone_polygon)
+        if not zone_polygon.is_valid or zone_polygon.area == 0:
+            raise ValueError(
+                "Po odjeciu wylaczonych obszarow wielokat strefy jest niepoprawny lub ma zerowa powierzchnie "
+                "(wylaczenia prawdopodobnie pokrywaja cala strefe)"
+            )
 
     # Raster-fetch extent (bbox/UTM origin) always comes from the full polygon_lonlat, even when
     # zone_polygon is smaller - this is what lets repeated calls for different sub-regions of the
@@ -2021,10 +2041,11 @@ def compute_field_zones(
     lat_centers = (lat_edges[:-1] + lat_edges[1:]) / 2
     grid_lon, grid_lat = np.meshgrid(lon_centers, lat_centers)
 
-    poly_xy = np.asarray(zone_polygon.exterior.coords)
-    inside = points_in_polygon(
-        grid_lon.ravel(), grid_lat.ravel(), poly_xy[:, 0], poly_xy[:, 1]
-    ).reshape(grid_lon.shape)
+    # _shapely_contains (not the points_in_polygon ray-cast this replaced) is hole-aware - it
+    # delegates to real GEOS containment on the full geometry, so a zone_polygon with a hole
+    # (a field exclusion subtracted above) correctly excludes those pixels from the very first
+    # mask built, rather than only in the later per-zone masks that already used it.
+    inside = _shapely_contains(zone_polygon, grid_lon, grid_lat)
 
     valid = inside & (data_mask > 0)
     if not np.any(valid):
@@ -2482,6 +2503,21 @@ def compute_field_zones(
     )
     final_entries = [
         (mask, geom) for (mask, _orig_geom), geom in zip(final_entries, resimplified)
+    ]
+
+    # Same reasoning as the first simplify pass's own re-clip earlier in this function (search
+    # "re-clipping here guarantees the final output still never exceeds it"): Douglas-Peucker has
+    # no "stay inside zone_polygon" constraint, so this second/final resimplification pass can
+    # just as easily bulge a zone's boundary past zone_polygon's edge as the first pass could past
+    # the field's own outer edge - including INTO a hole (a field exclusion subtracted from
+    # zone_polygon at the top of this function). Nothing between here and the response ever
+    # re-clips again, so this is the actual last chance to enforce "no returned zone exceeds
+    # zone_polygon" - verified experimentally: without this, a zone could still carry a few
+    # hundred m^2 of overlap into an exclusion purely from this resimplify pass, even though every
+    # earlier stage (raw mask intersection, first simplify's own re-clip) already excluded it.
+    final_entries = [
+        (mask, _polygonal_only(_safe_intersection(geom, zone_polygon)) if geom is not None and not geom.is_empty else geom)
+        for mask, geom in final_entries
     ]
 
     # Simplification has no "stay inside the original shape" constraint (same reasoning as the

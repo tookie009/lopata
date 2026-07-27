@@ -12,6 +12,13 @@ lon/lat, calls compute_field_zones at 1.0/2.0/3.0/4.0ha for each field, and repo
 would look wrong on the map: a zone over its target_max_ha cap, a zone under 1 pixel's worth of
 area (a degenerate sliver), or more zones than the ideal ceil(field_area/target).
 
+A field entry may optionally carry an "exclusions" key - a list of WKT rings (same EPSG:2180
+convention as wkt_2180) excluded from sampling within that field (pond/building/power line...).
+When present, every returned zone and sample_point is additionally checked against the union of
+those exclusions (see _check_exclusions below) - reprojected via the same _wkt_to_lonlat helper
+and passed to compute_field_zones as exclusion_polygons_lonlat. Omit the key entirely (the
+default for every existing entry) for "no exclusions" - unchanged behavior.
+
 Run this after any change to field_zones.py, before pushing - it's the fastest way to catch a
 regression against every real field already known to have exposed a bug this session, instead of
 re-deriving reproduction steps from scratch each time.
@@ -19,7 +26,11 @@ re-deriving reproduction steps from scratch each time.
 
 import math
 
+import numpy as np
 from pyproj import Transformer
+from shapely.geometry import Polygon, shape
+from shapely.ops import unary_union
+from shapely.vectorized import contains as _shapely_contains
 
 import field_zones as fz
 
@@ -197,16 +208,38 @@ def _wkt_to_lonlat(wkt_2180: str) -> list[tuple[float, float]]:
     return [transformer.transform(x, y) for x, y in pairs]
 
 
+def _check_exclusions(result: dict, exclusion_union) -> list[str]:
+    """Checks every returned zone geometry and sample_point against the union of a field's
+    exclusion polygons (both already in lon/lat, matching result's own CRS) - returns a list of
+    issue strings, empty if clean."""
+    issues = []
+    for feature in result["features"]:
+        zone_geom = shape(feature["geometry"])
+        overlap = zone_geom.intersection(exclusion_union).area
+        if overlap > 1e-10:
+            issues.append(f"zone {feature['properties'].get('zone_id')} overlaps an exclusion ({overlap:.2e} deg^2)")
+        for lon, lat in feature["properties"].get("sample_points") or []:
+            if _shapely_contains(exclusion_union, np.array([lon]), np.array([lat]))[0]:
+                issues.append(f"sample_point ({lon}, {lat}) falls inside an exclusion")
+    return issues
+
+
 def run() -> bool:
     """Returns True if every field/target combination looks clean, False if anything worth a
     second look was found - printed either way."""
     all_ok = True
     for field in FIELDS:
         polygon = _wkt_to_lonlat(field["wkt_2180"])
+        exclusion_wkts = field.get("exclusions") or []
+        exclusion_polygons = [_wkt_to_lonlat(wkt) for wkt in exclusion_wkts]
+        exclusion_union = unary_union([Polygon(ring) for ring in exclusion_polygons]) if exclusion_polygons else None
         print(f"=== field {field['field_id']} \"{field['name']}\" ===")
         for target_ha in TARGET_SIZES_HA:
             result = fz.compute_field_zones(
-                polygon_lonlat=polygon, target_plot_size_ha=target_ha, field_id=field["field_id"]
+                polygon_lonlat=polygon,
+                target_plot_size_ha=target_ha,
+                field_id=field["field_id"],
+                exclusion_polygons_lonlat=exclusion_polygons or None,
             )
             areas = sorted(f["properties"]["area_ha"] for f in result["features"])
             types = [f["geometry"]["type"] for f in result["features"]]
@@ -222,6 +255,8 @@ def run() -> bool:
                 issues.append("degenerate near-zero-area zone")
             if result["n_zones"] > ideal_n_zones:
                 issues.append(f"more zones than ideal (ideal={ideal_n_zones})")
+            if exclusion_union is not None:
+                issues.extend(_check_exclusions(result, exclusion_union))
 
             status = "OK" if not issues else "CHECK: " + "; ".join(issues)
             if issues:

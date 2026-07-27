@@ -183,6 +183,7 @@ def post_field_zones(payload: FieldZonesRequest):
             field_id=payload.field_id,
             zone_polygon_lonlat=payload.zone_polygon,
             single_zone_override=payload.single_zone_override,
+            exclusion_polygons_lonlat=payload.exclusion_polygons,
         )
         _log_field_zones_call(request_json, response=result)
         return result
