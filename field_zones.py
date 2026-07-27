@@ -130,7 +130,17 @@ SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES = 30.0
 # route abandoning one cluster and jumping to a stranded one. Same "accept fewer points over a bad
 # placement" policy the endpoint-extension pass below already uses, just not previously applied
 # to this main loop.
-SAMPLE_POINT_MAX_REACH_MULTIPLE = 3.0
+#
+# 3.0 was the first value tried and was too strict: verified on a real field (127, "Tworzanice
+# 60") it could reject several CONSECUTIVE targets in a merely-moderately-sparse stretch (not a
+# real gap, just fewer nearby candidates than usual), leaving a fragmented, blob-shaped leftover
+# instead of one line - a real, if narrower, regression traded for fixing the original jump.
+# Verified directly against the exact reported bug's own (t,s) values that 4.0-5.0 is the safe
+# window: it accepts those moderate-reach candidates (closing the fragmentation gap) while still
+# rejecting both of the original ~111m jumps (their distance is still far outside this reach even
+# at 5.0x); at 6.0x one of the two original jumps starts being accepted again. 5.0 picked for a
+# comfortable margin within that window, not the tightest value that still (barely) works.
+SAMPLE_POINT_MAX_REACH_MULTIPLE = 5.0
 # Generous default candidate count per zone, not a fixed request - the frontend takes however
 # many points it actually needs from the front of the list (see field_zones.py's
 # _farthest_point_sample: any prefix of its output is itself well-spread).
