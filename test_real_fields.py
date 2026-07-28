@@ -223,7 +223,14 @@ FIELDS = [
     },
 ]
 
-TARGET_SIZES_HA = [1.0, 2.0, 3.0, 4.0]
+TARGET_SIZES_HA = [0.5, 1.0, 2.0, 3.0, 4.0]
+
+# krecik's routes wizard always requests 15 (RoutesComponent.pointsPerSubfield) - the
+# DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE=8 this corpus used to run against was never what real
+# traffic actually sends, and denser target spacing (chord_len/15 vs chord_len/8) interacts
+# differently with the reach-cap/backfill/sanity-check machinery - confirmed 2026-07-27: two
+# real bugs on field 127 "Tworzanice 60" @4ha only surfaced at 15 points/zone, not 8.
+MAX_SAMPLE_POINTS_PER_ZONE = 15
 
 
 def _wkt_to_lonlat(wkt_2180: str) -> list[tuple[float, float]]:
@@ -283,6 +290,25 @@ def _check_sample_point_continuity(result: dict) -> list[str]:
 # and was clean, since no SINGLE step exceeded 50% of the diagonal, even though the overall path
 # was a scatter with reported/optimal length ratio ~1.53).
 SAMPLE_POINT_MAX_PATH_INEFFICIENCY_RATIO = 1.4
+
+
+def _check_zone_geometry_validity(result: dict) -> list[str]:
+    """Flags a zone whose returned geometry is invalid (self-intersecting) or has a degenerate
+    (near-zero-area) interior hole - either renders in Leaflet as a stray extra boundary
+    line/loop inside what should be one clean subfield. Added after a real case (field 127
+    "Tworzanice 60" @0.5ha): 4 of 176 zones came back invalid, one with a hole 4.5e-18 deg^2 -
+    both survived every existing cleanup pass in field_zones.py silently."""
+    issues = []
+    for feature in result["features"]:
+        geom = shape(feature["geometry"])
+        zid = feature["properties"].get("zone_id")
+        polys = geom.geoms if geom.geom_type == "MultiPolygon" else [geom]
+        for poly in polys:
+            if not poly.is_valid:
+                issues.append(f"zone {zid} has an invalid (self-intersecting) geometry")
+            if poly.interiors:
+                issues.append(f"zone {zid} has {len(poly.interiors)} interior hole(s)")
+    return issues
 
 
 def _nn_greedy_path_length(xy: np.ndarray) -> float:
@@ -352,7 +378,8 @@ def run() -> bool:
         print(f"=== field {field['field_id']} \"{field['name']}\" ===")
         for target_ha in TARGET_SIZES_HA:
             result = fz.compute_field_zones(
-                polygon_lonlat=polygon, target_plot_size_ha=target_ha, field_id=field["field_id"]
+                polygon_lonlat=polygon, target_plot_size_ha=target_ha, field_id=field["field_id"],
+                max_sample_points_per_zone=MAX_SAMPLE_POINTS_PER_ZONE,
             )
             areas = sorted(f["properties"]["area_ha"] for f in result["features"])
             types = [f["geometry"]["type"] for f in result["features"]]
@@ -370,6 +397,7 @@ def run() -> bool:
                 issues.append(f"more zones than ideal (ideal={ideal_n_zones})")
             issues.extend(_check_sample_point_continuity(result))
             issues.extend(_check_sample_point_path_efficiency(result))
+            issues.extend(_check_zone_geometry_validity(result))
 
             status = "OK" if not issues else "CHECK: " + "; ".join(issues)
             if issues:

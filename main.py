@@ -1,6 +1,8 @@
 import json
 import logging
+import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -10,6 +12,20 @@ import db_cache
 from field_zones import compute_field_zones
 from ndvi import fetch_ndvi_png
 from schemas import FieldZonesRequest, NdviRequest
+
+# Set once at import time (i.e. once per process start, --reload worker included) - included in
+# every /field-zones response as "server_instance" so a fix that doesn't seem to take effect can
+# be diagnosed in seconds instead of by re-deriving reproduction steps from scratch: compare this
+# against the previous response's value. Confirmed necessary the hard way (2026-07-27/28):
+# uvicorn --reload can leave an orphaned worker process alive after a restart (see
+# lopata_dev_service_port memory) whose command line doesn't even mention this project, so
+# `Stop-Process` by command-line match silently missed it - several "restarts" in a row kept
+# being answered by the same stale process with no obvious way to tell from the response alone.
+# If two calls made minutes apart come back with an IDENTICAL started_at/pid, that's not a
+# healthy cache hit - it means requests are being served by a process that was never actually
+# restarted, and the fix under test hasn't been loaded at all.
+SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
+SERVER_PID = os.getpid()
 
 app = FastAPI(
     title="NDVI API",
@@ -120,6 +136,11 @@ def _ndvi_metadata_headers(metadata: dict) -> dict[str, str]:
         headers["X-NDVI-Candidates-Considered"] = str(metadata["candidates_considered"])
     if metadata.get("ndvi_mean_at_selection") is not None:
         headers["X-NDVI-Mean-At-Selection"] = str(metadata["ndvi_mean_at_selection"])
+    # Same server-instance fingerprint /field-zones carries in its JSON body (see SERVER_PID's
+    # own module-level comment) - this endpoint's body is a raw image, so headers are the only
+    # place it can go.
+    headers["X-Server-Started-At"] = SERVER_STARTED_AT
+    headers["X-Server-Pid"] = str(SERVER_PID)
     return headers
 
 
@@ -184,6 +205,7 @@ def post_field_zones(payload: FieldZonesRequest):
             zone_polygon_lonlat=payload.zone_polygon,
             single_zone_override=payload.single_zone_override,
         )
+        result["server_instance"] = {"pid": SERVER_PID, "started_at": SERVER_STARTED_AT}
         _log_field_zones_call(request_json, response=result)
         return result
     except LookupError as exc:

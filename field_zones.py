@@ -269,6 +269,30 @@ def _polygonal_only(geom):
     return geom
 
 
+def _drop_degenerate_holes(geom):
+    """Strips any interior ring (hole) whose enclosed area is below MIN_GAP_PIECE_AREA_DEG2 -
+    floating-point noise from a renoding op (buffer(0), set_precision) rather than a real hole in
+    the zone. Confirmed on a real zone (field 127 "Tworzanice 60" @0.5ha): after _safe_buffer0
+    fixed a self-intersection, one zone was left with a real-but-microscopic interior ring
+    (4.5e-18 deg^2 - two of its three vertices differing only past the 12th decimal), which
+    Leaflet would still render as a stray hairline loop inside an otherwise clean subfield. Reuses
+    MIN_GAP_PIECE_AREA_DEG2 (already this file's own "is this a real gap or just noise" threshold
+    for exactly this class of near-zero-area artifact - see that constant's own docstring) rather
+    than a second, separately-tuned one."""
+    if geom is None or geom.is_empty:
+        return geom
+    if geom.geom_type == "Polygon":
+        if not geom.interiors:
+            return geom
+        real_holes = [ring for ring in geom.interiors if Polygon(ring).area > MIN_GAP_PIECE_AREA_DEG2]
+        if len(real_holes) == len(geom.interiors):
+            return geom  # every hole is already real - nothing to strip
+        return Polygon(geom.exterior, real_holes)
+    if geom.geom_type == "MultiPolygon":
+        return MultiPolygon([_drop_degenerate_holes(p) for p in geom.geoms])
+    return geom
+
+
 def _safe_union(geoms: list):
     """unary_union(geoms), retried after snapping every input onto a small precision grid if GEOS
     itself throws instead of returning a result (typically "TopologyException: side location
@@ -1457,6 +1481,279 @@ def _farthest_point_sample(points_m: np.ndarray, n: int) -> list[int]:
     return chosen
 
 
+def _two_opt_improve(points: np.ndarray, order: list[int]) -> list[int]:
+    """Standard open-path 2-opt local search over `order` (a permutation of indices into
+    `points`): repeatedly finds the pair of edges whose reversal most shortens the total path,
+    reverses that segment, and repeats until no single reversal helps anymore. Only used as a
+    cleanup on top of an already-reasonable starting tour (see this function's own call sites,
+    e.g. _farthest_point_fallback's greedy nearest-neighbor walk) - greedy NN (or any other
+    construction) can still lock in an early crossing it has no way to undo later, which 2-opt
+    (an O(n^2) sweep, repeated until convergence) reliably removes. Cheap enough to run
+    unconditionally: every call site caps `order` at max_sample_points_per_zone, at most 15 in
+    practice.
+
+    Followed by an explicit geometric crossing-removal pass (see _remove_path_crossings) - the
+    distance-based sweep above alone is NOT sufficient: confirmed on a real live response (field
+    127 "Tworzanice 60" @4ha, zone 20) where 5 of 15 real candidates shared the exact same
+    latitude (several raster pixels on one row roughly perpendicular to the guide line, a routine
+    occurrence, not a rare edge case). Reversing the segment between two crossing edges through
+    EXACTLY COLLINEAR points leaves total path length UNCHANGED, not shorter - the classic 2-opt
+    quadrilateral-inequality argument ("uncrossing always strictly shortens a path") is only a
+    strict inequality for points in general position; collinear points make it an equality, which
+    the epsilon-gated `new_cost < old_cost - 1e-9` check above correctly refuses as "no
+    improvement" even though the tour still visits them in a self-overlapping order. A pure
+    distance-based swap criterion can never fix that - only checking for crossings directly can."""
+    order = list(order)
+    n = len(order)
+    if n < 4:
+        return order
+
+    def _dist(a: int, b: int) -> float:
+        return float(np.linalg.norm(points[order[a]] - points[order[b]]))
+
+    improved = True
+    while improved:
+        improved = False
+        for i in range(n - 2):
+            for j in range(i + 2, n - 1):
+                old_cost = _dist(i, i + 1) + _dist(j, j + 1)
+                new_cost = _dist(i, j) + _dist(i + 1, j + 1)
+                if new_cost < old_cost - 1e-9:
+                    order[i + 1 : j + 1] = order[i + 1 : j + 1][::-1]
+                    improved = True
+    return _remove_path_crossings(points, order)
+
+
+def _remove_path_crossings(points: np.ndarray, order: list[int]) -> list[int]:
+    """Explicitly finds and reverses any pair of non-adjacent edges that geometrically cross -
+    see _two_opt_improve's own docstring for why a pure distance-based swap criterion can miss
+    this (exactly collinear points make an uncrossing reversal cost-NEUTRAL, not cost-reducing,
+    so 2-opt's strict improvement check never fires). Uncrossing two genuinely crossing segments
+    is always safe regardless of cost - by the same quadrilateral inequality 2-opt itself relies
+    on, it can only ever shorten or tie the path, never lengthen it. Bounded to at most n*n passes
+    as a defensive cap (never observed to need more than one or two in practice, since each swap
+    strictly reduces the crossing count) - a real infinite loop would mean two edges keep
+    reporting as crossing after being uncrossed, which shapely's own segment intersection test
+    does not do for the same fixed point set."""
+    order = list(order)
+    n = len(order)
+    if n < 4:
+        return order
+
+    def _edge(i: int) -> LineString:
+        return LineString([points[order[i]], points[order[i + 1]]])
+
+    # `.intersects()`, not `.crosses()` - two exactly collinear OVERLAPPING segments (the
+    # motivating case here) intersect in a shared line, not a point, which `.crosses()`
+    # (dimension-reducing intersection only) does not count as crossing at all. The overall
+    # `is_simple` check below is the real stopping condition regardless - an occasional
+    # `.intersects()` false-positive-for-"crossing" (e.g. two edges merely touching at a shared
+    # endpoint) only costs a harmless extra reversal, never a wrong result, since a genuinely
+    # simple path always ends the outer loop.
+    for _ in range(n * n):
+        if LineString([points[order[k]] for k in range(n)]).is_simple:
+            break
+        swapped = False
+        for i in range(n - 1):
+            edge_i = _edge(i)
+            for j in range(i + 2, n - 1):
+                if edge_i.intersects(_edge(j)):
+                    order[i + 1 : j + 1] = order[i + 1 : j + 1][::-1]
+                    swapped = True
+                    break
+            if swapped:
+                break
+        if not swapped:
+            break
+    return order
+
+
+def _remove_path_or_opt_spikes(points: np.ndarray, order: list[int]) -> list[int]:
+    """Last-resort correctness net for a path _remove_path_crossings couldn't fully fix: a
+    "spike" - one point out of sequence relative to its own immediate neighbors, usually along a
+    near-collinear run - is an ADJACENT-edge defect, and 2-opt-style segment reversal cannot
+    touch it: reversing the single-point segment between two adjacent edges is a no-op by
+    definition (see _remove_path_crossings's own docstring, which only ever considers
+    NON-adjacent edge pairs for exactly this reason). The correct local-search move for "one point
+    is misplaced" is Or-opt (relocate a single point elsewhere), not 2-opt (reverse a segment).
+
+    Exhaustively tries removing each point and reinserting it at every other position, stopping
+    as soon as the path is simple - deliberately correctness-seeking, not shortest-path-seeking
+    (unlike _two_opt_improve): a self-intersecting "prettier" path is strictly worse than a valid
+    one, so this only ever needs to find *a* fix, not the *shortest* one. O(n^3) worst case
+    (n points to remove x n positions to try x an is_simple check) is fine at n<=15 in practice -
+    confirmed fast, and only ever needed for a single point in every real case seen so far."""
+    order = list(order)
+    n = len(order)
+    if n < 4:
+        return order
+    if LineString([points[i] for i in order]).is_simple:
+        return order
+
+    for _ in range(n):
+        if LineString([points[i] for i in order]).is_simple:
+            break
+        fixed = False
+        for k in range(n):
+            point_idx = order[k]
+            remainder = order[:k] + order[k + 1 :]
+            for pos in range(len(remainder) + 1):
+                trial = remainder[:pos] + [point_idx] + remainder[pos:]
+                if LineString([points[i] for i in trial]).is_simple:
+                    order = trial
+                    fixed = True
+                    break
+            if fixed:
+                break
+        if not fixed:
+            break  # no single-point relocation fixes it - return the best (still imperfect) order
+    return order
+
+
+def _path_turn_angles_deg(points: np.ndarray, order: list[int]) -> list[float]:
+    """Deviation-from-straight angle (degrees, 0-180) at each interior point of the path named by
+    `order` - 0 means the path keeps going in the same direction, 180 means it reverses on itself.
+    Used by _smooth_path_turns as the objective it's actually trying to reduce, since neither
+    _two_opt_improve (total distance) nor _remove_path_crossings/_remove_path_or_opt_spikes
+    (simplicity) say anything about how sharply the path bends between consecutive points."""
+    angles: list[float] = []
+    for k in range(1, len(order) - 1):
+        p0, p1, p2 = points[order[k - 1]], points[order[k]], points[order[k + 1]]
+        v1, v2 = p1 - p0, p2 - p1
+        n1, n2 = float(np.linalg.norm(v1)), float(np.linalg.norm(v2))
+        if n1 < 1e-9 or n2 < 1e-9:
+            angles.append(0.0)
+            continue
+        cos_a = max(-1.0, min(1.0, float(np.dot(v1, v2)) / (n1 * n2)))
+        angles.append(math.degrees(math.acos(cos_a)))
+    return angles
+
+
+def _smooth_path_turns(points: np.ndarray, order: list[int], is_valid) -> list[int]:
+    """Hill-climbing pass minimizing the SHARPEST turn along the path, not total distance or
+    simplicity - the gap those other passes leave open. Confirmed on a real case (field 127
+    "Tworzanice 60" @4ha, zone 20): after boustrophedon banding (see _farthest_point_fallback)
+    plus both crossing-removal passes, the path was simple and reasonably short, yet still turned
+    sharply back and forth - "punkty nie są w jednej linii, zbyt duże skręty" reported directly by
+    the user with a screenshot. Root cause: banding splits points into 2 groups by equal COUNT
+    along the minor axis, which does NOT guarantee each group is actually a tight spatial strip -
+    for a genuinely diffuse/scattered candidate cloud (no natural rows to find), both "bands" can
+    each still span most of the minor-axis range, so sorting within a band by major-axis position
+    alone still zigzags.
+
+    Each iteration considers BOTH move types and takes whichever single move reduces the worst
+    turn angle the most (not first-improvement) - Or-opt (relocate one point elsewhere, same
+    mechanism as _remove_path_or_opt_spikes) ALONE was verified insufficient on the real zone 20
+    case: it reliably got stuck at a local optimum (138 -> 123 degrees, nowhere near
+    SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES) because the sharpest turn there was caused by a PAIR of points effectively
+    needing to trade places, a move Or-opt's single-point relocation cannot express in one step.
+    Adding 2-opt-style segment reversal (same neighborhood _two_opt_improve searches, but scored
+    by worst-angle instead of total distance) as a second candidate move type escapes that local
+    optimum. `is_valid` lets the caller enforce its OWN correctness constraint (this file's whole
+    crossing-check history: simple in BOTH UTM meters and lon/lat degrees, since reprojection
+    rounding can flip which one a near-degenerate case satisfies) on every candidate move -
+    smoothing must never be allowed to reintroduce a crossing two earlier passes just removed.
+    Not guaranteed to reach SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES for every input: some scattered point sets have no
+    ordering that stays both simple and mostly-straight, and this only ever accepts a move if it's
+    a strict improvement, so it stops (still imperfect) rather than search forever for a bound
+    that may not be reachable."""
+    order = list(order)
+    n = len(order)
+    if n < 4:
+        return order
+
+    def _worst_angle(o: list[int]) -> float:
+        angles = _path_turn_angles_deg(points, o)
+        return max(angles) if angles else 0.0
+
+    current_worst = _worst_angle(order)
+    for _ in range(4 * n):
+        if current_worst <= SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES:
+            break
+        best_trial = None
+        best_worst = current_worst
+
+        for k in range(n):
+            point_idx = order[k]
+            remainder = order[:k] + order[k + 1 :]
+            for pos in range(len(remainder) + 1):
+                trial = remainder[:pos] + [point_idx] + remainder[pos:]
+                if not is_valid(trial):
+                    continue
+                w = _worst_angle(trial)
+                if w < best_worst - 1e-6:
+                    best_worst = w
+                    best_trial = trial
+
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                trial = order[:i] + order[i : j + 1][::-1] + order[j + 1 :]
+                if not is_valid(trial):
+                    continue
+                w = _worst_angle(trial)
+                if w < best_worst - 1e-6:
+                    best_worst = w
+                    best_trial = trial
+
+        if best_trial is None:
+            break
+        order = best_trial
+        current_worst = best_worst
+    return order
+
+
+def _greedy_nearest_neighbor_order(points: np.ndarray, start: int) -> list[int]:
+    """Simplest possible tour construction: from `start`, repeatedly jump to whichever unvisited
+    point is nearest. One of several candidate STARTING orders _farthest_point_fallback tries
+    (alongside boustrophedon banding) before the shared repair-and-smooth chain polishes whichever
+    one it is - confirmed on a real case that the starting point matters even after polishing: a
+    banded order stuck at a 123-degree worst turn after smoothing, while a greedy-NN walk from a
+    different start, smoothed the same way, reached 95.6 degrees. `points` is capped at
+    max_sample_points_per_zone (<=15 in practice) by every call site, so trying every possible
+    start is cheap."""
+    n = len(points)
+    order = [start]
+    remaining = set(range(n)) - {start}
+    while remaining:
+        last = order[-1]
+        nxt = min(remaining, key=lambda i: float(np.linalg.norm(points[i] - points[last])))
+        order.append(nxt)
+        remaining.discard(nxt)
+    return order
+
+
+def _repair_and_smooth_order(
+    points_utm: np.ndarray, points_lonlat: np.ndarray, order: list[int]
+) -> list[int] | None:
+    """Runs the shared correctness-then-smoothness pipeline on one candidate order: crossing
+    removal in UTM, then Or-opt spike removal in UTM if still not simple, then the SAME two passes
+    again in lon/lat (a path can be simple in one projection and not the other for near-degenerate
+    collinear points - see this file's crossing-check history), then turn-angle smoothing
+    (_smooth_path_turns) subject to staying simple in BOTH spaces throughout. Returns None if the
+    order still isn't simple in both spaces after all of that - lets a caller comparing several
+    candidate orders (see _farthest_point_fallback) simply skip a candidate that couldn't be made
+    valid rather than accidentally scoring/preferring a broken path."""
+    order = _remove_path_crossings(points_utm, order)
+    if not LineString([points_utm[i] for i in order]).is_simple:
+        order = _remove_path_or_opt_spikes(points_utm, order)
+    if not LineString([points_lonlat[i] for i in order]).is_simple:
+        order = _remove_path_crossings(points_lonlat, order)
+    if not LineString([points_lonlat[i] for i in order]).is_simple:
+        order = _remove_path_or_opt_spikes(points_lonlat, order)
+
+    if not LineString([points_utm[i] for i in order]).is_simple:
+        return None
+    if not LineString([points_lonlat[i] for i in order]).is_simple:
+        return None
+
+    def _is_valid(candidate: list[int]) -> bool:
+        if not LineString([points_utm[i] for i in candidate]).is_simple:
+            return False
+        return LineString([points_lonlat[i] for i in candidate]).is_simple
+
+    return _smooth_path_turns(points_utm, order, _is_valid)
+
+
 def _longest_linestring_component(geom) -> LineString | None:
     """Picks the single longest LineString out of whatever a line/polygon intersection returned
     - a Polygon-vs-LineString intersection can come back as a LineString (the common case, a
@@ -1545,6 +1842,177 @@ def _longest_bisecting_chord(
         best_chord = _shp_rotate(chord, angle_deg, origin=(0, 0), use_radians=False)
 
     return best_chord
+
+
+
+# Below this convex_ratio (polygon.area / polygon.convex_hull.area), a zone is bent enough (an
+# "L"/"U"/boomerang shape - a genuinely convex zone sits at ~0.9-1.0) that _longest_bisecting_chord
+# can no longer be trusted to reach across its real extent - see _longest_geodesic_vertex_path's
+# own docstring for why. 0.85 comfortably separates a real bent zone (Luboszyce Małe 23, field
+# 346, one @4ha zone: 0.50) from ordinary convex/near-convex zones seen across the corpus
+# (consistently >=0.9), without so loose a threshold that mildly-irregular-but-fine convex zones
+# would ever route through the (more expensive, untested-on-those-shapes) geodesic path instead.
+BENT_ZONE_MAX_CONVEX_RATIO = 0.85
+
+# The anchor-based geodesic path (see _longest_geodesic_vertex_path's anchor_points parameter)
+# must be at least this fraction of the straight chord's own length to be used instead of it.
+# Deliberately BELOW 1.0, not a "must be longer" bar: since both anchors are real, well-separated
+# candidate pixels by construction, a geodesic that's merely comparable to (not necessarily
+# longer than) the chord is still usually the better guide for a genuinely non-convex zone - it
+# follows the zone's own bend and is anchored in real data at both ends, while the chord's
+# bisecting angle has no awareness of which direction real candidates actually lie in.
+BENT_ZONE_MIN_LENGTH_IMPROVEMENT_RATIO = 0.8
+
+
+def _longest_geodesic_vertex_path(
+    polygon: Polygon, anchor_points: tuple[tuple[float, float], tuple[float, float]] | None = None
+) -> LineString | None:
+    """A "taut string" path between two points, allowed to bend at reflex vertices, unlike
+    _longest_bisecting_chord's single straight line. Only called for zones _longest_bisecting_chord
+    itself can't do justice to (see BENT_ZONE_MAX_CONVEX_RATIO): a straight line bisecting a
+    convex-ish zone's area is a fine long guide, but for a genuinely bent zone (an "L" or "U"
+    wrapping around a neighboring zone - confirmed on a real one, Luboszyce Małe 23 field 346's
+    3.54ha zone @4ha target, convex_ratio 0.50) NO straight line can span both arms without leaving
+    the polygon, so the longest one _longest_bisecting_chord can find is stuck inside a single arm
+    (147m) even though the zone's own bounding-box diagonal is 528m. _compute_zone_sample_points
+    then tries to spread max_points candidates along that too-short chord; real field pixels near
+    each far-flung target position don't exist that close to the chord itself, so the reach-cap/
+    backfill machinery (SAMPLE_POINT_MAX_REACH_MULTIPLE) ends up filling both arms anyway but with
+    one big disconnected-looking jump between them - exactly the reported "trasa jest za krotka i
+    odstep miedzy dwoma fragmentami punktow jest troche za dlugi" bug, and NOT caught by this
+    function's own downstream t_coverage/path_inefficiency sanity check (both are computed
+    relative to the chord's own length, which the spilled-past-the-end points get clamped to by
+    LineString.project(), masking the real gap as "full coverage").
+
+    anchor_points: when given (two (x,y) UTM points - the caller passes the two most mutually
+    distant REAL CANDIDATE pixels, not just any two points), the path connects exactly these two
+    points instead of picking endpoints by the polygon's own geometric diameter. Endpoint choice
+    matters: the polygon's true geometric diameter can land on a vertex that's real (part of the
+    zone's actual boundary) but has almost no usable candidate pixels near it at all - confirmed
+    on a real zone (field 127 "Tworzanice 60" @4ha): the diameter's far vertex sat in a corner
+    with ZERO real candidates within the last ~40% of the resulting path, so _compute_zone_
+    sample_points' targets there had nothing to match, and _truncate_to_supported_span (an earlier
+    fix attempt) could only cut the unsupported tail off rather than aim the path better in the
+    first place - still left the truncated path only reaching partway into the zone, since it was
+    built toward the wrong corner to begin with. Anchoring both ends at real, well-separated data
+    points instead means the whole path is candidate-relevant by construction - no truncation
+    needed. Falls back to the plain vertex-diameter double-sweep when anchor_points is None (e.g.
+    a degenerate zone with too few real candidates to pick two anchors from).
+
+    Builds a visibility graph over the polygon's own exterior vertices, PLUS the two anchor points
+    when given as two extra nodes (an edge between two nodes exists if the straight segment
+    between them lies entirely inside the polygon) - anchors get to bend around the same reflex
+    vertices as any other route through the zone. Without anchor_points, approximates the
+    polygon's own geometric diameter via the standard "double sweep" heuristic instead: Dijkstra
+    from an arbitrary vertex finds its farthest vertex A; Dijkstra from A finds ITS farthest
+    vertex B; the A-B shortest path is returned - an approximation, not a guaranteed-optimal
+    diameter, for a zone with several bends, but still a dramatic improvement over a stuck-in-one-
+    arm straight chord regardless.
+
+    Downstream code (_compute_zone_sample_points) already treats guide_line as a generic
+    LineString throughout (arc-length via .project()/.length, perpendicular offset via
+    .distance()) - none of it assumes straightness, so a bent multi-vertex LineString slots in
+    with no other changes needed.
+
+    Returns None if the polygon has too few vertices to form a graph, or no path exists at all
+    between the chosen endpoints (would require a hole-free simple polygon with at least one open
+    geodesic path between them, true for any real zone boundary and anchors actually inside it)."""
+    if polygon is None or polygon.is_empty or polygon.area <= 0:
+        return None
+    coords = list(polygon.exterior.coords[:-1])
+    n = len(coords)
+    if n < 3:
+        return None
+
+    start_idx: int | None = None
+    end_idx: int | None = None
+    if anchor_points is not None:
+        coords = coords + [tuple(anchor_points[0]), tuple(anchor_points[1])]
+        start_idx, end_idx = n, n + 1
+        n = len(coords)
+
+    # A small tolerance buffer (not raw polygon.covers/.contains) so a segment that runs exactly
+    # along a slightly-wiggly boundary edge - routine floating-point/simplification noise, not a
+    # real excursion outside the zone - still counts as "inside", the same tolerant-containment
+    # pattern _compute_zone_sample_points itself already uses for candidate points via
+    # SAMPLE_POINT_MIN_DISTANCE_FROM_BOUNDARY_M (here needed for segments, not points).
+    tolerant_polygon = polygon.buffer(0.5)
+    adjacency: list[list[tuple[int, float]]] = [[] for _ in range(n)]
+    for i in range(n):
+        pi = Point(coords[i])
+        for j in range(i + 1, n):
+            segment = LineString([coords[i], coords[j]])
+            if not tolerant_polygon.contains(segment) and not tolerant_polygon.covers(segment):
+                continue
+            dist = pi.distance(Point(coords[j]))
+            adjacency[i].append((j, dist))
+            adjacency[j].append((i, dist))
+
+    def _dijkstra(source: int) -> list[float]:
+        dist = [math.inf] * n
+        dist[source] = 0.0
+        visited = [False] * n
+        heap = [(0.0, source)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if visited[u]:
+                continue
+            visited[u] = True
+            for v, w in adjacency[u]:
+                nd = d + w
+                if nd < dist[v]:
+                    dist[v] = nd
+                    heapq.heappush(heap, (nd, v))
+        return dist
+
+    def _farthest(source: int, dist: list[float]) -> int:
+        return max(range(n), key=lambda i: (dist[i] if math.isfinite(dist[i]) else -1.0, i != source))
+
+    if start_idx is None:
+        dist_from_0 = _dijkstra(0)
+        if not any(math.isfinite(d) for i, d in enumerate(dist_from_0) if i != 0):
+            return None  # vertex 0 isolated (shouldn't happen for a real simple polygon)
+        vertex_a = _farthest(0, dist_from_0)
+        dist_from_a = _dijkstra(vertex_a)
+        vertex_b = _farthest(vertex_a, dist_from_a)
+        if vertex_a == vertex_b or not math.isfinite(dist_from_a[vertex_b]):
+            return None
+        start_idx, end_idx = vertex_a, vertex_b
+
+    # Reconstruct the shortest path start->end by re-running Dijkstra with predecessor tracking -
+    # kept as a second pass (rather than tracking predecessors in the hot loop above) since this
+    # only needs to happen once, for the winning pair, not on every one of the two sweep's
+    # Dijkstra runs (when anchor_points wasn't given).
+    dist = [math.inf] * n
+    dist[start_idx] = 0.0
+    prev = [-1] * n
+    visited = [False] * n
+    heap = [(0.0, start_idx)]
+    while heap:
+        d, u = heapq.heappop(heap)
+        if visited[u]:
+            continue
+        visited[u] = True
+        if u == end_idx:
+            break
+        for v, w in adjacency[u]:
+            nd = d + w
+            if nd < dist[v]:
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(heap, (nd, v))
+
+    if not math.isfinite(dist[end_idx]):
+        return None
+    path_indices = []
+    cur = end_idx
+    while cur != -1:
+        path_indices.append(cur)
+        cur = prev[cur]
+    path_indices.reverse()
+    if len(path_indices) < 2:
+        return None
+    return LineString([coords[i] for i in path_indices])
 
 
 def _compute_zone_sample_points(
@@ -1666,63 +2134,164 @@ def _compute_zone_sample_points(
             # negligible area change, and _longest_bisecting_chord then returns a sane result.
             utm_zone_geom = _safe_buffer0(utm_zone_geom)
             guide_line = _longest_bisecting_chord(utm_zone_geom)
+
+            # A bent ("L"/"U") zone can leave even the LONGEST straight chord stuck inside a
+            # single arm - see _longest_geodesic_vertex_path's own docstring for the real bug
+            # this closes (Luboszyce Małe 23, field 346). Only even attempted for a zone clearly
+            # non-convex enough that this is worth the extra visibility-graph computation.
+            #
+            # The geodesic-diameter heuristic can pick an endpoint vertex at the tip of a real
+            # but thin, low-density spike - the polygon's own geometric diameter can land on a
+            # REAL vertex that nonetheless has almost no usable candidate pixels near it.
+            # Confirmed on a real zone (field 127 "Tworzanice 60" @4ha, convex_ratio 0.64): the
+            # diameter's far vertex sat in a corner with ZERO real candidates in the last ~40% of
+            # the resulting path. An earlier fix truncated the path down to its supported leading
+            # stretch after the fact - better than nothing, but the truncated stretch was still
+            # aimed at the (wrong) geometric corner to begin with, and still ended up visibly
+            # short of the zone's other real candidate-dense areas. Anchoring both endpoints at
+            # the two most mutually distant REAL CANDIDATE pixels instead (see
+            # _longest_geodesic_vertex_path's own docstring) fixes this at the source - the whole
+            # path is candidate-relevant by construction, no truncation needed.
+            if utm_zone_geom.geom_type == "Polygon" and utm_zone_geom.convex_hull.area > 0:
+                convex_ratio = utm_zone_geom.area / utm_zone_geom.convex_hull.area
+                if convex_ratio < BENT_ZONE_MAX_CONVEX_RATIO:
+                    anchor_idx = _farthest_point_sample(points_m, 2)
+                    anchor_points = (
+                        (tuple(points_m[anchor_idx[0]]), tuple(points_m[anchor_idx[1]]))
+                        if len(anchor_idx) == 2 else None
+                    )
+                    geodesic_line = _longest_geodesic_vertex_path(utm_zone_geom, anchor_points)
+                    straight_len = guide_line.length if guide_line is not None else 0.0
+                    if geodesic_line is not None and geodesic_line.length > straight_len * BENT_ZONE_MIN_LENGTH_IMPROVEMENT_RATIO:
+                        guide_line = geodesic_line
         except Exception as e:
             logger.warning("longest-bisecting-chord computation failed, falling back: %s", e)
 
     def _farthest_point_fallback() -> list[list[float]]:
-        """Maximize-mutual-distance spread over every real candidate in the zone, ignoring the
-        guide line entirely - used only when there's no usable chord at all (degenerate/near-zero
-        -area zone, or every candidate direction failed). A poor-fitting chord no longer routes
-        here: the reach-capped pass plus its uncapped backfill (see SAMPLE_POINT_MAX_REACH_MULTIPLE)
-        now fill max_points directly off the chord instead of abandoning it wholesale."""
+        """Maximize-mutual-distance spread over every real candidate in the zone - used when
+        there's no usable guide_line at all (degenerate/near-zero-area zone, or every candidate
+        direction failed), AND as the final sanity-check fallback below when the per-target chord
+        walk's own OUTPUT still doesn't cover enough of guide_line's length with real candidates
+        (see SAMPLE_POINT_MIN_CHORD_COVERAGE_FRACTION) - a poor-fitting chord no longer routes
+        here on its own the way it used to: the reach-capped pass plus its uncapped backfill (see
+        SAMPLE_POINT_MAX_REACH_MULTIPLE) fill max_points directly off the chord first, and only a
+        genuine coverage failure of that filled result falls back to here."""
         safe_idx_local = np.where(ndvi_safe)[0]
         pool = points_m[safe_idx_local] if len(safe_idx_local) >= max_points else points_m
         pool_lons = lons[safe_idx_local] if len(safe_idx_local) >= max_points else lons
         pool_lats = lats[safe_idx_local] if len(safe_idx_local) >= max_points else lats
-        chosen = _farthest_point_sample(pool, max_points)
 
-        # _farthest_point_sample's own docstring is explicit that it returns indices in SELECTION
-        # order (each one picked as farthest from every point already chosen, not path order) -
-        # confirmed this was a real, pre-existing defect (not introduced by this fallback, just
-        # rarely exercised before it): connecting its raw output in that order produced routes
-        # with a path-length up to ~50x the straight-line start-to-end distance on some real zones
-        # once this fallback started triggering more often (see SAMPLE_POINT_MIN_ACCEPT_FRACTION).
+        # SELECTION, not just ordering, was the actual bug behind "points look scattered/random"
+        # reports (field 127 "Tworzanice 60" @4ha, zone 20, reported directly with a screenshot
+        # TWICE - the second time after an extensive reordering-only fix (2-opt, crossing-removal,
+        # boustrophedon banding, turn-angle smoothing with 16 candidate starting orders) had
+        # already pushed the worst single turn angle down from 138 to ~101 degrees, yet the
+        # overall path STILL looked like a scattered ring around the zone's edge with a few
+        # crossings through the middle - because it was: `_farthest_point_sample` (the previous
+        # selection method) seeds at whichever point is farthest from the centroid and repeatedly
+        # adds whichever remaining point is farthest from every point already chosen - literally
+        # optimized to prefer boundary/corner points over interior ones. No amount of REORDERING
+        # those 15 points afterward can turn "15 points ringing the zone's perimeter" into
+        # something that reads as a single transect, because the flaw is in WHICH 15 points were
+        # picked, not what order they're visited in.
         #
-        # A first attempt re-ordered the CHOSEN points (without re-selecting them) by projecting
-        # onto their own PCA major axis, on the theory that this traces the same "long direction"
-        # a straight guide-line chord would. Confirmed WRONG against real production data: this
-        # only works when the candidate cloud is itself elongated along one axis. An interior zone
-        # (roughly as wide as it is tall - exactly the shape a poor-chord-fit zone tends to have,
-        # since an elongated zone is usually what gives the chord a good fit in the first place)
-        # has real spread across BOTH axes, and a single projection collapses that perpendicular
-        # spread into sort-order noise - reported directly by the user as "completely random"
-        # points on multiple zones of two different fields. Verified numerically on the exact
-        # reported points of one such zone: PCA-sort reproduced the exact reported (bad) path
-        # length, while a greedy nearest-neighbor walk over the SAME chosen points cut path length
-        # by ~35% and traces a coherent, if winding, line through the zone - not as clean as a
-        # true straight chord, but a real path instead of a scatter, and consistent with the
-        # explicitly-acceptable "S-shape" the user described.
-        if len(chosen) > 2:
-            chosen_pts = pool[chosen]
-            centered = chosen_pts - chosen_pts.mean(axis=0)
-            cov = np.cov(centered.T)
+        # Fixed at the source: pick points EVENLY SPACED along the candidate pool's OWN PCA major
+        # axis (computed from the FULL safe candidate pool, not a pre-selected max-spread subset,
+        # so it reflects where real candidates actually concentrate) - for each of max_points
+        # evenly-spaced target positions along that axis, take whichever unused real candidate is
+        # closest to it. This is the exact same "systematic target slots, nearest real candidate
+        # per slot" principle every OTHER (non-fallback) zone's chord-walk already uses to produce
+        # a clean, evenly-spaced transect - the only difference is the axis comes from PCA of the
+        # real data instead of the polygon's own area-bisecting chord, since this whole function
+        # only ever runs when that shape-based chord already failed (either no usable chord at
+        # all, or a real candidate-density gap along it - see this function's own earlier
+        # docstring). Selecting FOR evenly-spaced coverage, rather than maximizing mutual spread,
+        # means the result is already close to path-ordered by construction (sorted by projection
+        # below) - no boustrophedon banding or multi-start smoothing search needed as the PRIMARY
+        # mechanism anymore, though both are kept as a correctness/smoothness safety net below in
+        # case of local ties or an unusually lopsided candidate density.
+        if len(pool) <= max_points:
+            chosen = list(range(len(pool)))
+        else:
+            centered_pool = pool - pool.mean(axis=0)
+            cov = np.cov(centered_pool.T)
             eigvals, eigvecs = np.linalg.eigh(cov)
             major_axis = eigvecs[:, int(np.argmax(eigvals))]
-            # Deterministic start: the extreme point along the cloud's own major axis, so the
-            # walk still begins from one "end" of the zone rather than an arbitrary point.
-            start_pos = int(np.argmin(centered @ major_axis))
-            remaining = set(range(len(chosen)))
-            remaining.remove(start_pos)
-            order = [start_pos]
-            current = start_pos
-            while remaining:
-                next_pos = min(
-                    remaining,
-                    key=lambda i: float(np.sum((chosen_pts[i] - chosen_pts[current]) ** 2)),
-                )
-                order.append(next_pos)
-                remaining.remove(next_pos)
-                current = next_pos
+            pool_proj = centered_pool @ major_axis
+
+            targets = np.linspace(float(pool_proj.min()), float(pool_proj.max()), max_points)
+            used = np.zeros(len(pool), dtype=bool)
+            chosen = []
+            for target_t in targets:
+                remaining = np.where(~used)[0]
+                if len(remaining) == 0:
+                    break
+                target_point = pool.mean(axis=0) + major_axis * target_t
+                dists = np.linalg.norm(pool[remaining] - target_point, axis=1)
+                pick = int(remaining[int(np.argmin(dists))])
+                chosen.append(pick)
+                used[pick] = True
+            chosen.sort(key=lambda i: pool_proj[i])
+
+        if len(chosen) > 2:
+            chosen_pts = pool[chosen]
+            n = len(chosen)
+            order = list(range(n))
+            lonlat_pts = np.column_stack([pool_lons[chosen], pool_lats[chosen]])
+
+            # Being simple (non-self-crossing) is NOT the same as looking like a real transect, and
+            # the axis-based selection above is not guaranteed to be perfectly monotonic either -
+            # e.g. two candidates equidistant from adjacent target slots can tie-break in a way
+            # that puts one slightly out of sequence. `_smooth_path_turns` directly targets the
+            # user's own bar - "no turn sharper than ~30 degrees between points" - as a cheap
+            # safety net on top of a selection that should already be close to a straight line.
+            #
+            # Repair-and-smooth the cheap (identity) order first - this is enough for the
+            # overwhelming majority of zones that land here (this whole fallback, unlike the
+            # "chord-based sample points failed sanity check" branch above, is also the ONLY path
+            # for any degenerate/no-guide-line zone, which a fine-grained target like 0.5ha
+            # produces in real bulk - a 176-zone field had a meaningful fraction of its zones
+            # routing through here, confirmed the hard way: a first version that unconditionally
+            # ran the multi-start search below on every one of them took 8 CPU-minutes for a single
+            # regression run of 8 fields x 5 targets, up from under a minute).
+            order = _repair_and_smooth_order(chosen_pts, lonlat_pts, order) or order
+            worst_angle = max(_path_turn_angles_deg(chosen_pts, order), default=0.0)
+
+            # A single starting order polished by that smoothing pass can still land in a much
+            # worse LOCAL optimum than another starting order would - confirmed directly on a real
+            # case (field 127 "Tworzanice 60" @4ha, zone 20): polishing the boustrophedon band
+            # order alone got stuck at 123 degrees, while a plain greedy-nearest-neighbor walk from
+            # a DIFFERENT (better) starting point, polished the same way, reached 95.6 degrees.
+            # Only worth the extra search when the cheap result is ACTUALLY still bad
+            # (worst_angle above SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES) - there's no cheap way to
+            # know in advance which starting point will polish best, so every one of the (at most
+            # max_sample_points_per_zone, i.e. <=15) points is tried as a greedy-NN start,
+            # whichever finishes with the smallest worst turn angle (ties broken by shorter total
+            # path) wins, comparing against the cheap result too. Bounded and cheap PER ZONE
+            # (at most 16 candidates, ~15 points each, confirmed under 3s for the worst real case
+            # found) but gated on actually being needed, since (see above) this fallback overall is
+            # NOT rare enough to run unconditionally.
+            if worst_angle > SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES:
+                best_order, best_worst_angle, best_length = order, worst_angle, float(sum(
+                    np.linalg.norm(chosen_pts[order[i + 1]] - chosen_pts[order[i]])
+                    for i in range(len(order) - 1)
+                ))
+                for start in range(n):
+                    candidate = _two_opt_improve(chosen_pts, _greedy_nearest_neighbor_order(chosen_pts, start))
+                    fixed = _repair_and_smooth_order(chosen_pts, lonlat_pts, candidate)
+                    if fixed is None:
+                        continue
+                    worst = max(_path_turn_angles_deg(chosen_pts, fixed), default=0.0)
+                    length = float(sum(
+                        np.linalg.norm(chosen_pts[fixed[i + 1]] - chosen_pts[fixed[i]])
+                        for i in range(len(fixed) - 1)
+                    ))
+                    if worst < best_worst_angle - 1e-6 or (
+                        worst < best_worst_angle + 1e-6 and length < best_length
+                    ):
+                        best_order, best_worst_angle, best_length = fixed, worst, length
+                order = best_order
+
             chosen = [chosen[i] for i in order]
 
         return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
@@ -1744,8 +2313,9 @@ def _compute_zone_sample_points(
     if len(points_m) <= max_points:
         # Too few real candidates to be selective about layout - return all of them, ordered
         # along the chord so the route still traces roughly one direction instead of whatever
-        # order the raster mask happened to yield them in.
-        order = np.argsort(t)
+        # order the raster mask happened to yield them in. Same tie-breaking risk as the main
+        # return below (near-identical t among several real candidates) - same 2-opt cleanup.
+        order = _two_opt_improve(points_m, list(np.argsort(t)))
         return [[float(lons[i]), float(lats[i])] for i in order]
 
     chord_len = guide_line.length
@@ -2047,6 +2617,18 @@ def _compute_zone_sample_points(
             )
             return _farthest_point_fallback()
 
+    # sorted_chosen is built in ascending-t order, which normally rules out self-crossing (two
+    # segments with disjoint t-ranges can't cross) - but real candidates routinely include
+    # several with near-identical t (e.g. many pixels along one raster row roughly perpendicular
+    # to guide_line), and the bisect-insertion tie-break among those has no reason to match their
+    # actual physical (s-offset) adjacency. Confirmed on a real live response (field 127
+    # "Tworzanice 60" @4ha, zone 20): 5 of its 15 points shared the exact same latitude, and the
+    # returned path was genuinely self-intersecting (shapely `is_simple=False`) despite passing
+    # both sanity checks above (t_coverage/path_inefficiency are proxies, not a direct crossing
+    # test - a small local pinch doesn't necessarily fail either of them). _two_opt_improve only
+    # ever shortens or leaves unchanged an already-good path (so this is a no-op on the common
+    # case), and a 2-opt local optimum is provably crossing-free for Euclidean distance.
+    sorted_chosen = _two_opt_improve(points_m, sorted_chosen)
     return [[float(lons[i]), float(lats[i])] for i in sorted_chosen]
 
 
@@ -2915,6 +3497,18 @@ def compute_field_zones(
     zones = []
     for mask, geom in final_entries:
         geom = _remove_self_touching_spikes(geom, transformer)
+        # _remove_self_touching_spikes only targets its own specific bug (a near-duplicate-vertex
+        # detour), and deliberately gives up (returns its input unrepaired) rather than risk
+        # collapsing a real zone - it's not a general validity guarantee. Confirmed on a real field
+        # (127 "Tworzanice 60" @0.5ha, a dense ~176-zone split): 4 zones still came back genuinely
+        # invalid (self-intersecting) after every pass above, one with a phantom interior hole -
+        # exactly the kind of thing that renders in Leaflet as a stray extra boundary line/loop
+        # inside what should be one clean subfield. One last _safe_buffer0 (the same renoding
+        # trick already used everywhere else in this file for this exact bug class) as a true
+        # final safety net, unconditional on WHY the geometry is invalid.
+        if geom is not None and not geom.is_empty and not geom.is_valid:
+            geom = _safe_buffer0(geom)
+        geom = _drop_degenerate_holes(geom)
         entry = _zone_entry(mask, geom)
         if entry is not None:
             zones.append(entry)
