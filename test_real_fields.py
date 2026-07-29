@@ -15,6 +15,13 @@ area (a degenerate sliver), or more zones than the ideal ceil(field_area/target)
 Run this after any change to field_zones.py, before pushing - it's the fastest way to catch a
 regression against every real field already known to have exposed a bug this session, instead of
 re-deriving reproduction steps from scratch each time.
+
+Every field/target combination runs through BOTH of compute_field_zones' independent internal
+code paths (whole-field-only, and subfield-scoped with the whole field passed as its own
+"subfield") - see run()'s own docstring for why testing only one path (as this script did until
+2026-07-29) let a real bug reach production despite looking clean here: krecik's actual frontend
+ALWAYS uses the subfield-scoped path, which has its own separate hard-cap-enforcement logic a
+whole-field-only test can never exercise.
 """
 
 import math
@@ -369,43 +376,68 @@ def _check_sample_point_path_efficiency(result: dict) -> list[str]:
     return issues
 
 
+def _run_one(field: dict, polygon: list[tuple[float, float]], target_ha: float, use_subfield_path: bool) -> bool:
+    """Runs one field/target combination through compute_field_zones and prints/returns whether
+    it looked clean. use_subfield_path controls which of the two independent code paths inside
+    compute_field_zones actually runs (see PATH_LABELS below) - both need covering, not just the
+    whole-field-only one this script used to exclusively test."""
+    result = fz.compute_field_zones(
+        polygon_lonlat=polygon,
+        zone_polygon_lonlat=polygon if use_subfield_path else None,
+        target_plot_size_ha=target_ha, field_id=field["field_id"],
+        max_sample_points_per_zone=MAX_SAMPLE_POINTS_PER_ZONE,
+    )
+    areas = sorted(f["properties"]["area_ha"] for f in result["features"])
+    types = [f["geometry"]["type"] for f in result["features"]]
+    field_area_ha = result["field_area_ha"]
+
+    target_max_ha = min(4.0, target_ha * 1.25)
+    ideal_n_zones = math.ceil(field_area_ha / target_ha)
+
+    issues = []
+    if any(a > target_max_ha + 1e-6 for a in areas):
+        issues.append(f"zone over cap ({target_max_ha}ha)")
+    if any(a < 0.01 for a in areas):
+        issues.append("degenerate near-zero-area zone")
+    if result["n_zones"] > ideal_n_zones:
+        issues.append(f"more zones than ideal (ideal={ideal_n_zones})")
+    issues.extend(_check_sample_point_continuity(result))
+    issues.extend(_check_sample_point_path_efficiency(result))
+    issues.extend(_check_zone_geometry_validity(result))
+
+    status = "OK" if not issues else "CHECK: " + "; ".join(issues)
+    path_label = "subfield" if use_subfield_path else "whole-field"
+    print(
+        f"  @{target_ha}ha [{path_label}] -> n_zones={result['n_zones']} (ideal={ideal_n_zones}) "
+        f"areas={areas} multipolygons={types.count('MultiPolygon')} -- {status}"
+    )
+    return not issues
+
+
 def run() -> bool:
     """Returns True if every field/target combination looks clean, False if anything worth a
-    second look was found - printed either way."""
+    second look was found - printed either way.
+
+    Runs EVERY field/target through BOTH of compute_field_zones' independent code paths:
+    whole-field-only (zone_polygon_lonlat=None) and subfield-scoped (zone_polygon_lonlat=polygon,
+    i.e. the whole field passed as its own "subfield"). These are NOT redundant - they diverge
+    deep inside the function (_snap_to_zone_boundary and its own separate rebalance/cap-check only
+    run on the subfield-scoped path - see field_zones.py's own "if zone_polygon_lonlat is not
+    None" branches). Testing only the whole-field path (as this script did until 2026-07-29) is
+    not a superset check: a real, previously-shipped bug (a boundary-resimplify bulge manufacturing
+    an extra over-ideal zone) was fixed once on the whole-field path, verified clean here, but
+    still reached production because krecik's real frontend (routes.component.ts's
+    runLopataZoning()) ALWAYS sends zone_polygon_lonlat - even for the default "whole field as one
+    manually-drawn sample" case - so it only ever exercises the subfield-scoped path, which had
+    the exact same bug independently in a different function neither this script nor the first fix
+    ever touched. See D:\\..\\memory ndvi_zone_construction_fixes_2026-07-28 for the full story."""
     all_ok = True
     for field in FIELDS:
         polygon = _wkt_to_lonlat(field["wkt_2180"])
         print(f"=== field {field['field_id']} \"{field['name']}\" ===")
         for target_ha in TARGET_SIZES_HA:
-            result = fz.compute_field_zones(
-                polygon_lonlat=polygon, target_plot_size_ha=target_ha, field_id=field["field_id"],
-                max_sample_points_per_zone=MAX_SAMPLE_POINTS_PER_ZONE,
-            )
-            areas = sorted(f["properties"]["area_ha"] for f in result["features"])
-            types = [f["geometry"]["type"] for f in result["features"]]
-            field_area_ha = result["field_area_ha"]
-
-            target_max_ha = min(4.0, target_ha * 1.25)
-            ideal_n_zones = math.ceil(field_area_ha / target_ha)
-
-            issues = []
-            if any(a > target_max_ha + 1e-6 for a in areas):
-                issues.append(f"zone over cap ({target_max_ha}ha)")
-            if any(a < 0.01 for a in areas):
-                issues.append("degenerate near-zero-area zone")
-            if result["n_zones"] > ideal_n_zones:
-                issues.append(f"more zones than ideal (ideal={ideal_n_zones})")
-            issues.extend(_check_sample_point_continuity(result))
-            issues.extend(_check_sample_point_path_efficiency(result))
-            issues.extend(_check_zone_geometry_validity(result))
-
-            status = "OK" if not issues else "CHECK: " + "; ".join(issues)
-            if issues:
-                all_ok = False
-            print(
-                f"  @{target_ha}ha -> n_zones={result['n_zones']} (ideal={ideal_n_zones}) "
-                f"areas={areas} multipolygons={types.count('MultiPolygon')} -- {status}"
-            )
+            all_ok &= _run_one(field, polygon, target_ha, use_subfield_path=False)
+            all_ok &= _run_one(field, polygon, target_ha, use_subfield_path=True)
     return all_ok
 
 

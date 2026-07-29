@@ -8,7 +8,7 @@ import shapely
 from pyproj import Transformer
 from shapely.affinity import rotate as _shp_rotate
 from shapely.errors import GEOSException
-from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box, mapping
+from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon, box, mapping
 from shapely.ops import transform as shp_transform
 from shapely.ops import linemerge, polygonize, unary_union
 from shapely.vectorized import contains as _shapely_contains
@@ -309,10 +309,16 @@ def _safe_union(geoms: list):
     The retry itself is wrapped too (unlike an earlier version of this function) - verified in
     production that shapely.set_precision() snapping the inputs can itself throw a *second*,
     different GEOSException ("unable to assign free hole to a shell") on the same ill-conditioned
-    geometry that triggered the first one. An unwrapped retry step meant the very fallback added
-    to prevent a 502 became the 502 - falls back to just the first input geometry, unmerged,
-    if even the snapped retry still fails, the same "give up gracefully" direction _safe_buffer0/
-    _safe_intersection/_safe_difference already take."""
+    geometry that triggered the first one. An unwrapped retry step used to mean the very fallback
+    added to prevent a 502 became the 502 - now falls back to _incremental_union_fallback (see
+    its own docstring) rather than just returning geoms[0]: for a 2-geometry call site that's the
+    same thing, but for a call site that unions dozens/hundreds of geometries at once (e.g.
+    _fill_field_edge_gaps unioning every zone of a real field to find what's NOT covered),
+    returning only geoms[0] silently discards everyone else's area - confirmed in production on a
+    real, very non-convex 175-zone field: the whole-list union failed once on ONE bad pairwise
+    interaction, geoms[0] (a single ~0.5ha zone) was returned as "covered", and
+    _fill_field_edge_gaps then treated the other ~101ha of the field as one giant "gap" and
+    dumped it all onto a single neighboring zone."""
     try:
         return unary_union(geoms)
     except GEOSException as e:
@@ -325,10 +331,43 @@ def _safe_union(geoms: list):
             return unary_union(snapped)
         except GEOSException:
             logger.exception(
-                "unary_union still failed after precision snapping - returning just the first "
-                "input geometry unmerged rather than failing the whole request"
+                "unary_union still failed after precision snapping - falling back to an "
+                "incremental pairwise union so one bad geometry doesn't silently wipe out "
+                "every other input's area"
             )
-            return geoms[0]
+            return _incremental_union_fallback(geoms)
+
+
+def _incremental_union_fallback(geoms: list):
+    """Last-resort fallback for _safe_union when even a whole-list precision-snap retry fails -
+    see _safe_union's own docstring for why a plain geoms[0] passthrough is dangerous for a
+    call site that unions many geometries at once.
+
+    Folds the list left-to-right, unioning one geometry into the running accumulator at a time
+    (with the same try -> snap-and-retry sequence _safe_union itself uses, just scoped to the
+    single accumulator/geom pair). If one specific geometry can't be merged even after its own
+    precision-snap retry, it's skipped (logged, not silently ignored) and folding continues with
+    the rest - so one ill-conditioned geometry only costs its OWN area being left out of the
+    union, not every other geometry's."""
+    accumulator = geoms[0]
+    for geom in geoms[1:]:
+        try:
+            accumulator = unary_union([accumulator, geom])
+            continue
+        except GEOSException:
+            pass
+        try:
+            snapped_pair = [
+                shapely.set_precision(accumulator, grid_size=_TOPOLOGY_FALLBACK_GRID_M),
+                shapely.set_precision(geom, grid_size=_TOPOLOGY_FALLBACK_GRID_M),
+            ]
+            accumulator = unary_union(snapped_pair)
+        except GEOSException:
+            logger.exception(
+                "incremental union fallback: one geometry could not be merged even after "
+                "precision snapping - skipping it, its own area will be left out of the union"
+            )
+    return accumulator
 
 
 def _safe_buffer0(geom):
@@ -1776,10 +1815,20 @@ def _longest_linestring_component(geom) -> LineString | None:
     return max(lines, key=lambda g: g.length)
 
 
+# Among candidate bisecting-chord angles (see _longest_bisecting_chord), only ones at least this
+# fraction of the single longest chord's own length are eligible for the NDVI tie-break below -
+# never trade away real reach/coverage for NDVI avoidance, only choose among directions that are
+# already close to equally long. 0.9 mirrors the same "don't sacrifice too much of the primary
+# goal" pattern BENT_ZONE_MIN_LENGTH_IMPROVEMENT_RATIO/BENT_ZONE_SIDE_ARM_MAX_DETOUR_RATIO already
+# use elsewhere in this file for an analogous tradeoff.
+BISECTING_CHORD_NDVI_MIN_LENGTH_RATIO = 0.9
+
+
 def _longest_bisecting_chord(
     polygon: Polygon,
     num_angle_samples: int = BISECTING_CHORD_ANGLE_SAMPLES,
     bisection_iterations: int = BISECTING_CHORD_BISECTION_ITERATIONS,
+    unsafe_points_m: np.ndarray | None = None,
 ) -> LineString | None:
     """Finds, among all lines that split polygon's own area into two (roughly) equal halves, the
     LONGEST one - see SAMPLE_POINT_ZIGZAG_AMPLITUDE_FRACTION's old docstring (now replaced by
@@ -1792,10 +1841,26 @@ def _longest_bisecting_chord(
     equals exactly half the polygon's total area (monotonic in cut position, so binary search is
     exact up to floating point/GEOS precision). The chord at that position (the polygon's own
     intersection with the horizontal line, rotated back to the original orientation) is a
-    candidate for "the" bisecting line at this angle; whichever angle's chord is longest overall
-    wins. Requested directly after a real triangular zone: a corner-to-corner "diagonal" made no
-    sense for it (a triangle only has 3 corners), while a long line roughly bisecting its area is
-    a well-defined, sensible substitute a person would draw by hand too.
+    candidate for "the" bisecting line at this angle. Requested directly after a real triangular
+    zone: a corner-to-corner "diagonal" made no sense for it (a triangle only has 3 corners),
+    while a long line roughly bisecting its area is a well-defined, sensible substitute a person
+    would draw by hand too.
+
+    unsafe_points_m: when given (the zone's own worst-20%-NDVI candidate pixels, in the same UTM
+    frame as polygon - see SAMPLE_POINT_WORST_PERCENTILE), breaks ties among near-longest
+    candidates by which direction runs through the LEAST worst-NDVI territory, instead of always
+    taking the single longest chord regardless of what it runs through. Pure length-only
+    selection is blind to NDVI entirely - confirmed on a real zone (field 369 "Bełcz Wielki 288"
+    @4ha): the geometrically-longest chord ran diagonally straight through a large contiguous
+    patch of the zone's own worst-20%-NDVI pixels, and _best_candidate's SAFE_PREFERENCE_MAX_
+    REACH_MULTIPLE bound (needed to stop an UNRELATED bug - see that constant's own docstring)
+    then had no choice but to accept several worst-NDVI points along that stretch rather than
+    detour far around it - a problem better solved at direction-choice time, before that stretch
+    is ever committed to, than patched at point-selection time after the fact. Only ever a
+    tie-break among directions within BISECTING_CHORD_NDVI_MIN_LENGTH_RATIO of the single longest
+    chord (see that constant's own docstring) - never picks a meaningfully shorter chord just to
+    dodge a bad patch, since a shorter chord under-covers the zone's real extent regardless of
+    NDVI, a worse tradeoff than occasionally touching a bad pixel.
 
     Uses _safe_intersection (not raw .intersection) for both the area-clipping and the final
     chord extraction, since this runs once per zone per real request and a GEOS topology
@@ -1813,6 +1878,11 @@ def _longest_bisecting_chord(
     total_area = polygon.area
     half_area = total_area / 2.0
 
+    # A rough "typical half-width" of the zone, used only to size the corridor the NDVI tie-break
+    # (below) counts unsafe_points_m within - modeling the zone as a rectangle of the same area
+    # whose length is the longest chord found (area = length * width). Computed once with a first
+    # length-only pass, before the corridor can be sized at all.
+    candidates: list[tuple[float, LineString]] = []
     best_chord: LineString | None = None
     best_length = -1.0
 
@@ -1836,12 +1906,40 @@ def _longest_bisecting_chord(
 
         cut_line = LineString([(rminx - pad, cut_y), (rmaxx + pad, cut_y)])
         chord = _longest_linestring_component(_safe_intersection(rotated, cut_line))
-        if chord is None or chord.length <= best_length:
+        if chord is None:
             continue
-        best_length = chord.length
-        best_chord = _shp_rotate(chord, angle_deg, origin=(0, 0), use_radians=False)
+        chord = _shp_rotate(chord, angle_deg, origin=(0, 0), use_radians=False)
+        if unsafe_points_m is not None and len(unsafe_points_m) > 0:
+            candidates.append((chord.length, chord))
+        if chord.length > best_length:
+            best_length = chord.length
+            best_chord = chord
 
-    return best_chord
+    if unsafe_points_m is None or len(unsafe_points_m) == 0 or not candidates or best_length <= 0:
+        return best_chord
+
+    eligible = [(length, chord) for length, chord in candidates if length >= best_length * BISECTING_CHORD_NDVI_MIN_LENGTH_RATIO]
+    if len(eligible) <= 1:
+        return best_chord
+
+    corridor_half_width = max(total_area / best_length * 0.5, 1e-6)
+
+    def _unsafe_exposure(chord: LineString) -> int:
+        corridor = chord.buffer(corridor_half_width, cap_style="flat")
+        inside = _shapely_contains(
+            corridor, unsafe_points_m[:, 0], unsafe_points_m[:, 1]
+        )
+        return int(inside.sum())
+
+    best_length_chord, best_exposure = best_chord, _unsafe_exposure(best_chord)
+    for length, chord in eligible:
+        if chord is best_length_chord:
+            continue
+        exposure = _unsafe_exposure(chord)
+        if exposure < best_exposure:
+            best_length_chord, best_exposure = chord, exposure
+
+    return best_length_chord
 
 
 
@@ -1863,9 +1961,122 @@ BENT_ZONE_MAX_CONVEX_RATIO = 0.85
 # bisecting angle has no awareness of which direction real candidates actually lie in.
 BENT_ZONE_MIN_LENGTH_IMPROVEMENT_RATIO = 0.8
 
+# Upper bound on how many convex-hull vertices of the real candidate cloud are offered to
+# _longest_geodesic_vertex_path as anchor candidates (see that function's own docstring for why
+# passing the whole hull, not just the single euclidean-farthest pair, matters). The visibility
+# graph's cost is dominated by the polygon's own vertex count (often 50-150+), not by how many
+# anchor candidates are added - this cap is a generosity bound against a pathological candidate
+# cloud with an unusually large hull, not a real performance constraint in practice.
+BENT_ZONE_MAX_ANCHOR_CANDIDATES = 20
+
+# How far a real candidate must sit off the main (major-PCA-axis) direction, as a fraction of that
+# axis's own span, before it's treated as a genuine SIDE ARM worth explicitly routing through -
+# see _side_arm_waypoint_candidates's docstring. Ordinary cloud "width" (candidates scattered a bit off the
+# main line, not a real second direction) shouldn't trigger this - 0.28 was chosen by checking the
+# real motivating case (field 369 "Bełcz Wielki 288" @4ha): the side arm's deviation there is
+# ~30% of the major axis's span, just above this bar (a stricter 0.35 first tried missed it) -
+# verified via the full regression corpus that this doesn't fire on any other zone's ordinary,
+# not-a-real-arm candidate scatter.
+BENT_ZONE_SIDE_ARM_MIN_FRACTION = 0.28
+
+# A detected side arm is only routed through if doing so doesn't lengthen the path past this many
+# times the plain 2-point geodesic's own length - see the call site's comment for why: on the real
+# motivating case (field 369 "Bełcz Wielki 288" @4ha), the true geodesic detour needed to reach the
+# side arm was 2.46x the direct path (844m vs 344m) - the real boundary between the main axis and
+# that arm is far more convoluted than the arm's own straight-line PCA deviation suggested, so
+# forcing the detour in produces a much WORSE result (fails the walk's own downstream coverage
+# check, same as never detecting the arm at all) rather than a gentle curve. 1.5 accepts a
+# genuinely modest bend but rejects exactly this case, falling back to the plain 2-point path -
+# same as if no side arm had been detected, not a regression.
+BENT_ZONE_SIDE_ARM_MAX_DETOUR_RATIO = 1.5
+
+
+# Upper bound on how many side-arm waypoint candidates _side_arm_waypoint_candidates returns -
+# see the call site's own comment for why trying several (most-deviating first) instead of only
+# the single most extreme one matters (a "partial detour" that reaches SOME real way into the arm,
+# when the full tip is too expensive, is better than no detour at all). Each candidate tried costs
+# one more _geodesic_path_via_waypoints call (2 more Dijkstra sweeps) - only reached for zones
+# already flagged bent (convex_ratio < BENT_ZONE_MAX_CONVEX_RATIO, a minority), so a handful of
+# extra attempts per such zone is a bounded, acceptable cost.
+BENT_ZONE_SIDE_ARM_MAX_CANDIDATES = 6
+
+
+def _side_arm_waypoint_candidates(points_m: np.ndarray) -> list[tuple[float, float]]:
+    """Finds real candidates that sit far off the cloud's own major (PCA) axis relative to that
+    axis's own length - genuine SIDE ARM points (an L/T-shaped zone's shorter branch), not just
+    normal 2D scatter - ordered from MOST deviating (deepest into the arm) to least. Empty list if
+    no candidate deviates enough to count as one.
+
+    Exists because _longest_geodesic_vertex_path's geodesic double-sweep (see that function's own
+    docstring) picks whichever anchor PAIR has the longest path BETWEEN THEM - which does NOT
+    guarantee every arm gets visited, only that the resulting path is as long as possible. If a
+    side arm branches somewhere in the MIDDLE of the main axis (not at either end), a path from
+    one main-axis end, out to the side-arm tip, and back is often SHORTER than just going straight
+    to the other main-axis end - so the double-sweep correctly (by its own objective) ignores the
+    side arm entirely. Confirmed on a real zone (field 369 "Bełcz Wielki 288" @4ha): passing every
+    convex-hull vertex as an anchor candidate still produced the exact same 2-point path as the
+    single euclidean-farthest pair, because the side arm's real candidates never made the
+    geodesic-longest PAIR - visiting them only ever shortens the winning pair's own distance.
+
+    The fix is a different question entirely: not "which 2 points are farthest apart" but "is
+    there a real candidate that the winning 2-point path doesn't explain at all." Answered
+    directly via PCA: project every candidate onto the cloud's own minor axis (perpendicular to
+    its major axis) - any candidate whose ABSOLUTE deviation is a large enough fraction of the
+    major axis's own span (BENT_ZONE_SIDE_ARM_MIN_FRACTION) is a real side-arm candidate; ordinary
+    cloud width doesn't get anywhere close to that fraction on a real zone's own natural candidate
+    scatter. Returns every such candidate, most-deviating first (capped at
+    BENT_ZONE_SIDE_ARM_MAX_CANDIDATES) rather than only the single most extreme one - see the call
+    site for why trying progressively less-deep candidates matters when the deepest one's detour
+    is too expensive."""
+    if len(points_m) < 4:
+        return []
+    centered = points_m - points_m.mean(axis=0)
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    major_axis = eigvecs[:, int(np.argmax(eigvals))]
+    minor_axis = eigvecs[:, int(np.argmin(eigvals))]
+    major_proj = centered @ major_axis
+    minor_proj = centered @ minor_axis
+    major_extent = float(major_proj.max() - major_proj.min())
+    if major_extent < 1e-6:
+        return []
+    deviations = np.abs(minor_proj)
+    threshold = BENT_ZONE_SIDE_ARM_MIN_FRACTION * major_extent
+    qualifying = np.where(deviations >= threshold)[0]
+    if len(qualifying) == 0:
+        return []
+    ranked = qualifying[np.argsort(-deviations[qualifying])]
+    ranked = ranked[:BENT_ZONE_SIDE_ARM_MAX_CANDIDATES]
+    return [tuple(points_m[i]) for i in ranked]
+
+
+def _geodesic_path_via_waypoints(
+    polygon: Polygon, waypoints: list[tuple[float, float]]
+) -> LineString | None:
+    """Chains _longest_geodesic_vertex_path across consecutive PAIRS of an ordered waypoint list,
+    concatenating the segments into one continuous LineString - lets a guide line explicitly pass
+    through a real side-arm waypoint (see _side_arm_waypoint_candidates) instead of only ever connecting the
+    two geodesically-farthest-apart points. Returns None if any leg has no path (mirroring
+    _longest_geodesic_vertex_path's own None-on-failure contract) rather than returning a partial,
+    silently-shorter route."""
+    if len(waypoints) < 2:
+        return None
+    coords: list[tuple[float, float]] = []
+    for i in range(len(waypoints) - 1):
+        leg = _longest_geodesic_vertex_path(polygon, (waypoints[i], waypoints[i + 1]))
+        if leg is None:
+            return None
+        leg_coords = list(leg.coords)
+        if coords and coords[-1] == leg_coords[0]:
+            leg_coords = leg_coords[1:]
+        coords.extend(leg_coords)
+    if len(coords) < 2:
+        return None
+    return LineString(coords)
+
 
 def _longest_geodesic_vertex_path(
-    polygon: Polygon, anchor_points: tuple[tuple[float, float], tuple[float, float]] | None = None
+    polygon: Polygon, anchor_points: tuple[tuple[float, float], ...] | None = None
 ) -> LineString | None:
     """A "taut string" path between two points, allowed to bend at reflex vertices, unlike
     _longest_bisecting_chord's single straight line. Only called for zones _longest_bisecting_chord
@@ -1884,30 +2095,54 @@ def _longest_geodesic_vertex_path(
     relative to the chord's own length, which the spilled-past-the-end points get clamped to by
     LineString.project(), masking the real gap as "full coverage").
 
-    anchor_points: when given (two (x,y) UTM points - the caller passes the two most mutually
-    distant REAL CANDIDATE pixels, not just any two points), the path connects exactly these two
-    points instead of picking endpoints by the polygon's own geometric diameter. Endpoint choice
-    matters: the polygon's true geometric diameter can land on a vertex that's real (part of the
-    zone's actual boundary) but has almost no usable candidate pixels near it at all - confirmed
-    on a real zone (field 127 "Tworzanice 60" @4ha): the diameter's far vertex sat in a corner
-    with ZERO real candidates within the last ~40% of the resulting path, so _compute_zone_
-    sample_points' targets there had nothing to match, and _truncate_to_supported_span (an earlier
-    fix attempt) could only cut the unsupported tail off rather than aim the path better in the
-    first place - still left the truncated path only reaching partway into the zone, since it was
-    built toward the wrong corner to begin with. Anchoring both ends at real, well-separated data
-    points instead means the whole path is candidate-relevant by construction - no truncation
-    needed. Falls back to the plain vertex-diameter double-sweep when anchor_points is None (e.g.
-    a degenerate zone with too few real candidates to pick two anchors from).
+    anchor_points: when given (two or more (x,y) UTM points - real candidate pixels, not just any
+    points), the path connects whichever TWO of them are geodesically farthest apart (see the
+    double-sweep description below), instead of picking endpoints by the polygon's own geometric
+    diameter. Endpoint choice matters: the polygon's true geometric diameter can land on a vertex
+    that's real (part of the zone's actual boundary) but has almost no usable candidate pixels
+    near it at all - confirmed on a real zone (field 127 "Tworzanice 60" @4ha): the diameter's far
+    vertex sat in a corner with ZERO real candidates within the last ~40% of the resulting path,
+    so _compute_zone_sample_points' targets there had nothing to match, and
+    _truncate_to_supported_span (an earlier fix attempt) could only cut the unsupported tail off
+    rather than aim the path better in the first place - still left the truncated path only
+    reaching partway into the zone, since it was built toward the wrong corner to begin with.
+    Anchoring both ends at real data points instead means the whole path is candidate-relevant by
+    construction - no truncation needed. Falls back to the plain vertex-diameter double-sweep when
+    anchor_points is None (e.g. a degenerate zone with too few real candidates to pick anchors
+    from).
 
-    Builds a visibility graph over the polygon's own exterior vertices, PLUS the two anchor points
-    when given as two extra nodes (an edge between two nodes exists if the straight segment
-    between them lies entirely inside the polygon) - anchors get to bend around the same reflex
-    vertices as any other route through the zone. Without anchor_points, approximates the
-    polygon's own geometric diameter via the standard "double sweep" heuristic instead: Dijkstra
-    from an arbitrary vertex finds its farthest vertex A; Dijkstra from A finds ITS farthest
-    vertex B; the A-B shortest path is returned - an approximation, not a guaranteed-optimal
-    diameter, for a zone with several bends, but still a dramatic improvement over a stuck-in-one-
-    arm straight chord regardless.
+    Passing MORE than 2 candidates (added 2026-07-28) fixes a real, separate bug the original
+    exactly-2-anchor version had: the caller used to pick the single EUCLIDEAN-farthest pair of
+    real candidates (`_farthest_point_sample(points_m, 2)`) as the only two anchors - that metric
+    is blind to the polygon's own bends, so for an L-shaped zone whose main arm is notably LONGER
+    than its side arm, the euclidean-farthest pair always sits at the two ends of the long arm,
+    and the side arm (even one full of real, usable candidates) never gets anchored to at all.
+    Confirmed on a real zone (field 369 "Bełcz Wielki 288" @4ha): real candidates existed up to
+    170m further along the short arm than either chosen anchor, entirely unvisited. Passing the
+    convex hull vertices of the real candidate cloud (a handful of points, not all of them) as
+    anchor_points and picking the best PAIR via GEODESIC (not straight-line) double-sweep fixes
+    this at the source: a pair spanning two different arms has to bend around the zone's own
+    reflex vertices to connect, which the geodesic metric (unlike raw Euclidean distance) rewards
+    rather than ignores - the same double-sweep heuristic already used for the no-anchor case
+    below, just restricted to sweep among the candidate set instead of every polygon vertex.
+
+    Builds a visibility graph over the polygon's own exterior vertices, PLUS every anchor point
+    given as an extra node (an edge between two nodes exists if the straight segment between them
+    lies entirely inside the polygon) - anchors get to bend around the same reflex vertices as any
+    other route through the zone. Adding several anchor candidates instead of exactly 2 barely
+    changes this graph's cost: it's dominated by the polygon's own vertex count (often 50-150+ for
+    a real zone boundary), not by how many candidate anchors are searched among.
+
+    Endpoint SELECTION: with anchor_points given, runs the same "double sweep" heuristic as the
+    no-anchor case (Dijkstra from one candidate finds its geodesically farthest OTHER candidate A;
+    Dijkstra from A finds ITS farthest candidate B), but restricted to picking A and B from
+    anchor_points only, not any polygon vertex - so intermediate bends can still use any reflex
+    vertex, only the two ENDPOINTS are constrained to be real candidate-relevant points. Without
+    anchor_points at all, sweeps over every polygon vertex instead, approximating the polygon's own
+    geometric diameter: Dijkstra from an arbitrary vertex finds its farthest vertex A; Dijkstra from
+    A finds ITS farthest vertex B; the A-B shortest path is returned - an approximation, not a
+    guaranteed-optimal diameter, for a zone with several bends, but still a dramatic improvement
+    over a stuck-in-one-arm straight chord regardless.
 
     Downstream code (_compute_zone_sample_points) already treats guide_line as a generic
     LineString throughout (arc-length via .project()/.length, perpendicular offset via
@@ -1926,9 +2161,10 @@ def _longest_geodesic_vertex_path(
 
     start_idx: int | None = None
     end_idx: int | None = None
-    if anchor_points is not None:
-        coords = coords + [tuple(anchor_points[0]), tuple(anchor_points[1])]
-        start_idx, end_idx = n, n + 1
+    anchor_indices: list[int] = []
+    if anchor_points is not None and len(anchor_points) >= 2:
+        anchor_indices = list(range(n, n + len(anchor_points)))
+        coords = coords + [tuple(p) for p in anchor_points]
         n = len(coords)
 
     # A small tolerance buffer (not raw polygon.covers/.contains) so a segment that runs exactly
@@ -1965,19 +2201,27 @@ def _longest_geodesic_vertex_path(
                     heapq.heappush(heap, (nd, v))
         return dist
 
-    def _farthest(source: int, dist: list[float]) -> int:
-        return max(range(n), key=lambda i: (dist[i] if math.isfinite(dist[i]) else -1.0, i != source))
+    def _farthest(source: int, dist: list[float], among: list[int]) -> int:
+        return max(among, key=lambda i: (dist[i] if math.isfinite(dist[i]) else -1.0, i != source))
 
-    if start_idx is None:
-        dist_from_0 = _dijkstra(0)
-        if not any(math.isfinite(d) for i, d in enumerate(dist_from_0) if i != 0):
-            return None  # vertex 0 isolated (shouldn't happen for a real simple polygon)
-        vertex_a = _farthest(0, dist_from_0)
-        dist_from_a = _dijkstra(vertex_a)
-        vertex_b = _farthest(vertex_a, dist_from_a)
-        if vertex_a == vertex_b or not math.isfinite(dist_from_a[vertex_b]):
-            return None
-        start_idx, end_idx = vertex_a, vertex_b
+    # Double-sweep: from ANY starting node, Dijkstra finds the geodesically farthest node among
+    # the allowed candidates (`sweep_pool` - either just the anchors, or every polygon vertex when
+    # there are no anchors at all), then Dijkstra from THAT finds its own farthest candidate. Two
+    # Dijkstra runs total regardless of how many candidates are being swept over - see this
+    # function's own docstring for why this is what fixed the euclidean-farthest-pair bug (a pair
+    # spanning two different arms of a bent zone requires bending around a reflex vertex to
+    # connect, which raw Euclidean distance is blind to but geodesic distance rewards).
+    sweep_pool = anchor_indices if anchor_indices else list(range(n))
+    seed = sweep_pool[0]
+    dist_from_seed = _dijkstra(seed)
+    if not any(math.isfinite(dist_from_seed[i]) for i in sweep_pool if i != seed):
+        return None  # every other candidate is unreachable from the seed
+    vertex_a = _farthest(seed, dist_from_seed, sweep_pool)
+    dist_from_a = _dijkstra(vertex_a)
+    vertex_b = _farthest(vertex_a, dist_from_a, sweep_pool)
+    if vertex_a == vertex_b or not math.isfinite(dist_from_a[vertex_b]):
+        return None
+    start_idx, end_idx = vertex_a, vertex_b
 
     # Reconstruct the shortest path start->end by re-running Dijkstra with predecessor tracking -
     # kept as a second pass (rather than tracking predecessors in the hot loop above) since this
@@ -2119,6 +2363,16 @@ def _compute_zone_sample_points(
     # only meant to keep individual candidate POINTS off the very edge, not shrink the chord
     # itself, which candidates are then matched against).
     guide_line: LineString | None = None
+    # Set True below when a genuine side arm was DETECTED (a real, substantial secondary
+    # direction - see _side_arm_waypoint_candidates) but every candidate's detour cost exceeded
+    # BENT_ZONE_SIDE_ARM_MAX_DETOUR_RATIO, so the plain main-axis-only line was kept instead. That
+    # plain line's own t_coverage (checked much further below) is always high in this case - it
+    # measures coverage along the CHOSEN line's own axis, which by construction never included
+    # the arm, so it can't see that a real chunk of the zone's candidates were left off it
+    # entirely. Forces the coverage-agnostic _farthest_point_fallback() (which spreads points by
+    # PCA of the REAL candidate cloud, arm included, not a shape-only guide line) instead of
+    # silently shipping a technically-clean-looking line that skips a whole arm.
+    unreachable_side_arm = False
     if geom is not None and not geom.is_empty:
         try:
             utm_zone_geom = shp_transform(transformer.transform, geom)
@@ -2133,7 +2387,7 @@ def _compute_zone_sample_points(
             # elsewhere in this file for the same bug class) fixes validity here with a
             # negligible area change, and _longest_bisecting_chord then returns a sane result.
             utm_zone_geom = _safe_buffer0(utm_zone_geom)
-            guide_line = _longest_bisecting_chord(utm_zone_geom)
+            guide_line = _longest_bisecting_chord(utm_zone_geom, unsafe_points_m=points_m[~ndvi_safe])
 
             # A bent ("L"/"U") zone can leave even the LONGEST straight chord stuck inside a
             # single arm - see _longest_geodesic_vertex_path's own docstring for the real bug
@@ -2148,19 +2402,115 @@ def _compute_zone_sample_points(
             # the resulting path. An earlier fix truncated the path down to its supported leading
             # stretch after the fact - better than nothing, but the truncated stretch was still
             # aimed at the (wrong) geometric corner to begin with, and still ended up visibly
-            # short of the zone's other real candidate-dense areas. Anchoring both endpoints at
-            # the two most mutually distant REAL CANDIDATE pixels instead (see
-            # _longest_geodesic_vertex_path's own docstring) fixes this at the source - the whole
-            # path is candidate-relevant by construction, no truncation needed.
+            # short of the zone's other real candidate-dense areas. Anchoring endpoints at REAL
+            # CANDIDATE pixels instead (see _longest_geodesic_vertex_path's own docstring) fixes
+            # this at the source - the whole path is candidate-relevant by construction, no
+            # truncation needed.
+            #
+            # Anchor CANDIDATES are the convex hull of the real candidate cloud (every "extremal"
+            # direction, not just the single euclidean-farthest pair) - picking the single
+            # euclidean-farthest pair was ITSELF a real, separate bug: for an L-shaped zone whose
+            # main arm is notably longer than its side arm, the euclidean-farthest pair always
+            # sits at the two ends of the long arm, so the side arm never gets anchored to at all,
+            # however much real data it has (confirmed on a real zone, field 369 "Bełcz Wielki
+            # 288" @4ha: real candidates existed up to 170m further along the short arm than
+            # either euclidean-chosen anchor, entirely unvisited). Passing the whole hull lets
+            # _longest_geodesic_vertex_path's geodesic (not euclidean) double-sweep pick whichever
+            # PAIR of hull points is farthest APART ALONG THE ZONE'S OWN SHAPE, which naturally
+            # favors a pair spanning two different arms when one exists (bending around a reflex
+            # vertex to connect them makes the geodesic distance between them large, even though
+            # their straight-line distance might be small). Capped at
+            # BENT_ZONE_MAX_ANCHOR_CANDIDATES - the visibility graph's cost is dominated by the
+            # polygon's own vertex count, not by how many anchor candidates are added, so this cap
+            # is a generosity bound, not a real performance constraint.
             if utm_zone_geom.geom_type == "Polygon" and utm_zone_geom.convex_hull.area > 0:
                 convex_ratio = utm_zone_geom.area / utm_zone_geom.convex_hull.area
                 if convex_ratio < BENT_ZONE_MAX_CONVEX_RATIO:
-                    anchor_idx = _farthest_point_sample(points_m, 2)
-                    anchor_points = (
-                        (tuple(points_m[anchor_idx[0]]), tuple(points_m[anchor_idx[1]]))
-                        if len(anchor_idx) == 2 else None
-                    )
+                    anchor_points: tuple[tuple[float, float], ...] | None
+                    candidate_hull = MultiPoint([tuple(p) for p in points_m]).convex_hull
+                    if candidate_hull.geom_type == "Polygon":
+                        hull_coords = list(candidate_hull.exterior.coords[:-1])
+                        if len(hull_coords) > BENT_ZONE_MAX_ANCHOR_CANDIDATES:
+                            stride = len(hull_coords) / BENT_ZONE_MAX_ANCHOR_CANDIDATES
+                            hull_coords = [
+                                hull_coords[int(i * stride)] for i in range(BENT_ZONE_MAX_ANCHOR_CANDIDATES)
+                            ]
+                        anchor_points = tuple(hull_coords) if len(hull_coords) >= 2 else None
+                    else:
+                        anchor_idx = _farthest_point_sample(points_m, 2)
+                        anchor_points = (
+                            (tuple(points_m[anchor_idx[0]]), tuple(points_m[anchor_idx[1]]))
+                            if len(anchor_idx) == 2 else None
+                        )
                     geodesic_line = _longest_geodesic_vertex_path(utm_zone_geom, anchor_points)
+
+                    # The geodesic-farthest PAIR is not guaranteed to visit every arm of a bent
+                    # zone - only to be as long as possible (see _side_arm_waypoint_candidates's
+                    # own docstring for why a side arm branching mid-way along the main axis can
+                    # go entirely unvisited even with every hull vertex offered as a candidate
+                    # anchor). If a real candidate sits far enough off the cloud's own major axis
+                    # to count as a genuine side arm, try explicitly routing THROUGH it as a 3rd
+                    # waypoint (ordered by position along the major axis) instead of only ever
+                    # connecting the 2 points that make the longest single path.
+                    #
+                    # Only ACCEPT a detour that isn't wildly longer than the direct 2-point
+                    # geodesic - confirmed on the real motivating case (field 369 "Bełcz Wielki
+                    # 288" @4ha) that forcing a detour ALL THE WAY to the single deepest side-arm
+                    # point unconditionally can cost 2.5x the direct path (844m vs 344m): the real
+                    # boundary between the main axis and that particular arm is apparently far
+                    # more convoluted than the straight-line PCA deviation suggested (likely
+                    # carved by an adjacent zone's own irregular edge), so bending all the way to
+                    # the tip isn't a "gentle curve" but a large detour that then fails the walk's
+                    # own downstream t_coverage/path_inefficiency sanity check anyway (see below) -
+                    # worse than not trying at all.
+                    #
+                    # Rather than all-or-nothing (either the single deepest point or nothing),
+                    # try EVERY qualifying side-arm candidate, deepest first, and take the FIRST
+                    # (deepest) one whose resulting detour still fits BENT_ZONE_SIDE_ARM_MAX_
+                    # DETOUR_RATIO - a genuinely PARTIAL detour that reaches as far real into the
+                    # arm as the budget allows, instead of only ever choosing between "all the way"
+                    # and "not at all". A shallower candidate typically costs a smaller detour
+                    # (less of the convoluted boundary to bend around to reach it), so scanning
+                    # deepest-to-shallowest and stopping at the first success tends to land on the
+                    # deepest point the budget can actually afford - not guaranteed monotonic for
+                    # every zone shape, but each attempt is verified against its own real detour
+                    # ratio, never assumed.
+                    if geodesic_line is not None and anchor_points:
+                        main_a, main_b = geodesic_line.coords[0], geodesic_line.coords[-1]
+                        centroid = points_m.mean(axis=0)
+                        major_axis_vec = np.array(main_b) - np.array(main_a)
+                        _side_arm_candidates = _side_arm_waypoint_candidates(points_m)
+                        for side_arm in _side_arm_candidates:
+                            # The path's own first/last coordinates ARE the winning anchor pair -
+                            # anchors are graph nodes the shortest path starts/ends at exactly, no
+                            # need to re-derive which pair was chosen.
+                            waypoints = sorted(
+                                [main_a, main_b, side_arm],
+                                key=lambda p: float(np.dot(np.array(p) - centroid, major_axis_vec)),
+                            )
+                            bent_line = _geodesic_path_via_waypoints(utm_zone_geom, waypoints)
+                            if (
+                                bent_line is not None
+                                and bent_line.length <= geodesic_line.length * BENT_ZONE_SIDE_ARM_MAX_DETOUR_RATIO
+                            ):
+                                geodesic_line = bent_line
+                                break
+                        else:
+                            # Loop completed with no `break` - EVERY candidate's detour (not just
+                            # the deepest one) was too expensive, including the shallowest
+                            # candidates the partial-detour idea above was meant to rescue.
+                            # Confirmed on the real motivating case (field 369 "Bełcz Wielki 288"
+                            # @4ha): all 4 candidates cost 807-833m against a 521m budget (1.5x of
+                            # a 347m direct path) - barely varying with how deep into the arm the
+                            # candidate was, meaning the expense is in reaching the arm's
+                            # convoluted neck AT ALL, not in how far past it a candidate sits, so
+                            # no real candidate in this arm was ever going to fit. See
+                            # unreachable_side_arm's own docstring (set at this function's top)
+                            # for what happens next - the plain line's own t_coverage check further
+                            # below can't see this, so it needs this explicit flag instead.
+                            if _side_arm_candidates:
+                                unreachable_side_arm = True
+
                     straight_len = guide_line.length if guide_line is not None else 0.0
                     if geodesic_line is not None and geodesic_line.length > straight_len * BENT_ZONE_MIN_LENGTH_IMPROVEMENT_RATIO:
                         guide_line = geodesic_line
@@ -2296,10 +2646,12 @@ def _compute_zone_sample_points(
 
         return [[float(pool_lons[i]), float(pool_lats[i])] for i in chosen]
 
-    if guide_line is None or guide_line.length < 1e-6:
-        # No usable chord (degenerate/near-zero-area zone, or every candidate direction failed) -
-        # fall back to the old maximize-mutual-distance spread rather than collapsing every
-        # target onto one point.
+    if guide_line is None or guide_line.length < 1e-6 or unreachable_side_arm:
+        # No usable chord (degenerate/near-zero-area zone, or every candidate direction failed),
+        # OR a real side arm exists but no affordable detour reaches it (see
+        # unreachable_side_arm's own docstring) - either way, fall back to the old
+        # maximize-mutual-distance spread rather than collapsing every target onto one point, or
+        # silently shipping a clean-looking line that skips a whole arm of the zone.
         return _farthest_point_fallback()
 
     # t = how far along the chord a candidate's nearest point on it is; s = how far off the
@@ -3166,6 +3518,13 @@ def compute_field_zones(
     # can, for a non-convex outline, snap to a *different*, nearer part of that ring instead of
     # the intended nearby segment).
     if zone_polygon_lonlat is not None:
+        # Captured BEFORE _snap_to_zone_boundary runs - see the revalidated_entries fallback
+        # below (mirrors the later "Final re-simplification pass" fallback's own reasoning: a
+        # boundary-adjustment pass with no "stay inside budget" constraint can push a zone a
+        # little over cap for purely cosmetic reasons, and the pixel-mask-based donation right
+        # after it can't see that specific kind of overage - falling straight through to a
+        # destructive re-split manufactures an avoidable extra zone).
+        pre_snap_entries = final_entries
         # Was max(resolution_m * 10, 20.0) - a flat 10x-resolution tolerance (100m at the default
         # resolution_m=10) with no tie to what actually causes the seam discrepancy this snap
         # exists to fix: two independent compute_field_zones() calls dividing adjacent subfields
@@ -3234,10 +3593,31 @@ def compute_field_zones(
             new_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), new_geom_utm)
             rebalanced_entries.append((rebalance_masks[idx], new_geom))
 
+        # Looked up by mask OBJECT IDENTITY (not list index) below - cleaned_entries above can drop
+        # entries entirely (a snap that collapsed a zone to nothing), so positional alignment with
+        # pre_snap_entries isn't guaranteed, but the mask array object itself is only ever
+        # REPLACED (never mutated in place) by the rebalance donation step just above - so any
+        # zone whose mask object here is still the exact same one from pre_snap_entries is a zone
+        # rebalancing never touched, safe to compare against its own pre-snap geometry.
+        pre_snap_by_mask_id = {id(mask): geom for mask, geom in pre_snap_entries}
+
         revalidated_entries: list[tuple[np.ndarray, object]] = []
         for mask, geom in rebalanced_entries:
             if _area_ha(geom, transformer) <= target_max_ha:
                 revalidated_entries.append((mask, geom))
+                continue
+
+            # Same reasoning as the "Final re-simplification pass" fallback further below:
+            # _snap_to_zone_boundary has no "stay inside budget" constraint (see this block's own
+            # docstring) and can push a zone a little over cap for a purely cosmetic reason the
+            # pixel-mask-based donation just above can't see (it reasons in raster pixel-mask
+            # space, a boundary nudge that doesn't newly contain any pixel CENTER leaves the mask,
+            # and therefore the donation check, completely unchanged). If this exact zone's
+            # PRE-snap geometry was already under cap, use that instead of manufacturing a whole
+            # new zone via a destructive re-split for what's likely just snap-induced drift.
+            pre_geom = pre_snap_by_mask_id.get(id(mask))
+            if pre_geom is not None and _area_ha(pre_geom, transformer) <= target_max_ha:
+                revalidated_entries.append((mask, pre_geom))
                 continue
 
             zone_mask = valid & _shapely_contains(geom, grid_lon, grid_lat)
@@ -3299,9 +3679,12 @@ def compute_field_zones(
     resimplify_masks = [valid & _shapely_contains(geom, grid_lon, grid_lat) for _, geom in final_entries]
     resimplify_sizes_before = [int(m.sum()) for m in resimplify_masks]
     _rebalance_oversized_zones(resimplify_masks, max_pixels)
+    rebalance_untouched = [
+        int(resimplify_masks[i].sum()) == resimplify_sizes_before[i] for i in range(len(resimplify_masks))
+    ]
     rebalanced_final: list[tuple[np.ndarray, object]] = []
     for idx, (mask, geom) in enumerate(final_entries):
-        if int(resimplify_masks[idx].sum()) == resimplify_sizes_before[idx]:
+        if rebalance_untouched[idx]:
             rebalanced_final.append((mask, geom))
             continue
         new_geom = _raw_zone_geometry(resimplify_masks[idx])
@@ -3313,10 +3696,40 @@ def compute_field_zones(
         rebalanced_final.append((resimplify_masks[idx], new_geom))
 
     capped_final: list[tuple[np.ndarray, object]] = []
-    for mask, geom in rebalanced_final:
+    for idx, (mask, geom) in enumerate(rebalanced_final):
         if _area_ha(geom, transformer) <= target_max_ha:
             capped_final.append((mask, geom))
             continue
+
+        # This resimplification pass's own docstring already documents that Douglas-Peucker can
+        # bulge a zone's boundary outward at a concave point, pushing it a little over
+        # target_max_ha with NO corresponding increase in the zone's actual raster pixel
+        # footprint - the donation-first rebalance just above can't see this at all (it reasons
+        # entirely in pixel-mask space via _shapely_contains/max_pixels, and a boundary bulge
+        # that doesn't newly contain any pixel CENTER leaves the mask, and therefore the pixel
+        # count, completely unchanged). Falling straight through to a full re-split in that case
+        # manufactures a whole extra zone (confirmed on a real field, "Bełcz Wielki 288"
+        # id 369 @4ha: a zone at a clean 3.94ha pre-resimplify came back 4.02ha post-resimplify -
+        # a 0.02ha/0.5% bulge, well under a single pixel's worth of area - and got violently
+        # split into two ~2ha pieces for it) for what the PRE-resimplify geometry at this same
+        # index already proves is not a real overage: that geometry (same mask, same underlying
+        # pixels, no bulge) was under target_max_ha the whole time. Reverting to it here - rather
+        # than re-splitting - keeps the pixel-accurate zone count the earlier, pixel-budgeted
+        # construction pass (_balanced_contiguous_zones/_bisection_contiguous_zones, both of
+        # which already respected max_pixels) worked out, at the cost of that one zone keeping
+        # its pre-resimplify (slightly less smoothed) boundary instead of the fully re-threaded
+        # shared-edge network - a real but far smaller cosmetic tradeoff than an unnecessary extra
+        # zone. Only fall through to the destructive re-split when the pre-resimplify geometry was
+        # ALREADY over cap too (a genuine overage resimplification didn't cause), or when the
+        # rebalance step above actually donated pixels to/from this zone (rebalance_untouched
+        # False) - reverting to the pre-donation geometry in that case would silently reopen an
+        # overlap/gap against whichever neighbor's own final geometry already accounted for that
+        # donation.
+        pre_mask, pre_geom = pre_resimplify_entries[idx]
+        if rebalance_untouched[idx] and _area_ha(pre_geom, transformer) <= target_max_ha:
+            capped_final.append((pre_mask, pre_geom))
+            continue
+
         zone_mask = valid & _shapely_contains(geom, grid_lon, grid_lat)
         if not zone_mask.any():
             capped_final.append((mask, geom))
