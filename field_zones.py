@@ -3049,6 +3049,40 @@ def _compute_zone_sample_points_legacy(
     # ever shortens or leaves unchanged an already-good path (so this is a no-op on the common
     # case), and a 2-opt local optimum is provably crossing-free for Euclidean distance.
     sorted_chosen = _two_opt_improve(points_m, sorted_chosen)
+
+    # Turn-angle smoothing safety net - added 2026-08-02 after a live 5-field x 4-target browser
+    # survey found this exact gap: _repair_and_smooth_order/_smooth_path_turns (built for, and
+    # already proven in, _farthest_point_fallback below and sample_points_sweep.py's own safety
+    # net) was NEVER applied to this - the MAIN chord-walk path, which is what the large majority
+    # of zones actually go through. The per-step _turn_ok_at_insertion check during the greedy
+    # walk above is only a soft, local, least-bad-option gate - it does not repair a result that's
+    # still sharp-cornered once fully built, unlike this pass. Confirmed on real live data (field
+    # 1 "Tworzanice 60" @1ha, zone 4 among others): worst turn angles up to 150 degrees on zones
+    # that went through this exact path, not the fallback.
+    #
+    # A more aggressive multi-start search (mirroring the fallback's own two-tier design) was
+    # tried and REMOVED same day: gated at a 90-degree trigger (looser than
+    # SAMPLE_POINT_MAX_TURN_ANGLE_DEGREES=30, specifically to make it rare) plus a path-length
+    # guard AND a max-single-step guard (both needed - the search readily trades one kind of
+    # defect for the other when unguarded, confirmed via full-corpus regression), it still added
+    # ~93s to a single real request (field 1 "Tworzanice 60" @1ha, 95 zones: 46.6s baseline vs
+    # 139.7s with the search enabled, measured directly with curl against a live kret+lopata
+    # instance) - this path runs for nearly every zone, and even a "rare" 90-degree-gated
+    # multi-start still fired often enough on a large zone count to make a single browser request
+    # take over two minutes, indistinguishable from hung/broken to a user. The cheap pass below
+    # alone costs ~5s extra on the same 95-zone request (46.6s -> 51.8s) - the multi-start
+    # search's marginal quality improvement (worst_turn 137.3 vs the cheap-pass-only number,
+    # never fully solving the small-zone hard-limit class either way - see
+    # ndvi_zone_boundary_invalid_data_gap memory) was not worth 18x that cost. If revisiting this,
+    # profile per-zone first (which of _remove_path_crossings/_remove_path_or_opt_spikes/
+    # _smooth_path_turns's own hill-climbing dominates) rather than reaching for the same
+    # multi-start shape again.
+    if len(sorted_chosen) > 2:
+        lonlat_pts_all = np.column_stack([lons, lats])
+        smoothed = _repair_and_smooth_order(points_m, lonlat_pts_all, sorted_chosen)
+        if smoothed is not None:
+            sorted_chosen = smoothed
+
     return [[float(lons[i]), float(lats[i])] for i in sorted_chosen]
 
 
