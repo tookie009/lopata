@@ -29,6 +29,7 @@ import math
 import numpy as np
 from pyproj import Transformer
 from shapely.geometry import shape
+from shapely.ops import transform as shp_transform
 
 import field_zones as fz
 
@@ -228,6 +229,35 @@ FIELDS = [
             "323047.384797404 417768.634072354, 323028.400660164 417758.43688748))"
         ),
     },
+    {
+        # Added 2026-07-29 from krecik dev DB farmer 1 ("www www") - see
+        # ndvi_stray_multipolygon_sliver memory for the investigation this came from.
+        "field_id": 447,
+        "name": "Lipno 447",
+        "wkt_2180": (
+            "POLYGON ((332342.360448816 453401.486351387, 332307.658446121 453310.391158079, "
+            "332180.541667742 453339.820048833, 332151.323613704 453346.589736638, "
+            "332154.80111032 453355.939085558, 332165.939061084 453385.127085839, "
+            "332178.694223693 453418.51157528, 332185.984689535 453437.615535599, "
+            "332191.832635605 453452.140719374, 332199.163907008 453471.30409974, "
+            "332207.107008451 453492.068581093, 332223.256279697 453534.553634739, "
+            "332241.334398605 453581.360852232, 332397.590467685 453545.253272739, "
+            "332379.483607924 453498.536434195, 332342.360448816 453401.486351387))"
+        ),
+    },
+    {
+        "field_id": 4502,
+        "name": "Studzionki 150/2",
+        "wkt_2180": (
+            "POLYGON ((315379.647073833 412488.615083794, 315371.91148867 412533.491220749, "
+            "315302.732023583 412551.645118632, 315303.78224947 412557.845050378, "
+            "315195.947359565 412611.124132128, 314999.598081247 412694.778941912, "
+            "314983.924805656 412648.420807689, 315164.971805481 412549.875030572, "
+            "315168.716071195 412548.408573295, 315218.393433168 412528.809220759, "
+            "315236.63492759 412521.673407818, 315287.485517231 412501.559315822, "
+            "315379.647073833 412488.615083794))"
+        ),
+    },
 ]
 
 TARGET_SIZES_HA = [0.5, 1.0, 2.0, 3.0, 4.0]
@@ -318,6 +348,62 @@ def _check_zone_geometry_validity(result: dict) -> list[str]:
     return issues
 
 
+# Matches field_zones.py's own dust threshold (DUST_PART_MAX_PIXELS=2.5 * resolution_m=10 ** 2 =
+# 250 m^2): a MultiPolygon secondary part below this should already be stripped by
+# _split_dust_parts, which runs after every pixel-mutating pass (rebalance/donation/gap-fill/
+# final resimplify). One found ABOVE this threshold is not dust by the module's own definition -
+# it's a genuinely separate NDVI-similar patch that survived every dust-strip call anyway, which
+# means it was disconnected from the zone's main body by a LATER pass that runs after the dust
+# strip closest to it (donation/gap-fill peeling away the connecting pixels), not something
+# _split_dust_parts was ever meant to catch. Confirmed directly on field 369 "Bełcz Wielki 288"
+# (dev id 2) via the real subfield-scoped kret path: zone 8 @2.0ha had a 797m^2 part 108m from its
+# main body; zone 1/zone 5 @4.0ha had 540m^2/1442m^2 parts, both long thin slivers (13-18m wide,
+# 76-156m long) - exactly what renders in Leaflet as a disconnected, thin, "loose-ended" line
+# floating near a zone instead of a clean filled shape (each part of a MultiPolygon is bound its
+# own Leaflet layer independently - see the "Seventh fix" in ndvi_zone_junction_gap_bug memory for
+# the same rendering mechanism on a different root cause).
+CONTIGUITY_MAX_SECONDARY_PART_M2 = 250.0
+
+
+def _planar_area_m2(poly) -> float:
+    """Equirectangular-approx planar area in m^2 - same local-flat approximation
+    _check_sample_point_continuity/_check_sample_point_path_efficiency already use elsewhere in
+    this file, good enough at field scale (a few km at most)."""
+    minx, miny, maxx, maxy = poly.bounds
+    lat0 = math.radians((miny + maxy) / 2.0)
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * math.cos(lat0)
+    scaled = shp_transform(lambda x, y, z=None: (x * m_per_deg_lon, y * m_per_deg_lat), poly)
+    return scaled.area
+
+
+def _check_zone_contiguity(result: dict) -> list[str]:
+    """Flags a zone returned as a MultiPolygon with a secondary part bigger than lopata's own
+    dust threshold - see CONTIGUITY_MAX_SECONDARY_PART_M2's docstring. Each zone is supposed to be
+    exactly one contiguous piece (FieldZonesController's own docstring: "kazda jednym spojnym
+    kawalkiem") - a survivor above the dust floor is a real, visible defect, not noise."""
+    issues = []
+    for feature in result["features"]:
+        geom = shape(feature["geometry"])
+        if geom.geom_type != "MultiPolygon":
+            continue
+        zid = feature["properties"].get("zone_id")
+        parts = sorted(geom.geoms, key=lambda p: p.area, reverse=True)
+        main = parts[0]
+        main_m2 = _planar_area_m2(main)
+        for part in parts[1:]:
+            part_m2 = _planar_area_m2(part)
+            if part_m2 > CONTIGUITY_MAX_SECONDARY_PART_M2:
+                dist_m = main.distance(part) * 111320.0
+                mrr = part.minimum_rotated_rectangle
+                issues.append(
+                    f"zone {zid} is a MultiPolygon: secondary part {part_m2:.0f}m2, "
+                    f"{dist_m:.0f}m from the zone's {main_m2 / 10000:.2f}ha main body - "
+                    "not dust-sized, renders as a disconnected floating/loose-ended shape"
+                )
+    return issues
+
+
 def _nn_greedy_path_length(xy: np.ndarray) -> float:
     """Independent reference: greedy nearest-neighbor walk (own implementation, not calling into
     field_zones.py) over the same point SET, starting from the point most extreme along the
@@ -404,6 +490,7 @@ def _run_one(field: dict, polygon: list[tuple[float, float]], target_ha: float, 
     issues.extend(_check_sample_point_continuity(result))
     issues.extend(_check_sample_point_path_efficiency(result))
     issues.extend(_check_zone_geometry_validity(result))
+    issues.extend(_check_zone_contiguity(result))
 
     status = "OK" if not issues else "CHECK: " + "; ".join(issues)
     path_label = "subfield" if use_subfield_path else "whole-field"

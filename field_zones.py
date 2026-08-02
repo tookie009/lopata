@@ -761,6 +761,14 @@ def _simplify_zone_boundaries(
 # experimentally: a "gap" piece of 0.0012 m^2 - a fraction of a square millimeter).
 MIN_GAP_PIECE_AREA_DEG2 = 1e-11
 
+# How close (degrees) a gap piece must be to its chosen zone to actually be "touching" it, used
+# by _fill_field_edge_gaps to detect its own _best_touching_neighbor distance-fallback (a piece
+# with zero shared boundary length against every candidate). ~1e-8 deg is well under a millimeter
+# at any latitude this app's fields fall at - comfortably clears ordinary GEOS floating-point
+# noise at a real shared edge, while a genuinely non-touching piece (confirmed case: 92m away, see
+# GAP_PIECE_TOUCH_TOLERANCE_DEG's call site) is many orders of magnitude past it.
+GAP_PIECE_TOUCH_TOLERANCE_DEG = 1e-8
+
 
 def _fill_field_edge_gaps(
     zone_geoms: list, field_polygon: Polygon, transformer: Transformer | None = None,
@@ -851,7 +859,35 @@ def _fill_field_edge_gaps(
             best_local_i = _best_touching_neighbor(piece, candidate_geoms)
 
         nearest_i = present_indices[best_local_i]
-        result[nearest_i] = _polygonal_only(_safe_union([result[nearest_i], piece]))
+        # _best_touching_neighbor falls back to nearest-BY-DISTANCE when `piece` shares zero
+        # boundary length with every candidate (its own docstring: "rare in practice... a piece
+        # that's genuinely floating apart from every candidate"). Unioning a genuinely non-touching
+        # piece into result[nearest_i] anyway doesn't merge it - two disjoint polygons union into a
+        # MultiPolygon, not one connected shape - so this used to silently manufacture exactly the
+        # disconnected/"stray line with loose ends" artifact this whole function exists to prevent,
+        # just via its own fallback path instead of the mask-donation mechanism (see
+        # _rebalance_oversized_zones's identical fix elsewhere in this file). Confirmed directly on
+        # field 369 "Bełcz Wielki 288" @4.0ha: a 539.5m^2 gap piece 92m from its nearest zone,
+        # never touching it, still got unioned in here - see ndvi_stray_multipolygon_sliver memory.
+        # Skipping it leaves a real, small, uncovered gap instead - an already-accepted tradeoff
+        # elsewhere in this file (see the "Twelfth fix" era: a small hole is a far less severe
+        # visual defect than a disconnected floating shape) - rather than reproducing the exact
+        # defect this reattachment exists to fix.
+        if result[nearest_i].distance(piece) > GAP_PIECE_TOUCH_TOLERANCE_DEG:
+            continue
+        merged = _polygonal_only(_safe_union([result[nearest_i], piece]))
+        if merged.geom_type == "MultiPolygon":
+            # Even within tolerance, a piece that only touches its target at a single POINT (not
+            # a real shared edge) still doesn't merge into one Polygon under union() - the same
+            # failure mode as the pure non-touching case just above, just closer. Confirmed on
+            # field 318 "Lubów 155" @1.0ha (subfield-scoped): a 737m^2 piece at distance=0 (a real
+            # point-touch, not a floating-point near-miss) still produced a MultiPolygon here.
+            # Checking the ACTUAL union result (not a proxy like distance or shared boundary
+            # length) is what makes this robust regardless of the exact geometric mechanism -
+            # leave the piece as an uncovered gap rather than accept a disconnected shape the
+            # union itself is telling us it created.
+            continue
+        result[nearest_i] = merged
     return result
 
 
@@ -1481,6 +1517,11 @@ def _split_oversized_zones(
     reaches the splitting below.
     """
     _rebalance_oversized_zones(zone_masks, max_pixels)
+    # Donation above can strand part of a donor zone as its own disconnected component (see
+    # _enforce_4_connectivity's docstring and the identical fix/rationale where
+    # _rebalance_oversized_zones is called again later in compute_field_zones) - reassign any such
+    # piece to a real touching neighbor before it ever reaches vectorization/splitting below.
+    zone_masks = _enforce_4_connectivity(zone_masks)
     result = []
     for mask in zone_masks:
         result.extend(_split_until_within_budget(mask, smoothed_ndvi, max_pixels))
@@ -3461,12 +3502,23 @@ def compute_field_zones(
     sizes_before_rebalance = [int(m.sum()) for m in rebalance_masks]
     _rebalance_oversized_zones(rebalance_masks, max_pixels)
     # Re-vectorizing straight from a donated-to/donated-from mask (_raw_zone_geometry) can come
-    # back a MultiPolygon with a fresh tiny disconnected sliver - the donation moves pixels at
-    # the raster level with no connectivity guarantee, same failure mode _split_dust_parts
-    # already guards against earlier in this function, but this path runs *after* that earlier
-    # dust pass, so a sliver introduced here would otherwise reach the response untouched
-    # (verified: this exact mechanism produced a real ~0.008ha sliver on a live field - "Lubów
-    # 457", target_plot_size_ha=1.0 - rendered as a doubled boundary line on the map).
+    # back a MultiPolygon with a fresh disconnected sliver - the donation moves pixels at the
+    # raster level with no connectivity guarantee, same failure mode _split_dust_parts already
+    # guards against earlier in this function, but this path runs *after* that earlier dust pass,
+    # so a sliver introduced here would otherwise reach the response untouched (verified: this
+    # exact mechanism produced a real ~0.008ha sliver on a live field - "Lubów 457",
+    # target_plot_size_ha=1.0 - rendered as a doubled boundary line on the map). _split_dust_parts
+    # below only strips genuinely dust-sized (<DUST_PART_MAX_PIXELS) fragments, though - a
+    # donation can also peel away enough of a zone's own "neck" to strand a much bigger,
+    # non-dust-sized piece as its own disconnected component (confirmed directly on field 369
+    # "Bełcz Wielki 288": a 797m^2/1442m^2/540m^2 stranded piece, 76-155m long, well above the
+    # 250m^2 dust floor, surviving all the way to the response as a real, visible extra
+    # MultiPolygon part - see ndvi_stray_multipolygon_sliver memory). _enforce_4_connectivity
+    # already exists for exactly this shape of problem (reassign a disconnected piece to whichever
+    # neighboring zone actually borders it) - re-running it here, on the SAME masks donation just
+    # mutated, closes the gap the dust-only defense above leaves open, before any of these masks
+    # are vectorized.
+    rebalance_masks = _enforce_4_connectivity(rebalance_masks)
     rebalance_dust_area_m2 = DUST_PART_MAX_PIXELS * resolution_m ** 2
     for idx, geom in enumerate(zone_geoms):
         if geom is None or int(rebalance_masks[idx].sum()) == sizes_before_rebalance[idx]:
@@ -3566,6 +3618,51 @@ def compute_field_zones(
             geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), geom_utm)
             cleaned_entries.append((mask, geom))
 
+        # Dust is gone (just above), but a comparably-sized secondary part can still survive:
+        # _snap_to_zone_boundary's own _safe_buffer0 fallback (its own docstring: "snapping
+        # vertices together can itself introduce a hairline self-intersection") can legitimately
+        # split a bowtie self-intersection into two real, non-trivial lobes - not a sliver, so
+        # _split_dust_parts leaves both. Confirmed directly on field 369 "Bełcz Wielki 288"
+        # @1.0ha (bisection construction, instrumented directly): 2 zones each came back roughly
+        # 50/50 split (5978/6487 m^2, 6731/5508 m^2) from exactly this fallback. Reassign every
+        # non-largest part to whichever OTHER zone's current geometry actually shares a real
+        # boundary with it (same principle _fill_field_edge_gaps/_best_touching_neighbor already
+        # use elsewhere in this file) - a piece with zero shared boundary length against every
+        # candidate (including its own zone's remaining main part) is left as an uncovered gap
+        # rather than force-merged, same tradeoff as GAP_PIECE_TOUCH_TOLERANCE_DEG's own call site.
+        def _shared_boundary_length(a, b) -> float:
+            try:
+                inter = a.boundary.intersection(b.boundary)
+            except Exception:
+                return 0.0
+            return inter.length if hasattr(inter, "length") else 0.0
+
+        _regrouped_entries: list[tuple[np.ndarray, object]] = []
+        _orphan_pieces: list = []
+        for mask, geom in cleaned_entries:
+            if geom.geom_type != "MultiPolygon" or len(geom.geoms) <= 1:
+                _regrouped_entries.append((mask, geom))
+                continue
+            parts = sorted(geom.geoms, key=lambda p: p.area, reverse=True)
+            _regrouped_entries.append((mask, parts[0]))
+            _orphan_pieces.extend(parts[1:])
+        for piece in _orphan_pieces:
+            _lengths = [_shared_boundary_length(g, piece) for _m, g in _regrouped_entries]
+            _best_i = max(range(len(_lengths)), key=lambda i: _lengths[i]) if _lengths else None
+            if _best_i is None or _lengths[_best_i] <= 0:
+                continue
+            _m, _g = _regrouped_entries[_best_i]
+            _merged = _polygonal_only(_safe_union([_g, piece]))
+            if _merged.geom_type == "MultiPolygon":
+                # A positive shared-boundary-LENGTH candidate can still fail to merge into one
+                # Polygon in rare GEOS edge cases (e.g. the shared run is itself a single point
+                # once re-measured post-union) - checking the actual union result, not just the
+                # pre-check, is what makes this robust (same reasoning as GAP_PIECE_TOUCH_
+                # TOLERANCE_DEG's own post-union check in _fill_field_edge_gaps).
+                continue
+            _regrouped_entries[_best_i] = (_m, _merged)
+        cleaned_entries = _regrouped_entries
+
         # Before splitting anything still over budget (which always manufactures a new zone, even
         # for a few pixels' worth of overage - see _rebalance_oversized_zones's docstring), try
         # donating the post-snap excess to a touching sibling with spare room first - the same
@@ -3580,6 +3677,19 @@ def compute_field_zones(
         rebalance_masks = [valid & _shapely_contains(geom, grid_lon, grid_lat) for _, geom in cleaned_entries]
         sizes_before_rebalance = [int(m.sum()) for m in rebalance_masks]
         _rebalance_oversized_zones(rebalance_masks, max_pixels)
+        # Donation can strand part of a zone as its own disconnected component (see
+        # _enforce_4_connectivity's docstring, and the identical fix where
+        # _rebalance_oversized_zones is called earlier in this function) - reassign any such piece
+        # to a real touching neighbor before re-vectorizing below. Falls back to each mask's own
+        # pre-enforce object when its values didn't actually change: pre_snap_by_mask_id further
+        # below relies on id(mask) to detect "rebalancing never touched this zone", and
+        # _enforce_4_connectivity always returns fresh array objects even for zones it left
+        # untouched, which would otherwise defeat that identity check for every zone.
+        _connectivity_fixed = _enforce_4_connectivity(rebalance_masks)
+        rebalance_masks = [
+            fixed if not np.array_equal(fixed, orig) else orig
+            for fixed, orig in zip(_connectivity_fixed, rebalance_masks)
+        ]
         rebalanced_entries: list[tuple[np.ndarray, object]] = []
         for idx, (mask, geom) in enumerate(cleaned_entries):
             if int(rebalance_masks[idx].sum()) == sizes_before_rebalance[idx]:
@@ -3679,6 +3789,13 @@ def compute_field_zones(
     resimplify_masks = [valid & _shapely_contains(geom, grid_lon, grid_lat) for _, geom in final_entries]
     resimplify_sizes_before = [int(m.sum()) for m in resimplify_masks]
     _rebalance_oversized_zones(resimplify_masks, max_pixels)
+    # Donation can strand part of a zone as its own disconnected component (see
+    # _enforce_4_connectivity's docstring, and the identical fix at every other
+    # _rebalance_oversized_zones call site in this function) - reassign any such piece to a real
+    # touching neighbor before re-vectorizing below. Safe to just rebind here: rebalance_untouched
+    # right below compares by VALUE (.sum()), not object identity, so a fresh array from
+    # _enforce_4_connectivity is fine.
+    resimplify_masks = _enforce_4_connectivity(resimplify_masks)
     rebalance_untouched = [
         int(resimplify_masks[i].sum()) == resimplify_sizes_before[i] for i in range(len(resimplify_masks))
     ]
@@ -3894,9 +4011,36 @@ def compute_field_zones(
         best_local_i = _best_touching_neighbor(utm_geoms[smallest_i], [utm_geoms[i] for i in with_room_idx])
         target_i = with_room_idx[best_local_i]
 
+        # _best_touching_neighbor falls back to nearest-BY-DISTANCE when the smallest zone shares
+        # zero boundary length with every candidate (see its own docstring: "a piece that's
+        # genuinely floating apart from every candidate"). Merging via _safe_union anyway doesn't
+        # actually connect two disjoint polygons - it just produces a MultiPolygon, the same
+        # failure mode already fixed at _fill_field_edge_gaps/_snap_to_zone_boundary's own call
+        # sites in this file (see GAP_PIECE_TOUCH_TOLERANCE_DEG and the
+        # ndvi_stray_multipolygon_sliver memory - confirmed directly: field 1 "Tworzanice 60"
+        # @1.0ha, 7 zones came back MultiPolygon from exactly this fallback, each roughly the
+        # smallest-zone-plus-target-zone size). Treat "no real touching neighbor" the same as "no
+        # neighbor with room" just above: leave this zone as its own (undersized) zone rather than
+        # manufacturing a disconnected floating shape.
+        try:
+            _shared_boundary = utm_geoms[smallest_i].boundary.intersection(utm_geoms[target_i].boundary)
+            _shared_len = _shared_boundary.length if hasattr(_shared_boundary, "length") else 0.0
+        except Exception:
+            _shared_len = 0.0
+        if _shared_len <= 0:
+            unmergeable_mask_ids.add(id(final_entries[smallest_i][0]))
+            continue
+
         smallest_mask, smallest_geom = final_entries[smallest_i]
         target_mask, _target_geom = final_entries[target_i]
         merged_geom_utm = _polygonal_only(_safe_union([utm_geoms[target_i], utm_geoms[smallest_i]]))
+        if merged_geom_utm.geom_type == "MultiPolygon":
+            # A positive shared-boundary-length candidate can still fail to merge into one
+            # Polygon in rare GEOS edge cases - checking the actual union result, not just the
+            # pre-check, is what makes this robust (same reasoning as GAP_PIECE_TOUCH_TOLERANCE_
+            # DEG's own post-union check in _fill_field_edge_gaps).
+            unmergeable_mask_ids.add(id(final_entries[smallest_i][0]))
+            continue
         merged_geom = shp_transform(lambda x, y: transformer.transform(x, y, direction="INVERSE"), merged_geom_utm)
         merged_mask = target_mask | (valid & _shapely_contains(smallest_geom, grid_lon, grid_lat))
         final_entries[target_i] = (merged_mask, merged_geom)
