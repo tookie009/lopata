@@ -1,6 +1,7 @@
 import heapq
 import logging
 import math
+import os
 from collections import deque
 
 import numpy as np
@@ -61,6 +62,32 @@ MAX_ZONE_SIZE_DEVIATION_PCT = 25.0
 # exactly what a good sample location looks like, not an "extreme" to steer away from - only ever
 # exclude the worst end of the zone's own distribution, never the best. A single, named,
 # easy-to-retune knob on purpose - expect this to get adjusted again.
+# Which sample-point placement algorithm to use - "legacy" (chord/geodesic greedy-walk, see
+# _compute_zone_sample_points_legacy and D:\lopata\CLAUDE.md's full design history) or "sweep"
+# (boustrophedon row-based coverage, see sample_points_sweep.py). Added 2026-08-02 after the
+# legacy algorithm's own patch history (15+ sessions, ~725 lines, D:\lopata\CLAUDE.md) kept
+# producing new instances of the same failure class - points clustered in a fraction of a zone's
+# real extent (see memory ndvi_zone_boundary_invalid_data_gap: "t_coverage passes even though the
+# chosen line only threads through a fraction of the zone's true 2D footprint") - on a real,
+# reported field (346 "Luboszyce Małe 23") and, worse, a visually distinct symptom on field 127
+# "Tworzanice 60" (points clustered tightly enough to read as a disconnected "hook"/floating
+# shape on the map, despite the underlying path being geometrically simple/non-crossing - see
+# D:\lopata\CLAUDE.md's new "Alternatywny algorytm: boustrophedon sweep" section for the full
+# writeup). Overridable without a code change via the LOPATA_SAMPLE_POINT_ALGORITHM env var
+# (same "no code change needed" pattern as config.py's ndvi_cache_ttl_seconds), so both
+# algorithms can be A/B'd live without a redeploy.
+#
+# Default is "legacy", NOT "sweep" - a full-corpus A/B regression (2026-08-02, test_real_fields.py
+# x both algorithms, 9 fields x 5 targets x 15 pts/zone) found sweep is NOT yet a clean win despite
+# fixing the two originally-reported clustering cases: aggregated across the whole corpus, sweep
+# produced MORE >90-degree turn segments than legacy (1308 vs 870 - the opposite of its own design
+# goal), a 180-degree full reversal (worst_turn=180.0 vs legacy's 161.4), and 2 self-intersecting
+# paths (vs 0 for legacy). It IS faster (156s vs 664s for the full corpus) and has fewer low-
+# coverage zones (113 vs 140), so the underlying idea has merit - but "sweep" should stay opt-in
+# via the env var until the row-transition turn-angle and path-simplicity issues above are fixed,
+# not the silent default. See D:\lopata\CLAUDE.md's sweep section for the full writeup.
+SAMPLE_POINT_ALGORITHM = os.environ.get("LOPATA_SAMPLE_POINT_ALGORITHM", "legacy").strip().lower()
+
 SAMPLE_POINT_WORST_PERCENTILE = 20.0
 # Below this many pixels, a percentile split isn't meaningful (e.g. 3 pixels -> "worst 20%" is
 # either 0 or 1 pixel depending on rounding) - skip the filter rather than let it arbitrarily
@@ -2300,7 +2327,7 @@ def _longest_geodesic_vertex_path(
     return LineString([coords[i] for i in path_indices])
 
 
-def _compute_zone_sample_points(
+def _compute_zone_sample_points_legacy(
     ndvi: np.ndarray,
     grid_lon: np.ndarray,
     grid_lat: np.ndarray,
@@ -3023,6 +3050,30 @@ def _compute_zone_sample_points(
     # case), and a 2-opt local optimum is provably crossing-free for Euclidean distance.
     sorted_chosen = _two_opt_improve(points_m, sorted_chosen)
     return [[float(lons[i]), float(lats[i])] for i in sorted_chosen]
+
+
+def _compute_zone_sample_points(
+    ndvi: np.ndarray,
+    grid_lon: np.ndarray,
+    grid_lat: np.ndarray,
+    transformer,
+    mask: np.ndarray,
+    geom,
+    max_points: int,
+) -> list[list[float]]:
+    """Dispatches to whichever sample-point algorithm SAMPLE_POINT_ALGORITHM selects - see that
+    constant's own docstring. Both call sites in this file (the single_zone_override early exit
+    and _select_sample_points, used by _zone_entry) already go through this one function, so this
+    is the only place that needs to know the two implementations exist."""
+    if SAMPLE_POINT_ALGORITHM == "sweep":
+        from sample_points_sweep import compute_zone_sample_points_sweep
+
+        return compute_zone_sample_points_sweep(
+            ndvi, grid_lon, grid_lat, transformer, mask, geom, max_points,
+        )
+    return _compute_zone_sample_points_legacy(
+        ndvi, grid_lon, grid_lat, transformer, mask, geom, max_points,
+    )
 
 
 def compute_field_zones(

@@ -170,6 +170,104 @@ heurystykę. Jeśli tak - zostaje jako gotowy, przemyślany pomysł do wdrożeni
 kilku kątów blisko optymalnego i wybierać ten, którego chord zaczyna się najbliżej
 poprzedniego końca, akceptując skrót do progu procentowego maksymalnej długości).
 
+## Alternatywny algorytm: boustrophedon sweep (2026-08-02)
+
+Po kolejnej sesji patchy (powyższa historia to już kilkanaście warstw poprawek na tym samym
+zachłannym-marszu-po-cięciwie: reach-cap, safe-preference-cap, sanity-check+fallback, geodezyjne
+ścieżki dla wygiętych stref, boustrophedon banding wewnątrz fallbacku, 2-opt, usuwanie
+skrzyżowań w DWÓCH układach współrzędnych...) i dwóch nowych realnych zgłoszeń tej samej klasy
+buga (pole 346 "Luboszyce Małe 23" - punkty skupione w ułamku strefy; pole 127 "Tworzanice 60" -
+to samo, ale skupienie na tyle ciasne, że na mapie wygląda jak oderwany "haczyk"/pętla), dodano
+**całkiem NIEZALEŻNY, drugi algorytm** zamiast kolejnej łatki: `sample_points_sweep.py`.
+
+**Flaga wyboru**: `SAMPLE_POINT_ALGORITHM` w `field_zones.py` (`"legacy"` lub `"sweep"`),
+nadpisywalna bez zmiany kodu przez zmienną środowiskową `LOPATA_SAMPLE_POINT_ALGORITHM` (ten sam
+wzorzec co `ndvi_cache_ttl_seconds` w `config.py`). Dispatch siedzi w JEDNYM miejscu -
+`_compute_zone_sample_points` (dawna funkcja o tej nazwie przemianowana na
+`_compute_zone_sample_points_legacy`) - oba miejsca wywołania w tym pliku (early-exit
+`single_zone_override` i `_select_sample_points` w `compute_field_zones`) już i tak przechodzą
+przez ten jeden punkt, więc nic więcej nie trzeba było zmieniać.
+
+**Jak działa `sample_points_sweep.py`**: zamiast JEDNEJ linii (cięciwa/ścieżka geodezyjna) na
+całą strefę, dzieli strefę na RÓWNOLEGŁE PASY (rzędy) prostopadłe do krótszej osi wielokąta
+strefy (z `minimum_rotated_rectangle`, nie z chmury kandydatów - ten sam "kształt strefy dyktuje
+kierunek" co stary algorytm). W każdym rzędzie cele rozkładane są równomiernie wzdłuż dłuższej
+osi (uwzględniając rozłączne kawałki, gdy strefa jest na tyle niewypukła, że pas przecina ją w
+kilku miejscach - patrz `_evenly_spaced_targets_over_ranges`), dobierany jest najbliższy
+prawdziwy kandydat NDVI do każdego celu, po czym WYNIK (nie kolejność celów) sortowany jest po
+własnej pozycji na osi głównej - **to była pierwsza realna pułapka**: zachłanny dobór per-cel
+jest niezależny między celami, więc kolejność przetwarzania celów NIE gwarantuje, że wybrani
+kandydaci wyjdą w tej samej kolejności (jeden cel może "przegrać" najbliższego kandydata na rzecz
+sąsiada) - bez tego sortowania powstawały realne samoprzecięcia. Rzędy odwiedzane są na przemian
+(serpentyna), więc połączenie między rzędami to krótki, niemal prostopadły skok - stąd zakręty
+~90° na końcach rzędów zamiast długich zygzaków.
+
+**Druga pułapka**: krańce rzędów muszą być wyznaczone po KWANTYLACH prawdziwych kandydatów
+(`np.quantile(s_all, ...)`), nie po równym podziale geometrycznego zasięgu strefy - realne
+piksele leżą na siatce rastra (10m), więc równy podział geometryczny regularnie zostawiał rząd z
+garstką/zerem kandydatów (każdy pas łapał fragment innego wiersza rastra niedopasowany do jego
+własnej siatki), co zmuszało dobór do "szukania w całej puli" (patrz `_best_candidate_for_target`)
+i rozbijało założenie o zgrubnej przynależności punktu do jego rzędu - to był realny, częsty
+(nie brzegowy) mechanizm samoprzecięć w małych (~1ha) strefach, znaleziony i naprawiony podczas tej
+samej sesji.
+
+**Dlaczego to ma szansę być lepsze niż kolejna łatka na starym algorytmie**: cała rodzina
+poprzednich bugów (patrz pamięć `ndvi_zone_boundary_invalid_data_gap`) sprowadzała się do tego, że
+JEDNA wybrana linia mogła mieć świetny `t_coverage` (pokrycie WZGLĘDEM SIEBIE SAMEJ), a mimo to
+obejmować tylko ułamek prawdziwego 2D kształtu strefy - bo pokrycie całej strefy było efektem
+UBOCZNYM doboru punktów na jednej linii, nie czymś wymuszonym z konstrukcji. W sweep pokrycie całej
+strefy wynika WPROST z konstrukcji: rzędy razem obejmują cały zakres krótszej osi, z definicji, nie
+jako nadzieja że akurat tak wyjdzie.
+
+**Wydajność**: sweep nie ma grafu widoczności/Dijkstry (ścieżki geodezyjne dla wygiętych stref w
+starym algorytmie) ani wielostartowego zachłannego-najbliższy-sąsiad + wspinaczki po kącie skrętu
+(stary fallback, ~2.3s/wywołanie zmierzone w poprzednich sesjach) - dobór kandydata do celu to
+przeszukanie liniowe po co najwyżej kilkuset kandydatach w strefie, budowa pasów to stała liczba
+operacji geometrycznych (przecięcie prostokąt x wielokąt) proporcjonalna do liczby rzędów.
+
+**Weryfikacja 2026-08-02**: A/B na polach 346 (`@1ha`, zgłoszony bug) i 127 (`@1/4ha`, zgłoszony
+bug) - wizualnie (matplotlib) sweep wyraźnie czyściejszy na obu: pole 346 legacy miało kilka stref z
+zygzakami zostawiającymi połowę strefy pustą, sweep wypełnia każdą strefę systematyczną siatką
+rzędów; pole 127 @4ha legacy rysował pojedynczą przekątną per strefa (często nie sięgającą rogów),
+sweep rysuje zwarte równoległe rzędy pokrywające realnie całą strefę. Zero samoprzecięć po
+poprawkach obu pułapek opisanych wyżej. Pełny wynik regresyjnego porównania (cały korpus
+`test_real_fields.py` x oba algorytmy) - patrz commit message/pamięć sesji z 2026-08-02.
+
+## Pełny wynik A/B na całym korpusie (2026-08-02) - sweep NIE jest jeszcze domyślny
+
+Powyższa weryfikacja (2 zgłoszone pola) była zachęcająca, ale celowo NIE wystarczająca do zmiany
+domyślnego algorytmu - `full_ab_regression.py` (scratch, nie w repo) przepuścił OBA algorytmy przez
+cały korpus `test_real_fields.py` (9 pól x 5 celów: 0.5/1/2/3/4ha, `max_sample_points_per_zone=15`,
+tylko ścieżka subfield-scoped, czyli ta sama co prawdziwy frontend). Wynik:
+
+| miara | legacy | sweep |
+|---|---|---|
+| czas całego przebiegu | 664.2s | 156.4s |
+| stref z pokryciem <50% bbox diagonal | 140 | 113 |
+| segmenty skrętu >90° | 870 | **1308** |
+| najgorszy pojedynczy skręt | 161.4° | **180.0°** (pełny zawrót) |
+| trasy samoprzecinające się (`is_simple=False`) | 0 | **2** |
+| pól/celów z flagą CHECK (zigzag/nieciągłość/etc.) | 3 | **22** |
+
+Sweep jest ~4x szybszy i ma mniej stref o niskim pokryciu (zgodnie z zamierzeniem konstrukcji "rzędy
+z definicji obejmują cały zasięg strefy") - ale ma WIĘCEJ ostrych skrętów niż legacy, nie mniej,
+mimo że to był jego główny cel projektowy, plus realny 180° zawrót i 2 samoprzecinające się trasy
+(legacy ma zero obu). To bezpośrednio przeczy priorytetom użytkownika (zero linii bez końca/
+samoprzecięć, skręty möwliwie ≤90°) - dlatego `SAMPLE_POINT_ALGORITHM` domyślnie zostaje `"legacy"`,
+`"sweep"` jest dostępny tylko przez `LOPATA_SAMPLE_POINT_ALGORITHM=sweep` do dalszej pracy, NIE jako
+cichy nowy domyślny wybór.
+
+Część flag "zigzag" (trasa >1.4x dłuższa niż zachłanne najbliższy-sąsiad) może być fałszywym
+alarmem - `SAMPLE_POINT_MAX_PATH_INEFFICIENCY_RATIO` był kalibrowany pod STARY zachłanny spacer,
+nie pod celowo-nie-najkrótszą systematyczną strukturę rzędów (dokładnie ta sama zastrzeżenie już
+raz padło dla starego boustrophedon-bandingu w fallbacku, patrz pamięć
+`ndvi_sample_point_path_algorithm` punkt 5) - ale `worst_turn=180°` i `nonsimple=2` to REALNE,
+niekwestionowalne defekty samego sweep, niezależne od tego zastrzeżenia. **Następne kroki dla kogoś,
+kto to podejmie**: znaleźć które konkretne strefy dają 180° zawrót / samoprzecięcie (prawdopodobnie
+błąd w kolejności odwiedzania rzędów przy nietypowym kształcie strefy - patrz `_evenly_spaced_
+targets_over_ranges`/serpentyna w `sample_points_sweep.py`) i naprawić PRZED rozważeniem zmiany
+domyślnego algorytmu.
+
 ## Historia (dlaczego nie przekątna + wspólna oś PCA)
 
 Wcześniejsza wersja (commity `e3e72dc`..`210eadf`) liczyła jedną wspólną oś PCA dla całego

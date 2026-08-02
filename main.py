@@ -1,7 +1,9 @@
+import contextvars
 import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +28,26 @@ from schemas import FieldZonesRequest, NdviRequest
 # restarted, and the fix under test hasn't been loaded at all.
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 SERVER_PID = os.getpid()
+
+# Correlation id for cross-service log grepping: kret generates/forwards X-Request-Id (see
+# RequestLoggingFilter there) on every call into this service; reused verbatim (or generated here
+# if a caller ever hits this service directly, e.g. manual curl/testujPola) so the SAME id shows
+# up in both kret's and lopata's logs for one request. Set once per request in log_all_requests()
+# below and picked up automatically by every log line via the LogRecordFactory override - no need
+# to thread it through function signatures.
+_REQUEST_ID_HEADER = "X-Request-Id"
+_request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+
+_base_log_record_factory = logging.getLogRecordFactory()
+
+
+def _request_id_log_record_factory(*args, **kwargs):
+    record = _base_log_record_factory(*args, **kwargs)
+    record.request_id = _request_id_ctx.get()
+    return record
+
+
+logging.setLogRecordFactory(_request_id_log_record_factory)
 
 app = FastAPI(
     title="NDVI API",
@@ -55,7 +77,7 @@ _field_zones_logger.propagate = False
 if not _field_zones_logger.handlers:
     _log_path = Path(__file__).parent / "logs" / "field_zones_requests.log"
     _log_path.parent.mkdir(parents=True, exist_ok=True)
-    _formatter = logging.Formatter("%(asctime)s %(message)s")
+    _formatter = logging.Formatter("%(asctime)s [%(request_id)s] %(message)s")
     _file_handler = logging.FileHandler(_log_path, encoding="utf-8")
     _file_handler.setFormatter(_formatter)
     _field_zones_logger.addHandler(_file_handler)
@@ -72,7 +94,7 @@ _access_logger.setLevel(logging.INFO)
 _access_logger.propagate = False
 if not _access_logger.handlers:
     _access_handler = logging.StreamHandler()
-    _access_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _access_handler.setFormatter(logging.Formatter("%(asctime)s [%(request_id)s] %(message)s"))
     _access_logger.addHandler(_access_handler)
 
 
@@ -95,6 +117,12 @@ def _format_body_for_log(body_bytes: bytes) -> str:
 
 @app.middleware("http")
 async def log_all_requests(request: Request, call_next):
+    # Reused from kret's own request id (see RequestLoggingFilter there) if present, else
+    # generated - each incoming request gets its own asyncio Task in Starlette, so this contextvar
+    # is naturally request-scoped without needing an explicit reset.
+    request_id = request.headers.get(_REQUEST_ID_HEADER) or str(uuid.uuid4())
+    _request_id_ctx.set(request_id)
+
     start = time.monotonic()
     client = request.client.host if request.client else "?"
     # Starlette caches the raw bytes on first read, so the route handler downstream still gets a
@@ -114,6 +142,7 @@ async def log_all_requests(request: Request, call_next):
         "%s %s client=%s body=%s -> %s (%.1fms)",
         request.method, request.url.path, client, body_preview, response.status_code, duration_ms,
     )
+    response.headers[_REQUEST_ID_HEADER] = request_id
     return response
 
 
