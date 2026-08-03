@@ -3120,6 +3120,7 @@ def compute_field_zones(
     field_id: int | None = None,
     zone_polygon_lonlat: list[tuple[float, float]] | None = None,
     single_zone_override: bool = False,
+    exclusion_polygons_lonlat: list[list[tuple[float, float]]] | None = None,
 ) -> dict:
     """Builds zones by seeded region growing (see _balanced_contiguous_zones) - each zone is
     grown outward from a seed pixel to an explicit, near-equal pixel-count share of the field, so
@@ -3158,6 +3159,10 @@ def compute_field_zones(
     heavily tuned. Still gets real NDVI-aware sample_points (via _compute_zone_sample_points),
     same as every normally-sized zone - the whole point of doing this in lopata rather than
     letting the frontend fall back to blind geometric point placement for an oversized zone.
+
+    exclusion_polygons_lonlat: optional list of polygons (ponds, buildings, ...) subtracted from
+    zone_polygon before anything else happens - see the subtraction's own comment below for why
+    kret was already sending this and why it used to be silently dropped.
     """
     field_polygon = Polygon(polygon_lonlat)
     if not field_polygon.is_valid or field_polygon.area == 0:
@@ -3171,6 +3176,36 @@ def compute_field_zones(
             )
     else:
         zone_polygon = field_polygon
+
+    # Referenced again much later (see the final per-zone cleanup loop near the end of this
+    # function) as a last-resort safety net, so it has to exist even when there's nothing to
+    # subtract - stays None unless exclusion_polygons_lonlat actually resolves to real area below.
+    exclusion_union = None
+    if exclusion_polygons_lonlat:
+        # Cut every exclusion (pond, building, ...) out of zone_polygon itself - not just out of
+        # the pixel mask below - so field_area_ha, the boundary line network _simplify_zone_
+        # boundaries builds from zone_polygon.boundary, and single_zone_override's returned
+        # geometry (a bare `mapping(zone_polygon)`, see below) all agree with what actually gets
+        # divided. kret's own save-time check (RouteService.EXCLUSION_OVERLAP_EPSILON_M2) is what
+        # originally surfaced this: kret already forwarded exclusion_polygons expecting lopata to
+        # subtract them (see FieldZonesService.java's comment), but this field didn't exist in
+        # FieldZonesRequest yet, so it was silently dropped and a returned zone could legitimately
+        # overlap a farmer's excluded area.
+        exclusion_polys = [Polygon(ring) for ring in exclusion_polygons_lonlat if len(ring) >= 3]
+        exclusion_union = _safe_buffer0(_safe_union(exclusion_polys)) if exclusion_polys else None
+        if exclusion_union is not None and not exclusion_union.is_empty:
+            clipped = _polygonal_only(_drop_degenerate_holes(_safe_difference(zone_polygon, exclusion_union)))
+            if clipped.is_empty:
+                raise ValueError("Caly wskazany obszar (podpole/pole) jest wylaczony z probkowania")
+            if clipped.geom_type == "MultiPolygon":
+                # An exclusion that fully severs zone_polygon into disconnected pieces is a known,
+                # separate limitation shared with the frontend's manual-division wizard (see
+                # krecik's getUsableFieldGeometry/"Expected Polygon, got MultiPolygon") - region
+                # growing below assumes one contiguous zone_polygon to seed/grow within. Keeping
+                # only the largest piece is a conservative fallback rather than failing outright:
+                # the excluded sliver is real, but so is the (larger) rest of the field.
+                clipped = max(clipped.geoms, key=lambda g: g.area)
+            zone_polygon = clipped
 
     # Raster-fetch extent (bbox/UTM origin) always comes from the full polygon_lonlat, even when
     # zone_polygon is smaller - this is what lets repeated calls for different sub-regions of the
@@ -3303,6 +3338,16 @@ def compute_field_zones(
     inside = points_in_polygon(
         grid_lon.ravel(), grid_lat.ravel(), poly_xy[:, 0], poly_xy[:, 1]
     ).reshape(grid_lon.shape)
+    # zone_polygon can have interior rings (holes) here - either from an exclusion carved out
+    # above, or a pre-existing hole in the field's own registered geometry. The ray-cast test
+    # above only follows the exterior ring, so pixels inside a hole would otherwise still count
+    # as "inside" - explicitly punch each one back out.
+    for interior in zone_polygon.interiors:
+        hole_xy = np.asarray(interior.coords)
+        hole_inside = points_in_polygon(
+            grid_lon.ravel(), grid_lat.ravel(), hole_xy[:, 0], hole_xy[:, 1]
+        ).reshape(grid_lon.shape)
+        inside &= ~hole_inside
 
     valid = inside & (data_mask > 0)
     if not np.any(valid):
@@ -4151,6 +4196,22 @@ def compute_field_zones(
         if geom is not None and not geom.is_empty and not geom.is_valid:
             geom = _safe_buffer0(geom)
         geom = _drop_degenerate_holes(geom)
+        if exclusion_union is not None and geom is not None and not geom.is_empty:
+            # Belt-and-suspenders re-clip against the ORIGINAL (unsimplified) exclusion, not just
+            # the zone_polygon-with-a-hole subtraction done far above the first time zone_polygon
+            # was ever used: every simplification/snap/rebalance pass between there and here
+            # regenerates geometry from a raster mask or nudges vertices with no "never re-enter
+            # a hole" constraint of its own (same class of drift _snap_to_zone_boundary's own
+            # docstring describes for the field's outer edge) - confirmed directly on field 514
+            # ("Leszek Witiak"): the initial zone_polygon subtraction alone still let ~32% of a
+            # real exclusion's area (measured via shapely intersection) leak back into the two
+            # final zones after simplification/snapping, verified against the real field-zones
+            # request/response pair logged for that field. Doing this once more, unconditionally,
+            # right before entries become response features closes it regardless of which upstream
+            # step reintroduced the leak.
+            geom = _polygonal_only(_safe_difference(geom, exclusion_union))
+            if geom.geom_type == "MultiPolygon":
+                geom = max(geom.geoms, key=lambda g: g.area)
         entry = _zone_entry(mask, geom)
         if entry is not None:
             zones.append(entry)

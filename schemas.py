@@ -101,6 +101,17 @@ class FieldZonesRequest(BaseModel):
             "walidacja ponizej i docstring single_zone_override w field_zones.compute_field_zones."
         ),
     )
+    exclusion_polygons: list[list[tuple[float, float]]] | None = Field(
+        None,
+        description=(
+            "Opcjonalne wielokaty obszarow wylaczonych z probkowania tego pola (staw, budynek "
+            "itp.) - kazdy jako lista wierzcholkow [lon, lat] (WGS84), tej samej postaci co "
+            "polygon/zone_polygon. Piksele wewnatrz ktoregokolwiek z nich sa traktowane tak jak "
+            "brak danych NDVI: nie licza sie do n_zones/area_ha/statystyk stref ani nie moga "
+            "zawierac punktow probek, a zwrocona geometria strefy naturalnie je omija (dziura) - "
+            "patrz compute_field_zones."
+        ),
+    )
 
     @field_validator("polygon")
     @classmethod
@@ -113,6 +124,17 @@ class FieldZonesRequest(BaseModel):
         cls, value: list[tuple[float, float]] | None
     ) -> list[tuple[float, float]] | None:
         return _validate_lonlat_polygon(value) if value is not None else None
+
+    @field_validator("exclusion_polygons")
+    @classmethod
+    def _validate_exclusion_polygons(
+        cls, value: list[list[tuple[float, float]]] | None
+    ) -> list[list[tuple[float, float]]] | None:
+        if value is None:
+            return None
+        for ring in value:
+            _validate_lonlat_polygon(ring)
+        return value
 
     @model_validator(mode="after")
     def _validate_single_zone_override(self) -> "FieldZonesRequest":
