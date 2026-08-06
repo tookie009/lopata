@@ -3237,6 +3237,26 @@ def compute_field_zones(
     min_lon, min_lat, max_lon, max_lat = field_polygon.bounds
     centroid = field_polygon.centroid
     transformer = _to_utm_transformer(centroid.x, centroid.y)
+
+    if exclusion_union is not None and not exclusion_union.is_empty:
+        # Small outward safety margin on the exclusion itself (same 0.3m tolerance krecik/kret
+        # already use elsewhere for "close enough to be the same edge" - see
+        # NEIGHBOUR_DISTANCE_TOLERANCE_METERS, GeometryService.closeSmallGaps), applied AFTER the
+        # zone_polygon carve-out above (which still uses the exact drawn exclusion) but BEFORE the
+        # belt-and-suspenders re-clip further down, which is what this margin is actually for.
+        # Confirmed real on field 944/farmer 1 ("Godurowo 10", 2026-08-06, target 2ha): even with
+        # that re-clip already in place, _repaired_intake_polygon's buffer(0)-fixed pinch point
+        # left a returned zone overlapping the exclusion by 2.64m^2 (kret's own save-time
+        # EXCLUSION_OVERLAP_EPSILON_M2 is 1.0m^2) - GEOS's own precision noise right at a repaired
+        # self-crossing vertex apparently isn't fully absorbed by one difference() pass. A fixed
+        # linear margin on the subtrahend closes this regardless of exactly how large a stray
+        # sliver any given upstream step (this repair included) manages to reintroduce, instead of
+        # chasing each one individually.
+        exclusion_union = shp_transform(
+            lambda x, y: transformer.transform(x, y, direction="INVERSE"),
+            shp_transform(transformer.transform, exclusion_union).buffer(0.3),
+        )
+
     # Despite the name, this is the area actually being divided (zone_polygon) - identical to the
     # full field's area when zone_polygon_lonlat is None, as before.
     field_area_ha = _area_ha(zone_polygon, transformer)
