@@ -423,6 +423,36 @@ def _safe_buffer0(geom):
             return geom
 
 
+def _repaired_intake_polygon(coords_lonlat, what: str) -> Polygon:
+    """Builds a Polygon from raw lon/lat coords for compute_field_zones' two intake points
+    (polygon_lonlat/zone_polygon_lonlat) - repairing a minor self-intersection via _safe_buffer0
+    (the standard GEOS renoding trick) before giving up, instead of hard-rejecting on the spot.
+
+    Confirmed real on field 944/farmer 1 ("Godurowo 10", 2026-08-05): an exclusion drawn right at
+    the field's own edge left the frontend's post-subtraction zone_polygon ring self-crossing at a
+    single vertex - shapely's is_valid correctly flagged it ("Podany wielokat strefy (subpola) jest
+    niepoprawny"), but nothing attempted to fix it here, unlike the exclusion-differencing further
+    down in this same function which already goes through _safe_difference/_safe_buffer0. The
+    frontend's own turf.buffer-based repair attempt (dilate then erode) was tried and abandoned -
+    it collapsed this exact polygon's area from ~9.4ha down to near-zero (a turf/JS buffer
+    robustness bug, not present in shapely/GEOS) - so repair belongs here, not client-side.
+
+    buffer(0) on a self-crossing ring can split off a genuinely separate lobe as a MultiPolygon;
+    `what` is the invalid pola/strefy so the error message matches call site.
+    """
+    poly = Polygon(coords_lonlat)
+    if poly.is_valid and poly.area > 0:
+        return poly
+    repaired = _safe_buffer0(poly)
+    if isinstance(repaired, MultiPolygon):
+        repaired = max(repaired.geoms, key=lambda g: g.area)
+    if not isinstance(repaired, Polygon) or not repaired.is_valid or repaired.area == 0:
+        raise ValueError(
+            f"Podany wielokat {what} jest niepoprawny (samoprzecinajacy sie lub zerowej powierzchni)"
+        )
+    return repaired
+
+
 # ~0.5m - deliberately tiny (both known real cases were 1e-8 to 1e-14 degrees, i.e. sub-mm/pure
 # floating-point noise - see _remove_self_touching_spikes's own docstring). A looser threshold
 # (tried: ~2m, then ~5.5cm) flagged near-duplicate vertices on every single field in
@@ -3164,16 +3194,10 @@ def compute_field_zones(
     zone_polygon before anything else happens - see the subtraction's own comment below for why
     kret was already sending this and why it used to be silently dropped.
     """
-    field_polygon = Polygon(polygon_lonlat)
-    if not field_polygon.is_valid or field_polygon.area == 0:
-        raise ValueError("Podany wielokat pola jest niepoprawny (samoprzecinajacy sie lub zerowej powierzchni)")
+    field_polygon = _repaired_intake_polygon(polygon_lonlat, "pola")
 
     if zone_polygon_lonlat is not None:
-        zone_polygon = Polygon(zone_polygon_lonlat)
-        if not zone_polygon.is_valid or zone_polygon.area == 0:
-            raise ValueError(
-                "Podany wielokat strefy (subpola) jest niepoprawny (samoprzecinajacy sie lub zerowej powierzchni)"
-            )
+        zone_polygon = _repaired_intake_polygon(zone_polygon_lonlat, "strefy (subpola)")
     else:
         zone_polygon = field_polygon
 
