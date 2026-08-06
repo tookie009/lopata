@@ -10,10 +10,12 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 
+import base64
+
 import db_cache
 from field_zones import compute_field_zones
-from ndvi import fetch_ndvi_png
-from schemas import FieldZonesRequest, NdviRequest
+from ndvi import clear_ndvi_default, fetch_ndvi_candidates, fetch_ndvi_png, set_ndvi_default
+from schemas import FieldZonesRequest, NdviCandidatesRequest, NdviRequest, NdviSetDefaultRequest
 
 # Set once at import time (i.e. once per process start, --reload worker included) - included in
 # every /field-zones response as "server_instance" so a fix that doesn't seem to take effect can
@@ -156,6 +158,7 @@ def _ndvi_metadata_headers(metadata: dict) -> dict[str, str]:
         "X-NDVI-Max-Cloud-Cover": str(metadata["max_cloud_cover"]),
         "X-NDVI-Mosaicking-Order": metadata["mosaicking_order"],
         "X-NDVI-Data-Collection": metadata["data_collection"],
+        "X-NDVI-Selection-Mode": metadata.get("selection_mode") or "best_vegetation",
     }
     if metadata["acquired"] is not None:
         headers["X-NDVI-Acquired"] = metadata["acquired"]
@@ -205,6 +208,90 @@ def get_ndvi(payload: NdviRequest):
         raise HTTPException(status_code=502, detail=f"Blad pobierania danych z Copernicus: {exc}") from exc
 
     return Response(content=png_bytes, media_type="image/png", headers=_ndvi_metadata_headers(metadata))
+
+
+@app.post(
+    "/ndvi/candidates",
+    summary="Zwroc liste kandydackich terminow NDVI z podanego zakresu dat, do wizualnego porownania",
+    description=(
+        "Przeszukuje podany zakres dat (dowolny, nie tylko sezon wegetacyjny) i zwraca do "
+        "candidate_limit najmniej zachmurzonych terminow, kazdy jako maly obraz podgladowy PNG - "
+        "do widoku 'Edycja pola', zeby uzytkownik mogl porownac kolory przed przypieciem jednego "
+        "z nich jako domyslny (patrz POST /ndvi/default)."
+    ),
+)
+def post_ndvi_candidates(payload: NdviCandidatesRequest):
+    try:
+        candidates = fetch_ndvi_candidates(
+            polygon_lonlat=payload.polygon,
+            time_from=payload.time_from,
+            time_to=payload.time_to,
+            max_cloud_cover=payload.max_cloud_cover,
+            candidate_limit=payload.candidate_limit,
+            width=payload.width,
+            height=payload.height,
+            field_id=payload.field_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Blad pobierania danych z Copernicus: {exc}") from exc
+
+    return {
+        "candidates": [
+            {
+                "date": c["date"],
+                "cloudCover": c["cloud_cover"],
+                "imageBase64": base64.b64encode(c["png"]).decode("ascii"),
+            }
+            for c in candidates
+        ],
+    }
+
+
+@app.post(
+    "/ndvi/default",
+    summary="Przypnij wybrany termin NDVI jako domyslny dla pola",
+    description=(
+        "Pobiera raster dla wskazanej daty i zapisuje go w cache'u (patrz db_cache.get_any -"
+        "'lepki' odczyt) - kolejne GET/POST /ndvi dla tej samej rozdzielczosci beda go zwracac "
+        "bez ponownego auto-wyszukiwania, dopoki nie zostanie usuniety przez DELETE "
+        "/ndvi/default/{field_id}. Wymaga wlaczonego trwalego cache'u (LOPATA_DB_ENABLED) - bez "
+        "niego przypiecie znikneloby przy najblizszym restarcie, wiec ten endpoint w takiej "
+        "sytuacji zwraca blad zamiast cichego, tymczasowego zapisu."
+    ),
+)
+def post_ndvi_default(payload: NdviSetDefaultRequest):
+    try:
+        metadata = set_ndvi_default(
+            polygon_lonlat=payload.polygon,
+            field_id=payload.field_id,
+            acquired_date=payload.acquired_date.isoformat(),
+            max_cloud_cover=payload.max_cloud_cover,
+            width=payload.width,
+            height=payload.height,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Nie udalo sie przypiac terminu NDVI: {exc}") from exc
+    return {
+        "fieldId": payload.field_id,
+        "date": payload.acquired_date.isoformat(),
+        "cloudCover": metadata.get("cloud_cover"),
+    }
+
+
+@app.delete(
+    "/ndvi/default/{field_id}",
+    summary="Usun przypiety termin NDVI dla pola, przywracajac automatyczny wybor",
+)
+def delete_ndvi_default(field_id: int):
+    try:
+        clear_ndvi_default(field_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Nie udalo sie usunac przypiecia NDVI: {exc}") from exc
+    return {"fieldId": field_id, "cleared": True}
 
 
 @app.post(

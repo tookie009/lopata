@@ -1,3 +1,5 @@
+from datetime import date, datetime
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from field_zones import DEFAULT_LINE_SMOOTHING, DEFAULT_MAX_SAMPLE_POINTS_PER_ZONE
@@ -28,6 +30,57 @@ class NdviRequest(BaseModel):
             "Nieobowiazkowy - inne wywolujace moga go pominac."
         ),
     )
+
+    @field_validator("polygon")
+    @classmethod
+    def _validate_polygon(cls, value: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        return _validate_lonlat_polygon(value)
+
+
+class NdviCandidatesRequest(BaseModel):
+    polygon: list[tuple[float, float]] = Field(
+        ...,
+        min_length=3,
+        description="Wierzcholki wielokata pola jako pary [lon, lat] (WGS84), min. 3 punkty",
+    )
+    time_from: datetime = Field(..., description="Poczatek zakresu dat do przeszukania")
+    time_to: datetime = Field(..., description="Koniec zakresu dat do przeszukania")
+    max_cloud_cover: float = Field(30.0, ge=0, le=100, description="Maksymalne dopuszczalne zachmurzenie sceny w %")
+    candidate_limit: int = Field(10, gt=0, le=20, description="Maks. liczba kandydatow do zwrocenia")
+    width: int = Field(256, gt=0, le=1024, description="Szerokosc podgladowego obrazu w pikselach")
+    height: int = Field(256, gt=0, le=1024, description="Wysokosc podgladowego obrazu w pikselach")
+    field_id: int | None = Field(
+        None,
+        description="Opcjonalny identyfikator pola (z kreta) - patrz NdviRequest.field_id",
+    )
+
+    @field_validator("polygon")
+    @classmethod
+    def _validate_polygon(cls, value: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        return _validate_lonlat_polygon(value)
+
+    @model_validator(mode="after")
+    def _validate_time_range(self) -> "NdviCandidatesRequest":
+        if self.time_to < self.time_from:
+            raise ValueError("time_to nie moze byc wczesniejsze niz time_from")
+        return self
+
+
+class NdviSetDefaultRequest(BaseModel):
+    polygon: list[tuple[float, float]] = Field(
+        ...,
+        min_length=3,
+        description="Wierzcholki wielokata pola jako pary [lon, lat] (WGS84), min. 3 punkty",
+    )
+    field_id: int = Field(..., description="Identyfikator pola (z kreta)")
+    # Named acquired_date, not date - a field named the same as its own annotated type ("date:
+    # date") trips Pydantic v2's forward-ref resolution (PydanticUserError: "Make sure you don't
+    # have any field name clashing with a type annotation"), confirmed the hard way on lopata's
+    # Python 3.14/pydantic 2.13.
+    acquired_date: date = Field(..., description="Data (rok-miesiac-dzien) terminu do przypiecia jako domyslny")
+    max_cloud_cover: float = Field(30.0, ge=0, le=100, description="Maksymalne dopuszczalne zachmurzenie sceny w %")
+    width: int = Field(512, gt=0, le=2500, description="Szerokosc pinowanego obrazu w pikselach")
+    height: int = Field(512, gt=0, le=2500, description="Wysokosc pinowanego obrazu w pikselach")
 
     @field_validator("polygon")
     @classmethod

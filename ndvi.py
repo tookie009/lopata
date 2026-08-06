@@ -65,6 +65,12 @@ class _TTLCache:
     def set(self, key, value) -> None:
         self._store[key] = (time.monotonic() + self._ttl, value)
 
+    # Used by clear_ndvi_default so a "Przywróć automatyczny wybór" DB clear isn't undermined by
+    # this L1 layer still serving the pre-clear raster for the rest of its TTL.
+    def clear_matching(self, predicate) -> None:
+        for key in [k for k in self._store if predicate(k)]:
+            del self._store[key]
+
 
 # Default 1 hour: long enough to cover "preview image, then divide into zones" within one
 # planning session, short enough that a genuinely new Sentinel-2 scene (revisit time ~5 days) is
@@ -170,15 +176,17 @@ def _l1_set(cache_key, bbox: BBox, array, metadata) -> None:
 
 
 def _fetch_ndvi_raw(bbox: BBox, width: int, height: int, max_cloud_cover: float, time_interval, mosaicking_order,
-                     field_id: int | None = None):
+                     field_id: int | None = None, persist: bool = True):
     """Just the Process API NDVI raster, no catalog metadata lookup - used for cheaply scoring
     several candidate dates in fetch_best_vegetation_ndvi_array. See _request_ndvi_tiff for the
     metadata-attaching variant used for the single winning/final fetch.
 
-    Cached by every parameter that affects the actual Sentinel Hub request (L1: in-process
-    memory, L2: db_cache's Postgres table, which survives a restart) - so an identical call (e.g.
-    the NDVI preview image and a subsequent field-zones split for the same field) is served
-    without hitting Copernicus again.
+    Cached in L1 (in-process memory) regardless of `persist`. Also written to L2 (db_cache's
+    Postgres table, which survives a restart) UNLESS persist=False - used for rasters that are
+    only ever used once within a single call (candidate scoring, date-range browsing previews)
+    and never looked up again afterward, where a Postgres write would just be dead weight (see
+    db_cache.py's docstring on ndvi_cache_field_key for why this matters: L2 is keyed without a
+    date, so persisting these would repeatedly evict whatever the real, reusable final raster is).
     """
     cache_key = _cache_key(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order)
 
@@ -212,14 +220,16 @@ def _fetch_ndvi_raw(bbox: BBox, width: int, height: int, max_cloud_cover: float,
 
     result = data[0]
     _l1_set(cache_key, bbox, result, None)
-    db_cache.set(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order,
-                 result, None, settings.ndvi_cache_ttl_seconds)
+    if persist:
+        db_cache.set(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order,
+                      result, None)
     return result
 
 
 def _request_ndvi_tiff(bbox: BBox, width: int, height: int, max_cloud_cover: float, time_interval, mosaicking_order,
                         field_id: int | None = None, season_window: tuple[datetime, datetime] | None = None,
-                        candidates_considered: int | None = None, ndvi_mean_at_selection: float | None = None):
+                        candidates_considered: int | None = None, ndvi_mean_at_selection: float | None = None,
+                        selection_mode: str = "best_vegetation", persist: bool = True):
     """Like _fetch_ndvi_raw, but also attaches acquisition-date/cloud-cover metadata (via
     _search_best_scene). That metadata lookup is its own STAC catalog call - NOT covered by
     _fetch_ndvi_raw's own cache - so on top of reusing a cached raster, this also checks whether
@@ -227,12 +237,19 @@ def _request_ndvi_tiff(bbox: BBox, width: int, height: int, max_cloud_cover: flo
     _search_best_scene entirely when it does.
 
     season_window/candidates_considered/ndvi_mean_at_selection let fetch_best_vegetation_ndvi_array
-    (the only caller) fold its own season-search bookkeeping into the metadata that gets cached
-    here, rather than caching a partial metadata dict and patching it in-place afterward - the
-    latter used to write only the narrow single-day time_interval this function was actually
-    called with (the winning date) to the cache, never the real season-long window that was
-    searched to find it, since the enrichment happened one level up, after this function's own
-    cache write had already fired.
+    fold its own season-search bookkeeping into the metadata that gets cached here, rather than
+    caching a partial metadata dict and patching it in-place afterward - the latter used to write
+    only the narrow single-day time_interval this function was actually called with (the winning
+    date) to the cache, never the real season-long window that was searched to find it, since the
+    enrichment happened one level up, after this function's own cache write had already fired.
+
+    selection_mode: "best_vegetation" (default, the usual auto-search) or "manual" - set by
+    set_ndvi_default when explicitly pinning a date, so callers can tell the two apart (see
+    NdviMetadata.selectionMode in kret).
+
+    persist: forwarded to _fetch_ndvi_raw and this function's own db_cache.set - see that
+    function's docstring. False for the date-range browsing endpoint, where every rendered
+    candidate is a one-off never looked up again.
     """
     cache_key = _cache_key(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order)
 
@@ -248,7 +265,7 @@ def _request_ndvi_tiff(bbox: BBox, width: int, height: int, max_cloud_cover: flo
             return cached_array, cached_metadata  # full hit - no Sentinel Hub/STAC calls at all
 
     ndvi_array = cached_array if cached_array is not None else _fetch_ndvi_raw(
-        bbox, width, height, max_cloud_cover, time_interval, mosaicking_order, field_id=field_id
+        bbox, width, height, max_cloud_cover, time_interval, mosaicking_order, field_id=field_id, persist=persist
     )
     if ndvi_array is None:
         return None
@@ -270,11 +287,13 @@ def _request_ndvi_tiff(bbox: BBox, width: int, height: int, max_cloud_cover: flo
         "data_collection": S2L2A_CDSE.api_id,
         "candidates_considered": candidates_considered,
         "ndvi_mean_at_selection": ndvi_mean_at_selection,
+        "selection_mode": selection_mode,
     }
 
     _l1_set(cache_key, bbox, ndvi_array, metadata)
-    db_cache.set(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order,
-                 ndvi_array, metadata, settings.ndvi_cache_ttl_seconds)
+    if persist:
+        db_cache.set(field_id, bbox, width, height, max_cloud_cover, time_interval, mosaicking_order,
+                      ndvi_array, metadata)
     return ndvi_array, metadata
 
 
@@ -353,11 +372,26 @@ def fetch_best_vegetation_ndvi_array(
     cloudy or most recent one. Candidates are scored cheaply at a small raster size
     (_SCORE_RASTER_PX) before the winning date is re-fetched at the requested width/height.
 
+    "Sticky" - if `field_id` already has ANY cached row for this exact (width, height,
+    max_cloud_cover) (db_cache.get_any), that's returned as-is and this whole auto-search is
+    skipped, regardless of whether that row got there through a previous auto-search or through
+    an explicit pin (see set_ndvi_default). This is checked here (not just in the /ndvi preview
+    endpoint) so a pin also drives field_zones.py's NDVI-based subfield division at ITS OWN
+    resolution once that resolution has been fetched at least once - both go through this same
+    function. A field that's never had this exact resolution fetched still runs a fresh
+    auto-search below; see db_cache.clear_field to un-stick a field and force a fresh search.
+
     :return: tuple of (numpy array of shape (height, width, 2) with bands [ndvi, dataMask],
         metadata dict - see _request_ndvi_tiff, plus "candidates_considered" and
         "ndvi_mean_at_selection").
     """
     bbox = _bbox_from_polygon(polygon_lonlat)
+
+    if field_id is not None:
+        sticky = db_cache.get_any(field_id, width, height, max_cloud_cover, MosaickingOrder.LEAST_CC)
+        if sticky is not None:
+            return sticky
+
     window = _growing_season_window(datetime.now(timezone.utc))
     candidates = _search_candidate_dates(bbox, window, max_cloud_cover, candidate_limit)
     if not candidates:
@@ -372,7 +406,7 @@ def fetch_best_vegetation_ndvi_array(
     for candidate in candidates:
         day_interval = _day_interval(candidate["properties"]["datetime"])
         raw = _fetch_ndvi_raw(bbox, _SCORE_RASTER_PX, _SCORE_RASTER_PX, max_cloud_cover, day_interval,
-                               MosaickingOrder.LEAST_CC, field_id=field_id)
+                               MosaickingOrder.LEAST_CC, field_id=field_id, persist=False)
         if raw is None:
             continue
         ndvi = raw[:, :, 0]
@@ -435,21 +469,19 @@ def _colorize_normalized(norm: np.ndarray) -> np.ndarray:
     return rgb.reshape(norm.shape + (3,)).astype(np.uint8)
 
 
-def fetch_ndvi_png(
+def _render_ndvi_png(
+    ndvi_array: np.ndarray,
     polygon_lonlat: list[tuple[float, float]],
-    width: int = 512,
-    height: int = 512,
-    max_cloud_cover: float = 30.0,
-    candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
+    bbox: BBox,
+    width: int,
+    height: int,
     stretch_percentiles: tuple[float, float] = (2.0, 98.0),
-    field_id: int | None = None,
-) -> tuple[bytes, dict]:
-    """Fetch an NDVI PNG for the given WGS84 field polygon (its exact edges, not just its
-    bounding rectangle - pixels outside the polygon are rendered fully transparent), for
-    whichever date in the last growing season captured the field at its best vegetation (see
-    fetch_best_vegetation_ndvi_array), contrast-stretched to the NDVI range actually observed
-    within the field itself (robust min/max via percentiles, to ignore a few outlier/noisy
-    pixels) rather than a fixed absolute NDVI-to-color scale.
+) -> bytes:
+    """Colorizes a raw NDVI raster (shape (height, width, 2), bands [ndvi, dataMask] - as
+    returned by _fetch_ndvi_raw/_request_ndvi_tiff) into a PNG clipped to the field polygon's
+    exact edges (pixels outside fully transparent), contrast-stretched to the NDVI range
+    actually observed within the field itself (robust min/max via percentiles, to ignore a few
+    outlier/noisy pixels) rather than a fixed absolute NDVI-to-color scale.
 
     A single field's NDVI values typically span a fairly narrow slice of the theoretical -1..1
     range (e.g. 0.6-0.85 for a healthy, uniform crop) - mapping that slice through a scale fixed
@@ -457,20 +489,11 @@ def fetch_ndvi_png(
     present variation invisible. Stretching per-request instead means whatever spread actually
     exists in the requested area always uses the full color range.
 
-    :return: tuple of (PNG bytes, metadata dict - see fetch_best_vegetation_ndvi_array).
+    Shared by fetch_ndvi_png (single best-vegetation/pinned date) and fetch_ndvi_candidates
+    (several dates for the date-range browsing modal), so both render identically.
     """
-    ndvi_array, metadata = fetch_best_vegetation_ndvi_array(
-        polygon_lonlat=polygon_lonlat,
-        width=width,
-        height=height,
-        max_cloud_cover=max_cloud_cover,
-        candidate_limit=candidate_limit,
-        field_id=field_id,
-    )
     ndvi = ndvi_array[:, :, 0]
     data_valid = ndvi_array[:, :, 1] > 0
-
-    bbox = _bbox_from_polygon(polygon_lonlat)
     polygon_mask = _pixel_polygon_mask(polygon_lonlat, bbox, width, height)
     valid = data_valid & polygon_mask
 
@@ -492,4 +515,129 @@ def fetch_ndvi_png(
 
     buffer = io.BytesIO()
     Image.fromarray(rgba, mode="RGBA").save(buffer, format="PNG")
-    return buffer.getvalue(), metadata
+    return buffer.getvalue()
+
+
+def fetch_ndvi_png(
+    polygon_lonlat: list[tuple[float, float]],
+    width: int = 512,
+    height: int = 512,
+    max_cloud_cover: float = 30.0,
+    candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
+    stretch_percentiles: tuple[float, float] = (2.0, 98.0),
+    field_id: int | None = None,
+) -> tuple[bytes, dict]:
+    """Fetch an NDVI PNG for the given WGS84 field polygon, for whichever date in the last
+    growing season captured the field at its best vegetation - or, if the field has a manually
+    pinned date, that date instead (see fetch_best_vegetation_ndvi_array). See _render_ndvi_png
+    for the colorization/contrast-stretch details.
+
+    :return: tuple of (PNG bytes, metadata dict - see fetch_best_vegetation_ndvi_array).
+    """
+    ndvi_array, metadata = fetch_best_vegetation_ndvi_array(
+        polygon_lonlat=polygon_lonlat,
+        width=width,
+        height=height,
+        max_cloud_cover=max_cloud_cover,
+        candidate_limit=candidate_limit,
+        field_id=field_id,
+    )
+    bbox = _bbox_from_polygon(polygon_lonlat)
+    png_bytes = _render_ndvi_png(ndvi_array, polygon_lonlat, bbox, width, height, stretch_percentiles)
+    return png_bytes, metadata
+
+
+DEFAULT_CANDIDATES_BROWSE_LIMIT = 10
+_CANDIDATE_PREVIEW_PX = 256
+
+
+def fetch_ndvi_candidates(
+    polygon_lonlat: list[tuple[float, float]],
+    time_from: datetime,
+    time_to: datetime,
+    max_cloud_cover: float = 30.0,
+    candidate_limit: int = DEFAULT_CANDIDATES_BROWSE_LIMIT,
+    width: int = _CANDIDATE_PREVIEW_PX,
+    height: int = _CANDIDATE_PREVIEW_PX,
+    field_id: int | None = None,
+) -> list[dict]:
+    """For the field-edit view's NDVI date-range picker: up to `candidate_limit` least-cloudy
+    scenes within [time_from, time_to] (an arbitrary user-chosen range, unlike
+    fetch_best_vegetation_ndvi_array's fixed growing-season window), each rendered as a small
+    preview PNG (same colorization as fetch_ndvi_png) so the user can visually compare them
+    before pinning one via set_ndvi_default. These previews are NOT written to the
+    persistent cache (persist=False throughout) - one-off browsing rasters, at a resolution
+    nothing else reuses, that would otherwise just evict the real cached final raster (see
+    db_cache.py's docstring on ndvi_cache_field_key).
+
+    :return: list of {"date": iso datetime string, "cloud_cover": float | None, "png": bytes},
+        least-cloudy first.
+    """
+    bbox = _bbox_from_polygon(polygon_lonlat)
+    candidates = _search_candidate_dates(bbox, (time_from, time_to), max_cloud_cover, candidate_limit)
+    if not candidates:
+        raise LookupError("Brak dostepnych zdjec Sentinel-2 w podanym zakresie dat dla tego obszaru")
+
+    results = []
+    for candidate in candidates:
+        acquired = candidate["properties"]["datetime"]
+        cloud_cover = candidate["properties"].get("eo:cloud_cover")
+        raw = _request_ndvi_tiff(
+            bbox, width, height, max_cloud_cover, _day_interval(acquired), MosaickingOrder.LEAST_CC,
+            field_id=field_id, persist=False,
+        )
+        if raw is None:
+            continue
+        ndvi_array, _metadata = raw
+        png_bytes = _render_ndvi_png(ndvi_array, polygon_lonlat, bbox, width, height)
+        results.append({"date": acquired, "cloud_cover": cloud_cover, "png": png_bytes})
+
+    if not results:
+        raise LookupError("Nie udalo sie pobrac zadnego zdjecia NDVI z podanego zakresu dat")
+
+    return results
+
+
+def set_ndvi_default(
+    polygon_lonlat: list[tuple[float, float]],
+    field_id: int,
+    acquired_date: str,
+    max_cloud_cover: float = 30.0,
+    width: int = 512,
+    height: int = 512,
+) -> dict:
+    """Pins `acquired_date` (an ISO "YYYY-MM-DD" string) as field_id's NDVI term - the field-edit
+    view's "Ustaw jako domyślny". Unlike the design this replaced (a separate override table
+    storing just the date), there's no resolution-independent "pinned date" record: this eagerly
+    fetches and persists the actual raster for that date at (width, height) - default 512x512,
+    the same size /ndvi itself defaults to - tagged selection_mode="manual" so it's visibly
+    distinct from an auto-selected sticky entry. A subsequent /ndvi call at this exact resolution
+    then hits this row via fetch_best_vegetation_ndvi_array's sticky get_any() check instead of
+    re-searching.
+
+    Only pins THIS resolution - field_zones.py's own (typically different) resolution isn't
+    eagerly populated here, since it varies per field/target size and isn't known at pin time.
+    In practice it'll independently auto-search and land on the same date most of the time (the
+    scoring step that picks a "best" date is itself resolution-independent - see
+    fetch_best_vegetation_ndvi_array), but this isn't guaranteed: a real, accepted limitation of
+    not having a resolution-independent pinned-date record.
+    """
+    bbox = _bbox_from_polygon(polygon_lonlat)
+    result = _request_ndvi_tiff(
+        bbox, width, height, max_cloud_cover, _day_interval(acquired_date), MosaickingOrder.LEAST_CC,
+        field_id=field_id, selection_mode="manual",
+    )
+    if result is None:
+        raise LookupError("Nie udalo sie pobrac wybranego terminu NDVI dla tego pola")
+    _array, metadata = result
+    return metadata
+
+
+def clear_ndvi_default(field_id: int) -> None:
+    """Un-sticks a field - deletes every cached row for it (all resolutions, see
+    db_cache.clear_field), so the next fetch at any resolution runs a fresh auto-search instead
+    of continuing to serve whatever was cached/pinned before. Also drops matching L1 entries so a
+    request within the L1 TTL window right after clearing doesn't still serve the (now
+    DB-cleared) stale raster from memory."""
+    db_cache.clear_field(field_id)
+    _RAW_NDVI_CACHE.clear_matching(lambda key: key[0] == field_id)
